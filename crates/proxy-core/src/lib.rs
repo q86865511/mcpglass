@@ -5,6 +5,15 @@
 //! forward bytes first and only then feed them here (fail-open): a bug in this
 //! crate must never be able to corrupt or stall client<->server traffic.
 
+mod sse;
+pub use sse::SseSplitter;
+
+/// The MCP protocol version this build targets. Centralised here (per the project
+/// convention that protocol constants live in `proxy-core`) so the stdio wrap and
+/// the HTTP gateway agree on one value — e.g. the `MCP-Protocol-Version` header of
+/// the Streamable HTTP transport.
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
 /// Which leg of the conversation a framed line belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {

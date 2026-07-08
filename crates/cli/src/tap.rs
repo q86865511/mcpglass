@@ -1,0 +1,590 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use policy::fingerprints_from_tools_list_versioned;
+use proxy_core::{parse_line, Direction};
+use storage::{
+    ActionTaken, FingerprintOutcome, Record, SecurityEvent, SecurityEventKind, Store,
+};
+use tokio::sync::mpsc;
+
+/// Outstanding tools/list request ids awaiting their response. Only a response
+/// whose id is still tracked here is fingerprinted, so an ordinary business
+/// response that happens to carry a `result.tools[]` shape is never mistaken for a
+/// tool advertisement.
+///
+/// Keyed strictly: a JSON-RPC id is per outstanding request, so a *non*-tools/list
+/// request reusing an id retires the stale entry ([`invalidate`](Self::invalidate)),
+/// and the map is bounded ([`CAP`](Self::CAP)) so a client that never reuses ids and
+/// whose responses are lost cannot grow it without end — the oldest entry is evicted.
+struct PendingToolsList {
+    /// id -> the request's `ts_ms`, used to evict the oldest entry when at capacity.
+    inner: HashMap<String, i64>,
+}
+
+impl PendingToolsList {
+    /// Cap on outstanding tracked ids. Comfortably above any realistic count of
+    /// concurrent tools/list requests, so eviction only ever discards leaked ids.
+    const CAP: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Note a tools/list request. If inserting a new id would exceed [`CAP`](Self::CAP),
+    /// the oldest tracked id is evicted first. Re-noting an existing id refreshes it.
+    fn note_request(&mut self, id: String, ts_ms: i64) {
+        if !self.inner.contains_key(&id) && self.inner.len() >= Self::CAP {
+            if let Some(oldest) = self
+                .inner
+                .iter()
+                .min_by_key(|(_, &ts)| ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.inner.remove(&oldest);
+            }
+        }
+        self.inner.insert(id, ts_ms);
+    }
+
+    /// Retire the pending entry for an id reused by a non-tools/list request.
+    fn invalidate(&mut self, id: &str) {
+        self.inner.remove(id);
+    }
+
+    /// Consume the pending entry for a response id; returns whether it was tracked
+    /// (i.e. this response answers a tools/list request we saw).
+    fn take(&mut self, id: &str) -> bool {
+        self.inner.remove(id).is_some()
+    }
+}
+
+/// One tapped frame handed to the storage thread. Off the hot path by design.
+pub(crate) struct TapEvent {
+    pub(crate) direction: Direction,
+    pub(crate) ts_ms: i64,
+    pub(crate) raw: Vec<u8>,
+}
+
+/// Work items for the storage thread. Both are strictly best-effort and off the
+/// forwarding path: a full or closed channel drops them without touching the wire.
+pub(crate) enum StorageMsg {
+    /// Record a framed message (either direction) into `messages`.
+    Tap(TapEvent),
+    /// Persist a security decision into `security_events`.
+    Security(SecurityEvent),
+}
+
+/// Drain the storage channel into SQLite. Runs on a blocking thread; a DB failure
+/// is logged and the item dropped — recording stops, forwarding does not.
+pub(crate) fn storage_loop(
+    mut rx: mpsc::Receiver<StorageMsg>,
+    db_path: PathBuf,
+    logger: Logger,
+    label: String,
+    command_line: String,
+) {
+    let store = match Store::open_with_log(&db_path, &|m| logger.info(m)) {
+        Ok(s) => s,
+        Err(e) => {
+            logger.error(format!("db open failed ({e:#}); recording disabled"));
+            // Keep draining so pumps' try_send never blocks/errors on a full queue.
+            while rx.blocking_recv().is_some() {}
+            return;
+        }
+    };
+    let session_id = match store.begin_session(&label, &command_line) {
+        Ok(id) => id,
+        Err(e) => {
+            logger.error(format!("begin_session failed ({e:#}); recording disabled"));
+            while rx.blocking_recv().is_some() {}
+            return;
+        }
+    };
+    // The server's start command is this server's stable identity, so fingerprint
+    // scoping (rug-pull detection) keys on it across sessions — a later wrap of the
+    // same command compares against what it advertised before.
+    let server_key = command_line.as_str();
+    // Outstanding tools/list requests, so only their responses are fingerprinted.
+    // Requests are forwarded before their tap is enqueued and a response cannot
+    // precede its request, so the id is present here by the time the matching
+    // response is drained.
+    let mut pending_tools_list = PendingToolsList::new();
+    while let Some(msg) = rx.blocking_recv() {
+        match msg {
+            StorageMsg::Tap(ev) => {
+                let direction = ev.direction;
+                let parsed = parse_line(&ev.raw, direction);
+                // Capture the correlation keys before `parsed` is moved into Record.
+                // A c2s request splits by method: a tools/list request is tracked; any
+                // *other* request bearing an id retires that id (JSON-RPC ids are per
+                // request, so reuse means the old tools/list is done).
+                let is_tools_list = parsed.method.as_deref() == Some("tools/list");
+                let tools_list_req_id = if direction == Direction::C2s && is_tools_list {
+                    parsed.rpc_id.clone()
+                } else {
+                    None
+                };
+                // Only a genuine *request* reusing the id retires the pending entry —
+                // a c2s response (no method) answering something the server asked
+                // (e.g. sampling/createMessage) must not invalidate an unrelated
+                // tools/list by coincidence of id.
+                let reused_req_id = if direction == Direction::C2s
+                    && !is_tools_list
+                    && parsed.method.is_some()
+                {
+                    parsed.rpc_id.clone()
+                } else {
+                    None
+                };
+                // For a response, carry its id and whether it is a JSON-RPC error:
+                // an error response consumes the pending entry but is not fingerprinted.
+                // `method.is_none()` excludes a server-initiated s2c *request* (e.g.
+                // sampling/createMessage) that happens to reuse a tracked id — only a
+                // JSON-RPC response (no method) can answer a tools/list request.
+                let resp = if direction == Direction::S2c && parsed.method.is_none() {
+                    parsed.rpc_id.clone().map(|id| (id, parsed.is_error))
+                } else {
+                    None
+                };
+                let rec = Record {
+                    ts_ms: ev.ts_ms,
+                    direction,
+                    raw: String::from_utf8_lossy(&ev.raw).into_owned(),
+                    method: parsed.method,
+                    rpc_id: parsed.rpc_id,
+                    is_valid_json: parsed.is_valid_json,
+                    is_error: parsed.is_error,
+                };
+                if let Err(e) = store.insert(session_id, &rec) {
+                    logger.error(format!("insert failed (record dropped): {e:#}"));
+                }
+                // Track outstanding tools/list requests; retire ids reused by other
+                // requests. (These are mutually exclusive per frame.)
+                if let Some(id) = tools_list_req_id {
+                    pending_tools_list.note_request(id, ev.ts_ms);
+                }
+                if let Some(id) = reused_req_id {
+                    pending_tools_list.invalidate(&id);
+                }
+                // Rug-pull detection lives here so the s2c leg stays a pure tap: only
+                // a non-error response that answers a tools/list request we saw has
+                // its per-tool fingerprints recorded and any change flagged. An error
+                // response still consumes the pending entry (the request is answered)
+                // but carries no tools to fingerprint. Failures are logged only.
+                if let Some((id, is_error)) = resp {
+                    if pending_tools_list.take(&id) && !is_error {
+                        record_fingerprints(
+                            &store,
+                            session_id,
+                            server_key,
+                            &ev.raw,
+                            ev.ts_ms,
+                            &logger,
+                        );
+                    }
+                }
+            }
+            StorageMsg::Security(ev) => {
+                if let Err(e) = store.insert_security_event(session_id, &ev) {
+                    logger.error(format!("security event insert failed (dropped): {e:#}"));
+                }
+            }
+        }
+    }
+    // The pumps have hung up: the child has exited. Best-effort end stamp.
+    if let Err(e) = store.end_session(session_id) {
+        logger.error(format!("end_session failed: {e:#}"));
+    }
+}
+
+/// From one server->client frame, record each advertised tool's fingerprint (under
+/// both algorithm versions, for the dual-hash migration) and flag any that changed
+/// definition (a rug-pull signal). A non tools/list frame yields no fingerprints;
+/// fingerprint changes are advisory (`flagged`), never blocking — the block
+/// decision only lives on the c2s leg.
+///
+/// Both a `Changed` (a brand-new definition) and a `Reverted` (an oscillation back
+/// to a previously seen one, A -> B -> A) raise a `fingerprint_change` event; the
+/// `Reverted` detail notes the oscillation. A single event kind is reused for both
+/// so no CHECK-constraint migration or dashboard change is needed.
+///
+/// `server_key` scopes the comparison to this server's identity so a change is
+/// detected across sessions (the caller passes the session's start command).
+pub(crate) fn record_fingerprints(
+    store: &Store,
+    session_id: i64,
+    server_key: &str,
+    raw: &[u8],
+    ts_ms: i64,
+    logger: &Logger,
+) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return;
+    };
+    for (tool, fp) in fingerprints_from_tools_list_versioned(&value) {
+        match store.record_fingerprint(session_id, server_key, &tool, &fp.v1, &fp.v2, ts_ms) {
+            Ok(outcome @ (FingerprintOutcome::Changed | FingerprintOutcome::Reverted)) => {
+                let detail = match outcome {
+                    FingerprintOutcome::Reverted => format!(
+                        "tool {tool:?} definition reverted to a previously seen fingerprint \
+                         (oscillation; possible rug-pull)"
+                    ),
+                    _ => format!(
+                        "tool {tool:?} definition changed since first sighting (possible rug-pull)"
+                    ),
+                };
+                let ev = SecurityEvent {
+                    ts_ms,
+                    kind: SecurityEventKind::FingerprintChange,
+                    rule: tool.clone(),
+                    detail,
+                    tool_name: Some(tool),
+                    rpc_id: None,
+                    action_taken: ActionTaken::Flagged,
+                };
+                if let Err(e) = store.insert_security_event(session_id, &ev) {
+                    logger.error(format!("fingerprint-change event insert failed: {e:#}"));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => logger.error(format!("record_fingerprint failed: {e:#}")),
+        }
+    }
+}
+
+pub(crate) fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Append-only diagnostics sink. Silently no-ops if the file can't be opened —
+/// logging must never be a reason to fail proxying. Never touches stdout/stderr.
+#[derive(Clone)]
+pub(crate) struct Logger {
+    inner: Arc<Mutex<Option<std::fs::File>>>,
+}
+
+impl Logger {
+    pub(crate) fn open(path: Option<&Path>) -> Self {
+        let file = path.and_then(|p| {
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+        Self {
+            inner: Arc::new(Mutex::new(file)),
+        }
+    }
+
+    fn write(&self, level: &str, msg: &str) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(file) = guard.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(file, "{} [{}] {}", now_ms(), level, msg);
+                let _ = file.flush();
+            }
+        }
+    }
+
+    pub(crate) fn info(&self, msg: impl AsRef<str>) {
+        self.write("INFO", msg.as_ref());
+    }
+
+    pub(crate) fn error(&self, msg: impl AsRef<str>) {
+        self.write("ERROR", msg.as_ref());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- PendingToolsList (B3 correlation, unit level) ----------------------
+
+    #[test]
+    fn pending_invalidate_and_take_are_strict() {
+        let mut p = PendingToolsList::new();
+        p.note_request("5".to_owned(), 1);
+        p.invalidate("5");
+        assert!(!p.take("5"), "an invalidated id must not be tracked");
+
+        p.note_request("6".to_owned(), 2);
+        assert!(p.take("6"));
+        assert!(!p.take("6"), "take consumes the entry");
+    }
+
+    #[test]
+    fn pending_evicts_oldest_when_full() {
+        let mut p = PendingToolsList::new();
+        // Fill to capacity with strictly increasing timestamps (id 0 is oldest).
+        for i in 0..PendingToolsList::CAP {
+            p.note_request(i.to_string(), i as i64);
+        }
+        assert_eq!(p.inner.len(), PendingToolsList::CAP);
+        // One more insert evicts the oldest rather than growing past the cap.
+        p.note_request("new".to_owned(), 1_000_000);
+        assert_eq!(p.inner.len(), PendingToolsList::CAP);
+        assert!(!p.take("0"), "the oldest id should have been evicted");
+        assert!(p.take("new"), "the newest id should be tracked");
+    }
+
+    // --- storage_loop correlation + oscillation (B2/B3, integration level) --
+
+    struct TmpDb(PathBuf);
+    impl TmpDb {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mcpglass-tap-test-{}-{}-{:?}",
+                tag,
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TmpDb(dir)
+        }
+        fn db(&self) -> PathBuf {
+            self.0.join("sessions.db")
+        }
+    }
+    impl Drop for TmpDb {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tap_ev(direction: Direction, ts_ms: i64, raw: &str) -> StorageMsg {
+        StorageMsg::Tap(TapEvent {
+            direction,
+            ts_ms,
+            raw: raw.as_bytes().to_vec(),
+        })
+    }
+
+    /// Drive `storage_loop` to completion over a prefilled channel.
+    fn drive(db: &Path, msgs: Vec<StorageMsg>) {
+        let (tx, rx) = mpsc::channel::<StorageMsg>(256);
+        for m in msgs {
+            tx.try_send(m).expect("prefill channel");
+        }
+        drop(tx); // closes the channel so storage_loop returns at drain end.
+        storage_loop(
+            rx,
+            db.to_path_buf(),
+            Logger::open(None),
+            "t".to_owned(),
+            "srv".to_owned(),
+        );
+    }
+
+    fn fingerprinted_tool_names(db: &Path) -> Vec<String> {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT tool_name FROM tool_fingerprints ORDER BY id")
+            .unwrap();
+        let names = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        names
+    }
+
+    fn fingerprint_change_count(db: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM security_events WHERE kind = 'fingerprint_change'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn error_response_consumes_pending_and_is_not_fingerprinted() {
+        let tmp = TmpDb::new("err-resp");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#),
+                // Error response to id 5: consumes the pending entry, records nothing.
+                tap_ev(
+                    Direction::S2c,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":5,"error":{"code":-32601,"message":"no"}}"#,
+                ),
+                // A later valid tools/list response reusing id 5 finds no pending entry.
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[{"name":"search","description":"y"}]}}"#,
+                ),
+            ],
+        );
+        assert!(
+            fingerprinted_tool_names(&db).is_empty(),
+            "an error response must consume the pending entry; the reused-id response must not fingerprint"
+        );
+    }
+
+    #[test]
+    fn reused_id_by_another_request_invalidates_pending() {
+        let tmp = TmpDb::new("reuse-id");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#),
+                // Client reuses id 7 for a different request: the tools/list is retired.
+                tap_ev(
+                    Direction::C2s,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"x"}}"#,
+                ),
+                // The (late/spoofed) tools/list response for id 7 must not fingerprint.
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"search","description":"y"}]}}"#,
+                ),
+            ],
+        );
+        assert!(
+            fingerprinted_tool_names(&db).is_empty(),
+            "an id reused by another request must invalidate the pending tools/list"
+        );
+
+        // Control: without the reuse, the same response IS fingerprinted.
+        let tmp2 = TmpDb::new("reuse-id-control");
+        let db2 = tmp2.db();
+        drive(
+            &db2,
+            vec![
+                tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#),
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"search","description":"y"}]}}"#,
+                ),
+            ],
+        );
+        assert_eq!(fingerprinted_tool_names(&db2), vec!["search".to_owned()]);
+    }
+
+    #[test]
+    fn oscillation_raises_fingerprint_change_event() {
+        let tmp = TmpDb::new("oscillation");
+        let db = tmp.db();
+        let req = r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#;
+        let resp = |desc: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":5,"result":{{"tools":[{{"name":"search","description":"{desc}"}}]}}}}"#
+            )
+        };
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, req),
+                tap_ev(Direction::S2c, 2, &resp("A")), // New: no event
+                tap_ev(Direction::C2s, 3, req),
+                tap_ev(Direction::S2c, 4, &resp("B")), // Changed: event 1
+                tap_ev(Direction::C2s, 5, req),
+                tap_ev(Direction::S2c, 6, &resp("A")), // Reverted (A->B->A): event 2
+            ],
+        );
+        assert_eq!(
+            fingerprint_change_count(&db),
+            2,
+            "one Changed and one Reverted must each raise a fingerprint_change event"
+        );
+        // The revert is labelled as an oscillation in its detail.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let osc: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM security_events
+                 WHERE kind = 'fingerprint_change' AND detail LIKE '%oscillation%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(osc, 1, "the revert must be recorded as an oscillation");
+    }
+
+    #[test]
+    fn server_initiated_request_does_not_consume_pending_tools_list() {
+        let tmp = TmpDb::new("s2c-server-request");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#),
+                // Server-initiated request, s2c, reusing id 9: it has a `method`, so
+                // it is not a JSON-RPC response and must not be mistaken for the
+                // tools/list reply.
+                tap_ev(
+                    Direction::S2c,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":9,"method":"sampling/createMessage","params":{}}"#,
+                ),
+                // The real tools/list response, still id 9, arrives after.
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":9,"result":{"tools":[{"name":"search","description":"y"}]}}"#,
+                ),
+            ],
+        );
+        assert_eq!(
+            fingerprinted_tool_names(&db),
+            vec!["search".to_owned()],
+            "a server-initiated s2c request must not consume the pending tools/list; \
+             the actual response must still be fingerprinted"
+        );
+    }
+
+    #[test]
+    fn c2s_response_to_server_request_does_not_invalidate_pending_tools_list() {
+        let tmp = TmpDb::new("c2s-response-to-server-req");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#),
+                // Client's c2s response to a server-initiated request, reusing id 7:
+                // no `method`, so it is a response, not a request — it must not
+                // retire the tracked tools/list id.
+                tap_ev(
+                    Direction::C2s,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":7,"result":{}}"#,
+                ),
+                // The real tools/list response, still id 7.
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"search","description":"y"}]}}"#,
+                ),
+            ],
+        );
+        assert_eq!(
+            fingerprinted_tool_names(&db),
+            vec!["search".to_owned()],
+            "a c2s response bearing no method must not invalidate the pending tools/list"
+        );
+    }
+}

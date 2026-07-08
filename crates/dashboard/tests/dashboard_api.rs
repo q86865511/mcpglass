@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use proxy_core::{parse_line, Direction};
+use rusqlite::Connection;
 use storage::{ActionTaken, Record, SecurityEvent, SecurityEventKind, Store};
 
 /// A private temp dir unique to this test run, cleaned on drop.
@@ -460,6 +461,79 @@ async fn empty_db_yields_empty_lists_not_errors() {
     assert_eq!(counts["secret_leak"].as_u64().unwrap(), 0);
     assert_eq!(counts["fingerprint_change"].as_u64().unwrap(), 0);
     assert_eq!(counts["blocked"].as_u64().unwrap(), 0);
+}
+
+/// Hand-build a v0 file: the old single-table schema, `user_version` left 0.
+/// Mirrors `storage`'s own legacy-v0 fixture (private to that crate), since
+/// exercising the dashboard's legacy-v0 handling needs a file in that exact
+/// on-disk shape before `dashboard::serve` ever looks at it.
+fn write_legacy_v0_db(db: &std::path::Path) {
+    let conn = Connection::open(db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_ms INTEGER NOT NULL,
+            direction TEXT NOT NULL,
+            raw TEXT NOT NULL,
+            method TEXT,
+            rpc_id TEXT,
+            is_valid_json INTEGER NOT NULL
+        );",
+    )
+    .unwrap();
+}
+
+/// A dashboard started against a legacy Phase-0 (v0) db file must not cache
+/// the empty in-memory store `Store::open` hands back for it (see
+/// `storage::is_legacy_v0`) forever: once the tap writer's `open_with_log`
+/// migrates the file on disk, a later request must see that data — not the
+/// startup-time snapshot, which is what a naively-cached handle would show
+/// until the process restarted.
+#[tokio::test]
+async fn legacy_v0_db_sees_data_after_writer_migrates_it() {
+    let tmp = TempDir::new("v0-dashboard");
+    let db = tmp.db();
+    write_legacy_v0_db(&db);
+
+    let addr = spawn_server(db.clone()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    // Before migration: a v0 file surfaces as an empty store, not an error.
+    let before: serde_json::Value = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before["sessions"].as_array().unwrap().len(), 0);
+
+    // The tap writer opens with `open_with_log`, which migrates the v0 file
+    // (renames it aside, starts a fresh v4 schema) and records a session.
+    let writer = Store::open_with_log(&db, &|_| {}).unwrap();
+    let sid = writer.begin_session("post-migration", "echo").unwrap();
+    writer.end_session(sid).unwrap();
+    drop(writer);
+
+    // After migration: a fresh request must see the new session.
+    let after: serde_json::Value = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let sessions = after["sessions"].as_array().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "dashboard must pick up the writer's migration, not stay pinned to the pre-migration empty store"
+    );
+    assert_eq!(sessions[0]["id"].as_i64().unwrap(), sid);
 }
 
 /// `on_ready` must fire with an address the listener actually bound to a real

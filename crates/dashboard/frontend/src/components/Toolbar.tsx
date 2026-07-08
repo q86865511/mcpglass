@@ -29,8 +29,8 @@ export function Toolbar({
         title="Filter by direction"
       >
         <option value="">all directions</option>
-        <option value="c2s">c2s (→ server)</option>
-        <option value="s2c">s2c (← client)</option>
+        <option value="c2s">c2s (client → server)</option>
+        <option value="s2c">s2c (server → client)</option>
       </select>
       <input
         type="text"
@@ -40,7 +40,7 @@ export function Toolbar({
       />
       <input
         type="text"
-        placeholder="search preview..."
+        placeholder="search raw JSON..."
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
         className="toolbar-search"

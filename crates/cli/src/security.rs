@@ -231,10 +231,14 @@ pub fn decide_c2s_frame(frame: &[u8], policy: &Policy, ts_ms: i64) -> Decision {
     Decision { action, events }
 }
 
-/// A complete `\n`-terminated JSON-RPC error response denying a blocked request.
-/// Built via `serde_json` so the id (which may be a number or string) and message
-/// are always correctly encoded.
-fn synthesize_error(id: &Value, rule: &str) -> Vec<u8> {
+/// The JSON body of a JSON-RPC error response denying a blocked request, *without*
+/// a trailing newline. Built via `serde_json` so the id (which may be a number or
+/// string) and message are always correctly encoded.
+///
+/// The stdio transport wants a `\n`-terminated frame ([`synthesize_error`]); the
+/// HTTP gateway wants the bare JSON body (an `application/json` response has no
+/// newline framing). Both share this builder so the -32001 shape stays identical.
+pub fn synthesize_error_body(id: &Value, rule: &str) -> Vec<u8> {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -244,7 +248,13 @@ fn synthesize_error(id: &Value, rule: &str) -> Vec<u8> {
         }
     });
     // The value is constructed from owned data and cannot fail to serialize.
-    let mut bytes = serde_json::to_vec(&body).expect("error response serializes");
+    serde_json::to_vec(&body).expect("error response serializes")
+}
+
+/// A complete `\n`-terminated JSON-RPC error response for the stdio transport,
+/// where each message is one newline-delimited frame.
+fn synthesize_error(id: &Value, rule: &str) -> Vec<u8> {
+    let mut bytes = synthesize_error_body(id, rule);
     bytes.push(b'\n');
     bytes
 }

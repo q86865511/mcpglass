@@ -273,25 +273,73 @@ fn mask(s: &str) -> String {
     format!("{head}{}{tail}", "*".repeat(stars))
 }
 
-/// Stable fingerprint of a single tool definition: SHA-256 over a canonical
-/// (recursively key-sorted) JSON of just `name` + `description` + `inputSchema`.
-/// Extra fields a server may add (annotations, etc.) do not affect it, so the
-/// fingerprint tracks the security-relevant surface only.
-pub fn fingerprint_tool(tool: &Value) -> String {
-    let subset = serde_json::json!({
+/// Current tool-fingerprint algorithm version. v1 hashed `name` + `description` +
+/// `inputSchema`; **v2** additionally folds in `annotations` (missing -> Null), so
+/// a server that quietly rewrites a tool's advertised annotations is now caught.
+/// `outputSchema` is deliberately *not* folded in yet — it is a candidate for a
+/// future v3 once its real-world churn is understood. Storage records new
+/// observations under this version and uses the older hash only to recognise a
+/// pre-existing v1 row during the dual-hash migration.
+pub const FP_VERSION: u32 = 2;
+
+/// A tool definition hashed under every fingerprint algorithm version at once.
+/// Storage needs all versions to compare an observation against history that may
+/// have been recorded under an older algorithm: an existing v1 record that still
+/// matches on `v1` is silently re-pinned to `v2` (no change alert), while a v1
+/// mismatch is a genuine change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolFingerprints {
+    /// v1 hash: `name` + `description` + `inputSchema`.
+    pub v1: String,
+    /// v2 hash: the v1 fields plus `annotations` (missing -> Null).
+    pub v2: String,
+}
+
+/// The v1 canonical subset — the fields the v1 algorithm fingerprints over.
+fn fingerprint_subset_v1(tool: &Value) -> Value {
+    serde_json::json!({
         "name": tool.get("name").cloned().unwrap_or(Value::Null),
         "description": tool.get("description").cloned().unwrap_or(Value::Null),
         "inputSchema": tool.get("inputSchema").cloned().unwrap_or(Value::Null),
-    });
-    let mut canonical = String::new();
-    write_canonical(&subset, &mut canonical);
+    })
+}
 
+/// The v2 canonical subset — v1 plus `annotations` (missing -> Null).
+/// `outputSchema` is intentionally excluded for now (see [`FP_VERSION`]).
+fn fingerprint_subset_v2(tool: &Value) -> Value {
+    let mut subset = fingerprint_subset_v1(tool);
+    // `subset` is always a JSON object here, so this inserts the key.
+    subset["annotations"] = tool.get("annotations").cloned().unwrap_or(Value::Null);
+    subset
+}
+
+/// SHA-256 over the canonical (recursively key-sorted) JSON of `subset`.
+fn hash_subset(subset: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical(subset, &mut canonical);
     let mut hasher = Sha256::new();
     hasher.update(canonical.as_bytes());
     to_hex(&hasher.finalize())
 }
 
-/// Extract `(tool name, fingerprint)` for every tool in a `tools/list` response
+/// Stable **v1** fingerprint of a single tool definition: SHA-256 over a canonical
+/// (recursively key-sorted) JSON of just `name` + `description` + `inputSchema`.
+/// Extra fields a server may add (annotations, etc.) do not affect it. Retained as
+/// the v1 hash for the dual-hash migration; new recordings pin to v2 (see
+/// [`fingerprint_tool_versions`]).
+pub fn fingerprint_tool(tool: &Value) -> String {
+    hash_subset(&fingerprint_subset_v1(tool))
+}
+
+/// Fingerprint a tool under every algorithm version at once (see [`ToolFingerprints`]).
+pub fn fingerprint_tool_versions(tool: &Value) -> ToolFingerprints {
+    ToolFingerprints {
+        v1: hash_subset(&fingerprint_subset_v1(tool)),
+        v2: hash_subset(&fingerprint_subset_v2(tool)),
+    }
+}
+
+/// Extract `(tool name, v1 fingerprint)` for every tool in a `tools/list` response
 /// (`result.tools[]`). Returns an empty vec for anything that is not a
 /// tools/list response or whose shape does not match. Nameless tools are skipped.
 pub fn fingerprints_from_tools_list(response_json: &Value) -> Vec<(String, String)> {
@@ -307,6 +355,28 @@ pub fn fingerprints_from_tools_list(response_json: &Value) -> Vec<(String, Strin
         .filter_map(|tool| {
             let name = tool.get("name").and_then(|n| n.as_str())?;
             Some((name.to_owned(), fingerprint_tool(tool)))
+        })
+        .collect()
+}
+
+/// Like [`fingerprints_from_tools_list`], but yields both fingerprint versions per
+/// tool for the dual-hash migration. Same shape contract: a non-tools/list or
+/// malformed response yields an empty vec, nameless tools are skipped.
+pub fn fingerprints_from_tools_list_versioned(
+    response_json: &Value,
+) -> Vec<(String, ToolFingerprints)> {
+    let tools = response_json
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array());
+    let Some(tools) = tools else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(|n| n.as_str())?;
+            Some((name.to_owned(), fingerprint_tool_versions(tool)))
         })
         .collect()
 }
@@ -831,5 +901,61 @@ mod tests {
         assert!(fingerprints_from_tools_list(&json!({"result": {}})).is_empty());
         assert!(fingerprints_from_tools_list(&json!({"method": "tools/call"})).is_empty());
         assert!(fingerprints_from_tools_list(&json!({"result": {"tools": "nope"}})).is_empty());
+    }
+
+    // --- v2 fingerprinting (annotations) ------------------------------------
+
+    #[test]
+    fn fingerprint_v2_folds_in_annotations_v1_ignores_them() {
+        let base = json!({"name": "read", "description": "reads", "inputSchema": {}});
+        let annotated = json!({
+            "name": "read", "description": "reads", "inputSchema": {},
+            "annotations": {"title": "Reader", "readOnlyHint": true}
+        });
+        let a = fingerprint_tool_versions(&base);
+        let b = fingerprint_tool_versions(&annotated);
+        // v1 is blind to annotations...
+        assert_eq!(a.v1, b.v1);
+        // ...but v2 folds them in, so adding annotations changes it.
+        assert_ne!(a.v2, b.v2);
+        // The public v1 helper still equals the v1 field.
+        assert_eq!(b.v1, fingerprint_tool(&annotated));
+    }
+
+    #[test]
+    fn fingerprint_v2_changes_when_annotations_change_v1_does_not() {
+        let x = json!({"name": "t", "description": "d", "inputSchema": {}, "annotations": {"title": "A"}});
+        let y = json!({"name": "t", "description": "d", "inputSchema": {}, "annotations": {"title": "B"}});
+        let fx = fingerprint_tool_versions(&x);
+        let fy = fingerprint_tool_versions(&y);
+        assert_eq!(fx.v1, fy.v1); // v1 does not see the annotation edit
+        assert_ne!(fx.v2, fy.v2); // v2 catches it
+    }
+
+    #[test]
+    fn fingerprint_v2_missing_annotations_is_stable_under_reorder() {
+        // Missing annotations hash as Null, so two annotation-less tools with keys
+        // in a different order still agree on v2.
+        let a = json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}});
+        let b = json!({"inputSchema": {"type": "object"}, "description": "d", "name": "t"});
+        assert_eq!(
+            fingerprint_tool_versions(&a).v2,
+            fingerprint_tool_versions(&b).v2
+        );
+    }
+
+    #[test]
+    fn fingerprints_from_tools_list_versioned_extracts_both_versions() {
+        let t1 = json!({"name": "read", "description": "r", "inputSchema": {}, "annotations": {"x": 1}});
+        let resp = json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [t1.clone()]}});
+        let fps = fingerprints_from_tools_list_versioned(&resp);
+        assert_eq!(fps.len(), 1);
+        assert_eq!(fps[0].0, "read");
+        assert_eq!(fps[0].1, fingerprint_tool_versions(&t1));
+        // Non-tools/list is empty, mirroring the v1 extractor.
+        assert!(fingerprints_from_tools_list_versioned(&json!({"result": {}})).is_empty());
+        assert!(
+            fingerprints_from_tools_list_versioned(&json!({"result": {"tools": "nope"}})).is_empty()
+        );
     }
 }

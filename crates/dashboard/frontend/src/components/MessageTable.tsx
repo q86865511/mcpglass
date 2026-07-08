@@ -12,9 +12,9 @@ function DirectionBadge({ msg }: { msg: MessageSummary }) {
     return <span className="badge badge-error">error</span>;
   }
   if (msg.direction === "c2s") {
-    return <span className="badge badge-c2s">&rarr; server</span>;
+    return <span className="badge badge-c2s">client &rarr; server</span>;
   }
-  return <span className="badge badge-s2c">&larr; client</span>;
+  return <span className="badge badge-s2c">server &rarr; client</span>;
 }
 
 export function MessageTable({ messages, selectedId, onSelect }: MessageTableProps) {

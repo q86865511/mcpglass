@@ -3,12 +3,23 @@
 //! Serves a small REST API over the [`storage`] crate's read side, plus the
 //! embedded React frontend bundle (`frontend/dist`, built separately by
 //! `pnpm build`). This is the read-only counterpart to the tap path in the
-//! `cli` crate: every request opens its own [`Store`] rather than sharing one,
-//! because `rusqlite::Connection` is not `Sync` and the tap's writer already
-//! runs in WAL mode so a concurrent reader never blocks it.
+//! `cli` crate: [`serve`] normally opens a single [`Store`] up front and
+//! shares it behind `Arc<Mutex<_>>`, since `rusqlite::Connection` is `Send`
+//! but not `Sync` — a mutex is enough to hand it across the blocking pool.
+//! The tap's writer runs in WAL mode, so this shared reader still sees new
+//! rows as they land without needing its own connection per request.
+//!
+//! The one exception is a legacy Phase-0 (v0) db file: [`storage::Store::open`]
+//! hands back an empty in-memory store for it rather than touching the file
+//! (destructive migration is the writer's job). Caching that empty store would
+//! pin the dashboard to "no data" until process restart even after the tap
+//! writer migrates the file. So [`serve`] checks [`storage::is_legacy_v0`]
+//! once up front and, only in that case, reopens a fresh `Store` per request
+//! instead of caching — see [`StoreHandle`].
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, StatusCode, Uri};
@@ -34,9 +45,24 @@ const DEFAULT_LIMIT: u32 = 100;
 /// Hard cap on `limit`, regardless of what the caller asks for.
 const MAX_LIMIT: u32 = 1000;
 
+/// How the shared state reaches a [`Store`] for a request. See the module
+/// doc comment for why the legacy-v0 case can't share the cached path.
+#[derive(Clone)]
+enum StoreHandle {
+    /// The common case: one `Store` opened at startup and shared behind a
+    /// mutex, relying on WAL mode so the tap writer's new rows are visible
+    /// without reopening.
+    Cached(Arc<Mutex<Store>>),
+    /// The db was a legacy v0 file when `serve` started. Every request
+    /// reopens `Store::open`, which re-runs the v0 check each time — so a
+    /// request placed after the tap writer has since migrated the file sees
+    /// the migrated data instead of the startup-time empty store.
+    PerRequest(PathBuf),
+}
+
 #[derive(Clone)]
 struct AppState {
-    db_path: PathBuf,
+    store: StoreHandle,
 }
 
 /// Bind `127.0.0.1:<port>` and serve the dashboard until the process exits.
@@ -56,7 +82,15 @@ pub async fn serve(
     port: u16,
     on_ready: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
-    let state = AppState { db_path };
+    // Decide before opening anything: once a legacy v0 file is migrated by
+    // the tap writer, a cached handle from this check would never notice.
+    let store_handle = if storage::is_legacy_v0(&db_path) {
+        StoreHandle::PerRequest(db_path.clone())
+    } else {
+        let store = Store::open(&db_path)?;
+        StoreHandle::Cached(Arc::new(Mutex::new(store)))
+    };
+    let state = AppState { store: store_handle };
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions))
@@ -77,17 +111,27 @@ pub async fn serve(
     Ok(())
 }
 
-/// Open a fresh `Store` on a blocking thread and run `f` against it. Every
-/// handler goes through this rather than holding a shared connection, since
-/// rusqlite's `Connection` is `!Sync`.
-async fn run_blocking<T, F>(db_path: PathBuf, f: F) -> anyhow::Result<T>
+/// Get to a `Store` on a blocking thread and run `f` against it. Every
+/// handler goes through this rather than touching a connection directly,
+/// since rusqlite's `Connection` is `!Sync` — the cached branch's mutex
+/// serialises access across the blocking pool; the per-request branch just
+/// opens its own (see [`StoreHandle`]).
+async fn run_blocking<T, F>(handle: StoreHandle, f: F) -> anyhow::Result<T>
 where
     F: FnOnce(&Store) -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    let joined = tokio::task::spawn_blocking(move || {
-        let store = Store::open(&db_path)?;
-        f(&store)
+    let joined = tokio::task::spawn_blocking(move || match handle {
+        StoreHandle::Cached(store) => {
+            let guard = store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("dashboard store lock poisoned"))?;
+            f(&guard)
+        }
+        StoreHandle::PerRequest(db_path) => {
+            let store = Store::open(&db_path)?;
+            f(&store)
+        }
     })
     .await
     .map_err(|e| anyhow::anyhow!("blocking task panicked: {e}"))?;
@@ -157,7 +201,7 @@ struct SessionsResponse {
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<SessionsResponse>, AppError> {
-    let sessions = run_blocking(state.db_path, |store| store.list_sessions()).await?;
+    let sessions = run_blocking(state.store.clone(), |store| store.list_sessions()).await?;
     Ok(Json(SessionsResponse {
         sessions: sessions.into_iter().map(SessionSummaryDto::from).collect(),
     }))
@@ -229,7 +273,7 @@ async fn session_messages(
         offset,
     };
     let (total, rows) =
-        run_blocking(state.db_path, move |store| store.messages(id, &filter)).await?;
+        run_blocking(state.store.clone(), move |store| store.messages(id, &filter)).await?;
     Ok(Json(MessagesResponse {
         total,
         messages: rows.into_iter().map(MessageRowDto::from).collect(),
@@ -273,7 +317,7 @@ async fn message_detail(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Response, AppError> {
-    let detail = run_blocking(state.db_path, move |store| store.message(id)).await?;
+    let detail = run_blocking(state.store.clone(), move |store| store.message(id)).await?;
     match detail {
         Some(d) => Ok(Json(MessageDetailDto::from(d)).into_response()),
         None => Ok((StatusCode::NOT_FOUND, "message not found").into_response()),
@@ -327,7 +371,7 @@ async fn session_stats(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<StatsDto>, AppError> {
-    let stats = run_blocking(state.db_path, move |store| store.stats(id)).await?;
+    let stats = run_blocking(state.store.clone(), move |store| store.stats(id)).await?;
     Ok(Json(StatsDto::from(stats)))
 }
 
@@ -377,7 +421,7 @@ async fn session_security(
 ) -> Result<Json<SecurityEventsResponse>, AppError> {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let offset = q.offset.unwrap_or(0);
-    let (total, rows) = run_blocking(state.db_path, move |store| {
+    let (total, rows) = run_blocking(state.store.clone(), move |store| {
         store.security_events(id, limit, offset)
     })
     .await?;
@@ -411,7 +455,7 @@ async fn session_security_counts(
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<SecurityCountsDto>, AppError> {
     let counts =
-        run_blocking(state.db_path, move |store| store.security_event_counts(id)).await?;
+        run_blocking(state.store.clone(), move |store| store.security_event_counts(id)).await?;
     Ok(Json(SecurityCountsDto::from(counts)))
 }
 

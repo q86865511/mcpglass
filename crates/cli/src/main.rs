@@ -6,28 +6,29 @@
 //! tap, so no proxy-side failure can alter or stall client<->server traffic
 //! (fail-open is the whole point of Phase 0).
 
-use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use policy::{fingerprints_from_tools_list, Mode, Policy};
-use proxy_core::{parse_line, Direction};
-use storage::{
-    ActionTaken, FingerprintOutcome, Record, SecurityEvent, SecurityEventKind, Store,
-};
+use policy::{Mode, Policy};
+use proxy_core::Direction;
+use storage::{ActionTaken, SecurityEvent, SecurityEventKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 use security::{Chunk, Decision, FrameAction, FramedStream};
+use tap::{now_ms, storage_loop, Logger, StorageMsg, TapEvent};
 
 mod clients;
 mod dash;
+mod gateway;
+mod gateway_config;
 mod security;
+mod tap;
 
 /// Memory guard for a single un-terminated frame on the tap path. Well above any
 /// realistic JSON-RPC message (the spike must handle >=10 MB payloads), yet still
@@ -37,7 +38,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 /// Test-only override (`MCPGLASS_MAX_LINE_BYTES`) for the frame cap, so integration
 /// tests can exercise the oversized-frame path without building a real 64 MB frame.
 /// Falls back to [`MAX_LINE_BYTES`]; ignored (falls back) if unset, unpar. or zero.
-fn max_line_bytes() -> usize {
+pub(crate) fn max_line_bytes() -> usize {
     std::env::var("MCPGLASS_MAX_LINE_BYTES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -95,6 +96,11 @@ enum SubCmd {
         /// Print the intended changes without writing or backing up.
         #[arg(long)]
         dry_run: bool,
+        /// Port the `mcpglass gateway` listens on; url-type servers are repointed
+        /// at `http://127.0.0.1:<port>/u/<name>`. Must match the port you run
+        /// `mcpglass gateway` with.
+        #[arg(long, default_value_t = 7412)]
+        gateway_port: u16,
     },
     /// Reverse `attach`, restoring each wrapped server's original command/args.
     Detach {
@@ -120,6 +126,41 @@ enum SubCmd {
         #[arg(long)]
         no_open: bool,
     },
+    /// Run the reverse proxy for url-type (Streamable HTTP) MCP servers:
+    /// `mcpglass gateway [--port N] [--db P] [--log P] [--policy P] [--enforce]
+    /// [--upstream name=url ...]`. Long-running; `attach` repoints clients at it.
+    Gateway {
+        /// Port to listen on (must match `attach --gateway-port`).
+        #[arg(long, default_value_t = 7412)]
+        port: u16,
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Proxy diagnostics log. Defaults to <data_local>/mcpglass/mcpglass.log.
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Security policy file. Same resolution as `wrap`; a file that exists but
+        /// fails to parse aborts startup.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Force enforce mode regardless of the policy file's `mode`.
+        #[arg(long)]
+        enforce: bool,
+        /// Upstream route `name=url` (repeatable). If omitted, routes are read from
+        /// `<data_local>/mcpglass/gateway.toml` (written by `attach`).
+        #[arg(long = "upstream", value_parser = parse_upstream)]
+        upstream: Vec<(String, String)>,
+    },
+}
+
+/// Parse a `--upstream name=url` argument into its (name, url) pair.
+fn parse_upstream(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((name, url)) if !name.is_empty() && !url.is_empty() => {
+            Ok((name.to_owned(), url.to_owned()))
+        }
+        _ => Err(format!("expected `name=url`, got {s:?}")),
+    }
 }
 
 #[tokio::main]
@@ -141,8 +182,9 @@ async fn main() {
             target,
             project,
             dry_run,
+            gateway_port,
         } => {
-            std::process::exit(clients::run_attach(&target, project, dry_run));
+            std::process::exit(clients::run_attach(&target, project, dry_run, gateway_port));
         }
         SubCmd::Detach {
             target,
@@ -155,29 +197,24 @@ async fn main() {
             let code = dash::run(db, port, no_open).await;
             std::process::exit(code);
         }
+        SubCmd::Gateway {
+            port,
+            db,
+            log,
+            policy,
+            enforce,
+            upstream,
+        } => {
+            let code = gateway::run(port, db, log, policy, enforce, upstream).await;
+            std::process::exit(code);
+        }
     }
-}
-
-/// One tapped frame handed to the storage thread. Off the hot path by design.
-struct TapEvent {
-    direction: Direction,
-    ts_ms: i64,
-    raw: Vec<u8>,
-}
-
-/// Work items for the storage thread. Both are strictly best-effort and off the
-/// forwarding path: a full or closed channel drops them without touching the wire.
-enum StorageMsg {
-    /// Record a framed message (either direction) into `messages`.
-    Tap(TapEvent),
-    /// Persist a security decision into `security_events`.
-    Security(SecurityEvent),
 }
 
 /// Exit code for a bad/missing security policy at startup. Distinct from the
 /// spawn failure (127); mirrors sysexits `EX_CONFIG`. Safe to abort here because
 /// no byte has been forwarded yet.
-const EXIT_POLICY_CONFIG: i32 = 78;
+pub(crate) const EXIT_POLICY_CONFIG: i32 = 78;
 
 /// Shared handle to our stdout. The server->client pump and the client->server
 /// gate both write here (real server frames and synthesized block responses), so
@@ -197,7 +234,7 @@ async fn run_wrap(
     let args: Vec<String> = command[1..].to_vec();
 
     // A session groups this whole run; label falls back to the program's basename.
-    let label = name.unwrap_or_else(|| program_label(&program));
+    let label = name.unwrap_or_else(|| program_label(&program, &args));
     let command_line = command.join(" ");
 
     let data_dir = default_data_dir();
@@ -325,7 +362,7 @@ async fn forward_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &[u8]) -> std::i
 /// wire — the exact failure this whole path is built to avoid. So we log the first
 /// drop and silently discard the rest; steady-state traffic never fills the channel
 /// and so never reaches this latch.
-fn log_drop_once(flag: &AtomicBool, logger: &Logger, msg: &str) {
+pub(crate) fn log_drop_once(flag: &AtomicBool, logger: &Logger, msg: &str) {
     if !flag.swap(true, Ordering::Relaxed) {
         logger.error(msg);
     }
@@ -579,160 +616,39 @@ async fn pump_s2c<R>(
     }
 }
 
-/// Drain the storage channel into SQLite. Runs on a blocking thread; a DB failure
-/// is logged and the item dropped — recording stops, forwarding does not.
-fn storage_loop(
-    mut rx: mpsc::Receiver<StorageMsg>,
-    db_path: PathBuf,
-    logger: Logger,
-    label: String,
-    command_line: String,
-) {
-    let store = match Store::open_with_log(&db_path, &|m| logger.info(m)) {
-        Ok(s) => s,
-        Err(e) => {
-            logger.error(format!("db open failed ({e:#}); recording disabled"));
-            // Keep draining so pumps' try_send never blocks/errors on a full queue.
-            while rx.blocking_recv().is_some() {}
-            return;
-        }
-    };
-    let session_id = match store.begin_session(&label, &command_line) {
-        Ok(id) => id,
-        Err(e) => {
-            logger.error(format!("begin_session failed ({e:#}); recording disabled"));
-            while rx.blocking_recv().is_some() {}
-            return;
-        }
-    };
-    // The server's start command is this server's stable identity, so fingerprint
-    // scoping (rug-pull detection) keys on it across sessions — a later wrap of the
-    // same command compares against what it advertised before.
-    let server_key = command_line.as_str();
-    // rpc_ids of tools/list *requests* we have seen but not yet matched to a
-    // response. Only a response whose id is in this set is fingerprinted, so an
-    // ordinary business response that happens to carry a `result.tools[]` shape is
-    // never mistaken for a tool advertisement. Requests are forwarded before their
-    // tap is enqueued and a response cannot precede its request, so the id is always
-    // present here by the time the matching response is drained.
-    let mut pending_tools_list: HashSet<String> = HashSet::new();
-    while let Some(msg) = rx.blocking_recv() {
-        match msg {
-            StorageMsg::Tap(ev) => {
-                let direction = ev.direction;
-                let parsed = parse_line(&ev.raw, direction);
-                // Capture the correlation keys before `parsed` is moved into Record.
-                let tools_list_req_id = if direction == Direction::C2s
-                    && parsed.method.as_deref() == Some("tools/list")
-                {
-                    parsed.rpc_id.clone()
-                } else {
-                    None
-                };
-                let resp_id = if direction == Direction::S2c {
-                    parsed.rpc_id.clone()
-                } else {
-                    None
-                };
-                let rec = Record {
-                    ts_ms: ev.ts_ms,
-                    direction,
-                    raw: String::from_utf8_lossy(&ev.raw).into_owned(),
-                    method: parsed.method,
-                    rpc_id: parsed.rpc_id,
-                    is_valid_json: parsed.is_valid_json,
-                    is_error: parsed.is_error,
-                };
-                if let Err(e) = store.insert(session_id, &rec) {
-                    logger.error(format!("insert failed (record dropped): {e:#}"));
-                }
-                // Track outstanding tools/list requests so only their responses are
-                // fingerprinted.
-                if let Some(id) = tools_list_req_id {
-                    pending_tools_list.insert(id);
-                }
-                // Rug-pull detection lives here so the s2c leg stays a pure tap: only
-                // a response that answers a tools/list request we saw has its
-                // per-tool fingerprints recorded and any change flagged. Failures are
-                // logged only.
-                if direction == Direction::S2c {
-                    if let Some(id) = resp_id {
-                        if pending_tools_list.remove(&id) {
-                            record_fingerprints(
-                                &store,
-                                session_id,
-                                server_key,
-                                &ev.raw,
-                                ev.ts_ms,
-                                &logger,
-                            );
-                        }
-                    }
-                }
-            }
-            StorageMsg::Security(ev) => {
-                if let Err(e) = store.insert_security_event(session_id, &ev) {
-                    logger.error(format!("security event insert failed (dropped): {e:#}"));
-                }
-            }
+/// Launchers whose own basename says nothing about which server is actually
+/// running — the useful label is the package/script they're invoking instead.
+const LAUNCHER_PROGRAMS: [&str; 7] = ["npx", "uvx", "bunx", "pnpm", "deno", "node", "python"];
+
+/// Default session label for the wrapped program. For launcher programs
+/// (`npx`, `uvx`, `bunx`, `pnpm`, `deno`, `node`, `python`) this is the
+/// basename of the first non-flag argument — e.g. `npx -y
+/// @modelcontextprotocol/server-git` labels as `server-git`, not `npx` —
+/// since the launcher's own name is the same for every server it runs.
+/// Anything else, or a launcher with no such argument, falls back to the
+/// program's own basename. (`attach` always passes `--name` explicitly, so
+/// this fallback only matters for a manually-invoked `mcpglass wrap`.)
+fn program_label(program: &str, args: &[String]) -> String {
+    let program_basename = basename(program);
+    let is_launcher = LAUNCHER_PROGRAMS
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&program_basename));
+    if is_launcher {
+        if let Some(first_arg) = args.iter().find(|a| !a.starts_with('-')) {
+            return basename(first_arg);
         }
     }
-    // The pumps have hung up: the child has exited. Best-effort end stamp.
-    if let Err(e) = store.end_session(session_id) {
-        logger.error(format!("end_session failed: {e:#}"));
-    }
+    program_basename
 }
 
-/// From one server->client frame, record each advertised tool's fingerprint and
-/// flag any that changed since first sighting (a rug-pull signal). A non
-/// tools/list frame yields no fingerprints; fingerprint changes are advisory
-/// (`flagged`), never blocking — the block decision only lives on the c2s leg.
-///
-/// `server_key` scopes the comparison to this server's identity so a change is
-/// detected across sessions (the caller passes the session's start command).
-fn record_fingerprints(
-    store: &Store,
-    session_id: i64,
-    server_key: &str,
-    raw: &[u8],
-    ts_ms: i64,
-    logger: &Logger,
-) {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
-        return;
-    };
-    for (tool, fingerprint) in fingerprints_from_tools_list(&value) {
-        match store.record_fingerprint(session_id, server_key, &tool, &fingerprint, ts_ms) {
-            Ok(FingerprintOutcome::Changed) => {
-                let ev = SecurityEvent {
-                    ts_ms,
-                    kind: SecurityEventKind::FingerprintChange,
-                    rule: tool.clone(),
-                    detail: format!(
-                        "tool {tool:?} definition changed since first sighting (possible rug-pull)"
-                    ),
-                    tool_name: Some(tool),
-                    rpc_id: None,
-                    action_taken: ActionTaken::Flagged,
-                };
-                if let Err(e) = store.insert_security_event(session_id, &ev) {
-                    logger.error(format!("fingerprint-change event insert failed: {e:#}"));
-                }
-            }
-            Ok(_) => {}
-            Err(e) => logger.error(format!("record_fingerprint failed: {e:#}")),
-        }
-    }
-}
-
-/// Basename (without extension) of the wrapped program, used as the default
-/// session label. Falls back to the raw string if there is nothing to strip.
-fn program_label(program: &str) -> String {
-    Path::new(program)
+/// Basename (without extension) of a path-like string. Falls back to the raw
+/// string if there is nothing to strip.
+fn basename(s: &str) -> String {
+    Path::new(s)
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
-        .unwrap_or(program)
+        .unwrap_or(s)
         .to_owned()
 }
 
@@ -817,59 +733,6 @@ pub(crate) fn default_data_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.data_local_dir().join("mcpglass"))
 }
 
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// Append-only diagnostics sink. Silently no-ops if the file can't be opened —
-/// logging must never be a reason to fail proxying. Never touches stdout/stderr.
-#[derive(Clone)]
-struct Logger {
-    inner: Arc<Mutex<Option<std::fs::File>>>,
-}
-
-impl Logger {
-    fn open(path: Option<&Path>) -> Self {
-        let file = path.and_then(|p| {
-            if let Some(parent) = p.parent() {
-                if !parent.as_os_str().is_empty() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-            }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
-        });
-        Self {
-            inner: Arc::new(Mutex::new(file)),
-        }
-    }
-
-    fn write(&self, level: &str, msg: &str) {
-        if let Ok(mut guard) = self.inner.lock() {
-            if let Some(file) = guard.as_mut() {
-                use std::io::Write;
-                let _ = writeln!(file, "{} [{}] {}", now_ms(), level, msg);
-                let _ = file.flush();
-            }
-        }
-    }
-
-    fn info(&self, msg: impl AsRef<str>) {
-        self.write("INFO", msg.as_ref());
-    }
-
-    fn error(&self, msg: impl AsRef<str>) {
-        self.write("ERROR", msg.as_ref());
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
@@ -932,6 +795,35 @@ mod tests {
     fn resolve_windows_executable_returns_none_when_nothing_matches() {
         let resolved = resolve_windows_executable("does-not-exist-xyz", "", |_| false);
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn program_label_takes_first_non_flag_arg_for_launchers() {
+        let args = vec!["-y".to_string(), "@modelcontextprotocol/server-git".to_string()];
+        assert_eq!(program_label("npx", &args), "server-git");
+    }
+
+    #[test]
+    fn program_label_falls_back_when_launcher_has_no_non_flag_arg() {
+        let args = vec!["-y".to_string(), "--verbose".to_string()];
+        assert_eq!(program_label("npx", &args), "npx");
+    }
+
+    #[test]
+    fn program_label_falls_back_when_launcher_has_no_args() {
+        assert_eq!(program_label("uvx", &[]), "uvx");
+    }
+
+    #[test]
+    fn program_label_recognizes_launcher_regardless_of_extension_or_case() {
+        let args = vec!["mcp-server-git".to_string()];
+        assert_eq!(program_label("NPX.CMD", &args), "mcp-server-git");
+    }
+
+    #[test]
+    fn program_label_uses_program_basename_for_non_launchers() {
+        let args = vec!["--stdio".to_string()];
+        assert_eq!(program_label("/usr/local/bin/my-server", &args), "my-server");
     }
 
     #[test]

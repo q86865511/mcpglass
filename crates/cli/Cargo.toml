@@ -20,13 +20,25 @@ proxy-core = { path = "../proxy-core" }
 policy = { path = "../policy" }
 storage = { path = "../storage" }
 dashboard = { path = "../dashboard" }
-tokio.workspace = true
+# `net` is needed by the gateway's TcpListener / axum::serve, on top of the
+# workspace defaults (rt/io/process/sync/macros).
+tokio = { workspace = true, features = ["net"] }
 clap.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 # preserve_order keeps client-config key order stable across attach/detach.
 serde_json = { workspace = true, features = ["preserve_order"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 opener = "0.7"
+# HTTP gateway: axum server + reqwest upstream client (rustls, streaming bodies).
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 rusqlite.workspace = true
+# gateway_http integration test: fake upstream (axum) + client (reqwest).
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros"] }

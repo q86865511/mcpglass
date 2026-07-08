@@ -4,7 +4,7 @@
 between any AI client (Claude Code, Claude Desktop, Cursor, ...) and your MCP servers, giving you
 debugging, observability, auditing, and security. All data stays on your machine.
 
-> Status: early development (Phase 2 — interception, config takeover, dashboard, security layer).
+> Status: early development (Phase 3 — stdio + HTTP interception, config takeover, dashboard, security layer).
 
 ## Why
 
@@ -16,7 +16,8 @@ debugging, observability, auditing, and security. All data stays on your machine
 ## Features
 
 - **Transparent interception** — `mcpglass wrap -- <server command>` runs any stdio MCP server with zero behavior change (fail-open: proxy errors never block traffic).
-- **One-command takeover** — `mcpglass attach [claude-code|claude-desktop|cursor|all]` rewrites client configs to route existing servers through the proxy (with backups); `mcpglass detach` restores them. `--dry-run` previews.
+- **HTTP (streamable) transport** — `mcpglass gateway` runs a local reverse proxy for Streamable HTTP MCP servers (spec 2025-06-18): JSON and SSE responses stream through untouched while a side-channel tap records them; policy decisions apply per request; loopback-only with Origin/Host validation against DNS rebinding.
+- **One-command takeover** — `mcpglass attach [claude-code|claude-desktop|cursor|all]` rewrites client configs to route existing servers through the proxy (with backups) — stdio servers are wrapped, url servers are pointed at the gateway with their upstream recorded in `gateway.toml`; `mcpglass detach` restores them. `--dry-run` previews.
 - **Local dashboard** — `mcpglass dashboard` opens a timeline of every request/response/notification: per-session view, filters, payload inspector, per-method latency, and a Security tab.
 - **Security layer** — `mcpglass wrap --policy <file>` enforces a TOML policy:
   - **Tool integrity pinning** — fingerprints each server's tool definitions and flags a change across runs (rug-pull detection).
@@ -29,7 +30,7 @@ debugging, observability, auditing, and security. All data stays on your machine
   JSON-RPC error to the client instead of forwarding — it never severs the connection, and any
   proxy-internal error always fails open.
 
-Planned (Phase 3+): HTTP (streamable) transport, context bloat analytics, request replay.
+Planned (Phase 3+): context bloat analytics, request replay, error injection.
 
 > **Privacy note:** the local SQLite database records **full raw traffic**, including any secret
 > that flows through it. This is by design (it is a traffic recorder) and the data never leaves

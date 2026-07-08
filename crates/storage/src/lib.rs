@@ -25,7 +25,13 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 /// `tool_fingerprints` (via `ALTER TABLE ADD COLUMN`, so existing fingerprint rows
 /// are preserved with an empty `server_key`) to scope rug-pull detection by server
 /// identity *across sessions*, and never touches `sessions`/`messages` rows.
-const SCHEMA_VERSION: i64 = 3;
+///
+/// v3 -> v4 is again additive: it adds `fp_version` (DEFAULT 1) and a nullable
+/// `last_seen_ts_ms` to `tool_fingerprints`. `last_seen_ts_ms` lets comparison key
+/// on the most recent observation so an A -> B -> A oscillation is detected, and
+/// `fp_version` marks each row's fingerprint algorithm so a legacy v1 row can be
+/// recognised and silently re-pinned to v2 during the dual-hash migration.
+const SCHEMA_VERSION: i64 = 4;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -224,13 +230,20 @@ pub struct SecurityCounts {
 /// again in a later session compares against the fingerprints it advertised before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FingerprintOutcome {
-    /// This exact `(server_key, tool, fingerprint)` was already recorded.
+    /// The observation matches the *most recent* fingerprint on record for this
+    /// `(server_key, tool)` — the definition is unchanged.
     Unchanged,
     /// First fingerprint seen for this `(server_key, tool)`.
     New,
-    /// This `(server_key, tool)` was seen before under a different fingerprint
-    /// (rug-pull suspicion), possibly in an earlier session.
+    /// A fingerprint never seen before for this `(server_key, tool)` (rug-pull
+    /// suspicion), superseding the previous most-recent one. Possibly first
+    /// observed in an earlier session.
     Changed,
+    /// The observation matches a *historical* (non-most-recent) fingerprint: the
+    /// definition oscillated back to a previously seen one (A -> B -> A). Also a
+    /// rug-pull signal — a server can flip a tool's definition between requests to
+    /// evade a membership-only check.
+    Reverted,
 }
 
 /// Owns a single write connection. Intended to run on one dedicated thread that
@@ -278,24 +291,42 @@ impl Store {
     }
 
     fn init_schema(&self) -> Result<()> {
-        // v2 -> v3 additive upgrade FIRST, so the CREATE batch below always sees a
-        // `tool_fingerprints` table that carries `server_key`. On a pre-v3 file the
-        // table exists without the column and is patched in place with ADD COLUMN
-        // (existing rows backfill to '' — acceptable: those are early Phase-2
-        // fingerprints that predate server scoping). On a fresh db the table does
-        // not exist yet, so this is a no-op and the CREATE below builds the column
-        // from the start. Idempotent: re-opening a v3 file finds the column and
-        // skips the ALTER.
-        self.migrate_v3_add_server_key()?;
+        // Fast path: a db already stamped at the current version needs no work. This
+        // is a plain autocommit read that holds no lock afterwards, so several
+        // connections opening an existing db (the HTTP gateway runs one storage
+        // session per upstream) never contend on the schema batch below — that batch
+        // reads `sqlite_master` and then writes within one transaction, a read->write
+        // promotion that `busy_timeout` cannot resolve when writers overlap. The
+        // first opener still creates everything atomically; the rest just skip.
+        let version: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap_or(0);
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
 
-        // BEGIN/COMMIT makes table creation and the `user_version = 3` stamp one
+        // v2 -> v3 and v3 -> v4 additive upgrades FIRST, so the CREATE batch below
+        // always sees a `tool_fingerprints` table that carries every current column.
+        // On a pre-v3 file the table exists without `server_key` and is patched in
+        // place with ADD COLUMN (existing rows backfill to '' — acceptable: those are
+        // early Phase-2 fingerprints that predate server scoping). On a pre-v4 file it
+        // is likewise patched with `fp_version` (backfill 1: legacy rows were hashed
+        // under v1) and `last_seen_ts_ms` (backfill NULL). On a fresh db the table
+        // does not exist yet, so these are no-ops and the CREATE below builds every
+        // column from the start. Idempotent: re-opening a v4 file finds the columns
+        // and skips the ALTERs.
+        self.migrate_v3_add_server_key()?;
+        self.migrate_v4_add_fp_columns()?;
+
+        // BEGIN/COMMIT makes table creation and the `user_version = 4` stamp one
         // atomic unit, so a concurrent reader's legacy-v0 probe (see
         // `is_legacy_v0`) can never observe the `messages` table mid-creation
         // with `user_version` still at 0 and misclassify a fresh db as v0.
         //
-        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3 upgrade additive: on an
+        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4 upgrade additive: on an
         // existing file the sessions/messages tables are left untouched, any missing
-        // tables are appended, and `user_version` is bumped to 3.
+        // tables are appended, and `user_version` is bumped to 4.
         self.conn
             .execute_batch(
                 "BEGIN;
@@ -339,14 +370,16 @@ impl Store {
                     fingerprint      TEXT    NOT NULL,
                     first_seen_ts_ms INTEGER NOT NULL,
                     server_key       TEXT    NOT NULL DEFAULT '',
+                    fp_version       INTEGER NOT NULL DEFAULT 1,
+                    last_seen_ts_ms  INTEGER,
                     UNIQUE (server_key, tool_name, fingerprint)
                 );
                 CREATE INDEX IF NOT EXISTS idx_tool_fingerprints_scope
                     ON tool_fingerprints(server_key, tool_name, id);
-                PRAGMA user_version = 3;
+                PRAGMA user_version = 4;
                 COMMIT;",
             )
-            .context("creating v3 schema")?;
+            .context("creating v4 schema")?;
         Ok(())
     }
 
@@ -383,6 +416,48 @@ impl Store {
                         ADD COLUMN server_key TEXT NOT NULL DEFAULT ''",
                 )
                 .context("adding server_key column (v2 -> v3)")?;
+        }
+        Ok(())
+    }
+
+    /// Add the `fp_version` and `last_seen_ts_ms` columns to a pre-v4
+    /// `tool_fingerprints` table. Legacy rows backfill to `fp_version = 1` (they
+    /// were hashed under the v1 algorithm) and a NULL `last_seen_ts_ms` (which the
+    /// recency comparison COALESCEs to `first_seen_ts_ms`). A no-op when the table
+    /// is absent (fresh db, handled by the CREATE in [`Store::init_schema`]) or the
+    /// columns already exist (a v4 file).
+    ///
+    /// Kept separate from the CREATE batch, and gated on an explicit column probe,
+    /// for the same reason as [`Store::migrate_v3_add_server_key`]: `ALTER TABLE ADD
+    /// COLUMN` is not conditional in SQLite, so running it on an existing column is
+    /// an error.
+    fn migrate_v4_add_fp_columns(&self) -> Result<()> {
+        let table_exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_fingerprints'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !table_exists {
+            return Ok(());
+        }
+        for (col, decl) in [
+            ("fp_version", "fp_version INTEGER NOT NULL DEFAULT 1"),
+            ("last_seen_ts_ms", "last_seen_ts_ms INTEGER"),
+        ] {
+            let has_col: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('tool_fingerprints') WHERE name = ?1",
+                params![col],
+                |r| r.get(0),
+            )?;
+            if has_col == 0 {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE tool_fingerprints ADD COLUMN {decl}"))
+                    .with_context(|| format!("adding {col} column (v3 -> v4)"))?;
+            }
         }
         Ok(())
     }
@@ -603,73 +678,141 @@ impl Store {
         Ok(())
     }
 
-    /// Record an observed `(tool_name, fingerprint)` under `server_key` and classify
-    /// it. `New` = first fingerprint seen for this `(server_key, tool)`;
-    /// `Unchanged` = this exact fingerprint was already recorded; `Changed` = this
-    /// `(server_key, tool)` was seen before under a different fingerprint (rug-pull
-    /// suspicion). The caller decides whether a `Changed` outcome warrants a
-    /// `fingerprint_change` event.
+    /// Record an observed tool definition — hashed under both algorithm versions
+    /// (`fp_v1`, `fp_v2`) — under `server_key` and classify it against history:
+    ///
+    /// - `New`: first fingerprint ever seen for this `(server_key, tool)`.
+    /// - `Unchanged`: matches the *most recent* recorded fingerprint.
+    /// - `Reverted`: matches a *historical* (non-most-recent) fingerprint — the
+    ///   definition oscillated back (A -> B -> A).
+    /// - `Changed`: a fingerprint never seen before for this `(server_key, tool)`.
+    ///
+    /// The caller decides whether a `Changed`/`Reverted` outcome warrants a
+    /// `fingerprint_change` event; `New`/`Unchanged` are silent.
+    ///
+    /// **Recency, not membership.** Comparison keys on the row with the greatest
+    /// `last_seen_ts_ms` (COALESCEd to `first_seen_ts_ms` for legacy rows), so a
+    /// server that flips a tool between two definitions is caught each way — a plain
+    /// set-membership check would silently accept the flip-back.
+    ///
+    /// **Dual-hash migration.** A stored row hashed under v1 is compared on `fp_v1`;
+    /// a v2 row on `fp_v2`. When a v1 row still matches on v1, it is silently
+    /// re-pinned to v2 (its `fingerprint`/`fp_version` are rewritten to the v2 hash)
+    /// and reported `Unchanged` — no false-positive alert for the algorithm bump.
+    /// A v1 *mismatch* is a genuine change and alerts as usual.
     ///
     /// The comparison scope is `(server_key, tool_name)` and deliberately spans
-    /// sessions: the canonical rug-pull is a server that is approved on one `wrap`
-    /// and then mutates a tool's definition on a *later* one, so a same-session-only
-    /// comparison would miss the primary attack. `session_id` is still stored for
-    /// traceability (which run first saw a given fingerprint).
+    /// sessions: the canonical rug-pull is a server approved on one `wrap` that then
+    /// mutates a tool on a *later* one. `session_id` is stored for traceability.
     ///
-    /// Append-only: a `Changed` outcome inserts a new row and keeps the prior
-    /// fingerprint(s), so the history of a tool's fingerprints is preserved.
+    /// Append-only for distinct fingerprints: `Changed` inserts a new row and keeps
+    /// the prior one(s); `Unchanged`/`Reverted` only refresh an existing row's
+    /// `last_seen_ts_ms` (and re-pin a v1 row), so a tool's fingerprint history is
+    /// preserved.
     pub fn record_fingerprint(
         &self,
         session_id: i64,
         server_key: &str,
         tool_name: &str,
-        fingerprint: &str,
+        fp_v1: &str,
+        fp_v2: &str,
         ts_ms: i64,
     ) -> Result<FingerprintOutcome> {
-        // Exact (server_key, tool, fingerprint) already known -> nothing to record.
-        let same_seen = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM tool_fingerprints
-                 WHERE server_key = ?1 AND tool_name = ?2 AND fingerprint = ?3",
-                params![server_key, tool_name, fingerprint],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        if same_seen {
+        // Load history for this (server, tool), most recent observation first. A
+        // NULL last_seen (legacy pre-v4 row) falls back to first_seen for ordering.
+        let mut stmt = self.conn.prepare(
+            "SELECT id, fingerprint, fp_version
+             FROM tool_fingerprints
+             WHERE server_key = ?1 AND tool_name = ?2
+             ORDER BY COALESCE(last_seen_ts_ms, first_seen_ts_ms) DESC, id DESC",
+        )?;
+        let rows: Vec<(i64, String, i64)> = stmt
+            .query_map(params![server_key, tool_name], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // First sighting: pin the v2 baseline and stay silent.
+        if rows.is_empty() {
+            self.insert_fingerprint(session_id, server_key, tool_name, fp_v2, ts_ms)?;
+            return Ok(FingerprintOutcome::New);
+        }
+
+        // Does the observation match a stored row? A v1 row is compared on the v1
+        // hash (dual-hash transition), a v2 row on the v2 hash.
+        let matches = |fingerprint: &str, fp_version: i64| -> bool {
+            if fp_version <= 1 {
+                fingerprint == fp_v1
+            } else {
+                fingerprint == fp_v2
+            }
+        };
+
+        // Matches the current (most-recent) definition -> Unchanged.
+        let (latest_id, latest_fp, latest_ver) = &rows[0];
+        if matches(latest_fp, *latest_ver) {
+            self.touch_fingerprint(*latest_id, *latest_ver, fp_v2, ts_ms)?;
             return Ok(FingerprintOutcome::Unchanged);
         }
-        // Fingerprint is new for this (server, tool); distinguish first sighting
-        // from a change (across any prior session under the same server_key).
-        let tool_seen = self
-            .conn
-            .query_row(
-                "SELECT 1 FROM tool_fingerprints
-                 WHERE server_key = ?1 AND tool_name = ?2",
-                params![server_key, tool_name],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some();
-        // Insert scoped by server_key. The v3 UNIQUE(server_key, tool_name,
-        // fingerprint) rejects a duplicate, but the `same_seen` check above already
-        // returns before reaching here for known pairs. (On a file upgraded from v2
-        // the pre-v3 UNIQUE(session_id, tool_name, fingerprint) also still exists;
-        // it cannot collide here because session ids are fresh per `wrap` run.)
+
+        // Matches an older definition -> the tool oscillated back (Reverted).
+        if let Some((id, _, ver)) = rows.iter().find(|(_, fp, ver)| matches(fp, *ver)) {
+            self.touch_fingerprint(*id, *ver, fp_v2, ts_ms)?;
+            return Ok(FingerprintOutcome::Reverted);
+        }
+
+        // A definition never seen before for this (server, tool) -> Changed.
+        self.insert_fingerprint(session_id, server_key, tool_name, fp_v2, ts_ms)?;
+        Ok(FingerprintOutcome::Changed)
+    }
+
+    /// Insert a fresh v2 fingerprint row (first_seen == last_seen == `ts_ms`).
+    fn insert_fingerprint(
+        &self,
+        session_id: i64,
+        server_key: &str,
+        tool_name: &str,
+        fp_v2: &str,
+        ts_ms: i64,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO tool_fingerprints
-                    (session_id, server_key, tool_name, fingerprint, first_seen_ts_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![session_id, server_key, tool_name, fingerprint, ts_ms],
+                    (session_id, server_key, tool_name, fingerprint,
+                     first_seen_ts_ms, last_seen_ts_ms, fp_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 2)",
+                params![session_id, server_key, tool_name, fp_v2, ts_ms],
             )
             .context("recording tool fingerprint")?;
-        Ok(if tool_seen {
-            FingerprintOutcome::Changed
+        Ok(())
+    }
+
+    /// Refresh a matched row's `last_seen_ts_ms`. A legacy v1 row is additionally
+    /// re-pinned to v2 (its `fingerprint` becomes `fp_v2`, `fp_version` becomes 2),
+    /// folding the current annotations into the baseline without an alert. A v2 row
+    /// keeps its fingerprint (already `fp_v2`), avoiding any UNIQUE churn.
+    fn touch_fingerprint(
+        &self,
+        id: i64,
+        fp_version: i64,
+        fp_v2: &str,
+        ts_ms: i64,
+    ) -> Result<()> {
+        if fp_version <= 1 {
+            self.conn.execute(
+                "UPDATE tool_fingerprints
+                    SET last_seen_ts_ms = ?2, fingerprint = ?3, fp_version = 2
+                 WHERE id = ?1",
+                params![id, ts_ms, fp_v2],
+            )
         } else {
-            FingerprintOutcome::New
-        })
+            self.conn.execute(
+                "UPDATE tool_fingerprints SET last_seen_ts_ms = ?2 WHERE id = ?1",
+                params![id, ts_ms],
+            )
+        }
+        .context("refreshing tool fingerprint")?;
+        Ok(())
     }
 
     /// A paged window of a session's security events plus the total match count
@@ -813,6 +956,13 @@ fn open_physical(db_path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("opening db {}", db_path.display()))?;
+    // WAL still allows only one writer at a time. The stdio `wrap` path has a single
+    // writer, but the HTTP gateway runs one storage session per upstream — i.e.
+    // several writer connections on this same db. Set the busy timeout FIRST, before
+    // the mode-switching pragmas below, so every subsequent lock acquisition (WAL
+    // switch, inserts) waits-and-retries instead of failing fast with SQLITE_BUSY.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .context("setting busy_timeout")?;
     // WAL lets a separate reader (e.g. the dashboard) observe the live session
     // without blocking the writer.
     conn.pragma_update(None, "journal_mode", "WAL")
@@ -825,7 +975,13 @@ fn open_physical(db_path: &Path) -> Result<Connection> {
 /// Probe `db_path` on a short-lived connection for the Phase-0 (v0) layout:
 /// `user_version == 0` with a `messages` table. Returns `false` if the path
 /// doesn't exist or can't be probed, leaving it for the real open to surface.
-fn is_legacy_v0(db_path: &Path) -> bool {
+///
+/// Public so a read-only caller (the dashboard) can decide *before* opening a
+/// [`Store`] whether caching the connection is safe: [`Store::open`] hands
+/// back an empty in-memory store for a v0 file, so a cached handle would stay
+/// pinned to "no data" even after the tap writer's [`Store::open_with_log`]
+/// migrates the file on disk. See `dashboard::serve`.
+pub fn is_legacy_v0(db_path: &Path) -> bool {
     if !db_path.exists() {
         return false;
     }
@@ -925,6 +1081,15 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// Record a fingerprint on a fresh (all-v2) db: `fp` is the v2 hash and the v1
+    /// hash is a distinct derived string. Since fresh-db rows are all v2, matching
+    /// keys on the v2 value, so `fp` alone drives New/Unchanged/Changed/Reverted.
+    fn rf(store: &Store, sid: i64, srv: &str, tool: &str, fp: &str, ts: i64) -> FingerprintOutcome {
+        store
+            .record_fingerprint(sid, srv, tool, &format!("{fp}-v1"), fp, ts)
+            .unwrap()
     }
 
     fn rec(direction: Direction, ts_ms: i64, raw: &str) -> Record {
@@ -1278,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_to_v3_additive_upgrade_preserves_data() {
+    fn v1_to_v4_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v1-upgrade");
         let db = tmp.db();
         write_legacy_v1_db(&db);
@@ -1290,7 +1455,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
 
         // ...without disturbing the pre-existing v1 data.
         let sessions = store.list_sessions().unwrap();
@@ -1308,10 +1473,7 @@ mod tests {
         let (n, ev_rows) = store.security_events(1, 50, 0).unwrap();
         assert_eq!(n, 1);
         assert_eq!(ev_rows.len(), 1);
-        assert_eq!(
-            store.record_fingerprint(1, "srv", "t", "fp", 1).unwrap(),
-            FingerprintOutcome::New
-        );
+        assert_eq!(rf(&store, 1, "srv", "t", "fp", 1), FingerprintOutcome::New);
     }
 
     /// Hand-build a v2 file: the v2 schema (sessions + messages + security_events +
@@ -1391,18 +1553,18 @@ mod tests {
     }
 
     #[test]
-    fn v2_to_v3_additive_upgrade_preserves_data() {
+    fn v2_to_v4_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v2-upgrade");
         let db = tmp.db();
         write_legacy_v2_db(&db);
 
-        // Opening a v2 file upgrades it in place to v3 via ALTER TABLE ADD COLUMN...
+        // Opening a v2 file upgrades it in place to v4 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
 
         // ...preserving all pre-existing v2 rows (sessions/messages/events).
         let sessions = store.list_sessions().unwrap();
@@ -1425,18 +1587,15 @@ mod tests {
         assert_eq!(fp_server, "");
 
         // New fingerprints record under the v3 server_key scope on the upgraded file.
-        assert_eq!(
-            store.record_fingerprint(1, "srv", "t", "fp", 200).unwrap(),
-            FingerprintOutcome::New
-        );
+        assert_eq!(rf(&store, 1, "srv", "t", "fp", 200), FingerprintOutcome::New);
 
-        // Re-opening the upgraded file is a no-op (ALTER not re-run) and still v3.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v4.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 3);
+        assert_eq!(version2, 4);
     }
 
     #[test]
@@ -1522,13 +1681,32 @@ mod tests {
         let srv = "echo";
 
         // First sighting of a tool -> New.
-        assert_eq!(store.record_fingerprint(sid, srv, "search", "aaa", 1).unwrap(), FingerprintOutcome::New);
+        assert_eq!(rf(&store, sid, srv, "search", "aaa", 1), FingerprintOutcome::New);
         // Same tool, same fingerprint -> Unchanged.
-        assert_eq!(store.record_fingerprint(sid, srv, "search", "aaa", 2).unwrap(), FingerprintOutcome::Unchanged);
-        // Same tool, different fingerprint -> Changed (rug-pull suspicion).
-        assert_eq!(store.record_fingerprint(sid, srv, "search", "bbb", 3).unwrap(), FingerprintOutcome::Changed);
+        assert_eq!(rf(&store, sid, srv, "search", "aaa", 2), FingerprintOutcome::Unchanged);
+        // Same tool, a brand-new fingerprint -> Changed (rug-pull suspicion).
+        assert_eq!(rf(&store, sid, srv, "search", "bbb", 3), FingerprintOutcome::Changed);
         // A different tool is New again, independent of `search`.
-        assert_eq!(store.record_fingerprint(sid, srv, "fetch", "aaa", 4).unwrap(), FingerprintOutcome::New);
+        assert_eq!(rf(&store, sid, srv, "fetch", "aaa", 4), FingerprintOutcome::New);
+    }
+
+    #[test]
+    fn record_fingerprint_reverts_on_oscillation() {
+        // A -> B -> A: returning to a previously-seen definition is Reverted, not
+        // Unchanged — a set-membership check would miss the flip-back.
+        let tmp = TempDir::new("fp-oscillation");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        let srv = "echo";
+
+        assert_eq!(rf(&store, sid, srv, "search", "aaa", 1), FingerprintOutcome::New);
+        assert_eq!(rf(&store, sid, srv, "search", "bbb", 2), FingerprintOutcome::Changed);
+        // Back to aaa: it is in history but no longer the most recent -> Reverted.
+        assert_eq!(rf(&store, sid, srv, "search", "aaa", 3), FingerprintOutcome::Reverted);
+        // Flip forward to bbb again: bbb is now the older one -> Reverted again.
+        assert_eq!(rf(&store, sid, srv, "search", "bbb", 4), FingerprintOutcome::Reverted);
+        // Re-observing the current definition (aaa is now most recent) -> Unchanged.
+        assert_eq!(rf(&store, sid, srv, "search", "bbb", 5), FingerprintOutcome::Unchanged);
     }
 
     #[test]
@@ -1539,15 +1717,15 @@ mod tests {
 
         // Session 1 approves `search` under fingerprint aaa.
         let s1 = store.begin_session("run1", srv).unwrap();
-        assert_eq!(store.record_fingerprint(s1, srv, "search", "aaa", 1).unwrap(), FingerprintOutcome::New);
+        assert_eq!(rf(&store, s1, srv, "search", "aaa", 1), FingerprintOutcome::New);
 
         // A LATER session wrapping the SAME server re-advertises `search`...
         let s2 = store.begin_session("run2", srv).unwrap();
         // ...with the same definition -> Unchanged (no false positive across runs).
-        assert_eq!(store.record_fingerprint(s2, srv, "search", "aaa", 2).unwrap(), FingerprintOutcome::Unchanged);
+        assert_eq!(rf(&store, s2, srv, "search", "aaa", 2), FingerprintOutcome::Unchanged);
         // ...but a mutated definition is caught as Changed even though it is the
         // first time THIS session saw the tool (the canonical rug-pull).
-        assert_eq!(store.record_fingerprint(s2, srv, "search", "bbb", 3).unwrap(), FingerprintOutcome::Changed);
+        assert_eq!(rf(&store, s2, srv, "search", "bbb", 3), FingerprintOutcome::Changed);
     }
 
     #[test]
@@ -1558,11 +1736,11 @@ mod tests {
 
         // The same tool name under a different server_key is a different tool: its
         // fingerprint does not interfere with the other server's history.
-        assert_eq!(store.record_fingerprint(sid, "server-a", "search", "aaa", 1).unwrap(), FingerprintOutcome::New);
-        assert_eq!(store.record_fingerprint(sid, "server-b", "search", "zzz", 2).unwrap(), FingerprintOutcome::New);
+        assert_eq!(rf(&store, sid, "server-a", "search", "aaa", 1), FingerprintOutcome::New);
+        assert_eq!(rf(&store, sid, "server-b", "search", "zzz", 2), FingerprintOutcome::New);
         // server-a's `search` re-advertised as aaa is still Unchanged; server-b's
         // divergent fingerprint never counted as a change for server-a.
-        assert_eq!(store.record_fingerprint(sid, "server-a", "search", "aaa", 3).unwrap(), FingerprintOutcome::Unchanged);
+        assert_eq!(rf(&store, sid, "server-a", "search", "aaa", 3), FingerprintOutcome::Unchanged);
     }
 
     #[test]
@@ -1571,8 +1749,8 @@ mod tests {
         let store = Store::open(&tmp.db()).unwrap();
         let sid = store.begin_session("s", "echo").unwrap();
         let srv = "echo";
-        store.record_fingerprint(sid, srv, "search", "aaa", 1).unwrap();
-        assert_eq!(store.record_fingerprint(sid, srv, "search", "bbb", 2).unwrap(), FingerprintOutcome::Changed);
+        rf(&store, sid, srv, "search", "aaa", 1);
+        assert_eq!(rf(&store, sid, srv, "search", "bbb", 2), FingerprintOutcome::Changed);
 
         // Both fingerprint rows are retained (no overwrite on a change).
         let count: i64 = store
@@ -1586,8 +1764,165 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
 
-        // Re-recording either historical fingerprint is still Unchanged.
-        assert_eq!(store.record_fingerprint(sid, srv, "search", "aaa", 3).unwrap(), FingerprintOutcome::Unchanged);
-        assert_eq!(store.record_fingerprint(sid, srv, "search", "bbb", 4).unwrap(), FingerprintOutcome::Unchanged);
+        // Re-recording the older fingerprint is now Reverted (oscillation), and the
+        // current one is Unchanged — history is preserved either way (still 2 rows).
+        assert_eq!(rf(&store, sid, srv, "search", "aaa", 3), FingerprintOutcome::Reverted);
+        assert_eq!(rf(&store, sid, srv, "search", "aaa", 4), FingerprintOutcome::Unchanged);
+        let count2: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_fingerprints
+                 WHERE server_key = ?1 AND tool_name = 'search'",
+                params![srv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count2, 2);
+    }
+
+    /// Hand-build a v3 file: the v1/v2 tables plus the *pre-v4* tool_fingerprints
+    /// (with `server_key` but no `fp_version` / `last_seen_ts_ms`) carrying one
+    /// legacy v1 fingerprint row, `user_version` stamped 3.
+    fn write_legacy_v3_db(db: &Path, legacy_v1_fp: &str) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                command TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL,
+                is_error INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('policy_deny','secret_leak','fingerprint_change')),
+                rule TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                tool_name TEXT,
+                rpc_id TEXT,
+                action_taken TEXT NOT NULL CHECK (action_taken IN ('flagged','blocked'))
+            );
+            CREATE TABLE tool_fingerprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                tool_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                first_seen_ts_ms INTEGER NOT NULL,
+                server_key TEXT NOT NULL DEFAULT '',
+                UNIQUE (server_key, tool_name, fingerprint)
+            );
+            PRAGMA user_version = 3;
+            COMMIT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label, command, started_at_ms) VALUES ('old', 'srv', 42)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_fingerprints
+                (session_id, server_key, tool_name, fingerprint, first_seen_ts_ms)
+             VALUES (1, 'srv', 'search', ?1, 100)",
+            params![legacy_v1_fp],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v3_to_v4_additive_upgrade_preserves_and_backfills_fingerprints() {
+        let tmp = TempDir::new("v3-upgrade");
+        let db = tmp.db();
+        write_legacy_v3_db(&db, "legacy_v1");
+
+        // Opening a v3 file upgrades it in place to v4 via ALTER TABLE ADD COLUMN...
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+
+        // ...the legacy fingerprint row survives, backfilled to fp_version=1 with a
+        // NULL last_seen_ts_ms (recency then falls back to first_seen_ts_ms).
+        let (fp_version, last_seen): (i64, Option<i64>) = store
+            .conn
+            .query_row(
+                "SELECT fp_version, last_seen_ts_ms FROM tool_fingerprints WHERE tool_name = 'search'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp_version, 1);
+        assert_eq!(last_seen, None);
+
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v4.
+        let store2 = Store::open(&db).unwrap();
+        let version2: i64 = store2
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version2, 4);
+    }
+
+    #[test]
+    fn record_fingerprint_dual_hash_silently_repins_matching_v1_row() {
+        // A legacy v1 row whose v1 hash still matches is re-pinned to v2 with no
+        // alert (Unchanged) — the algorithm bump must not be a false positive.
+        let tmp = TempDir::new("fp-dualhash-repin");
+        let db = tmp.db();
+        write_legacy_v3_db(&db, "v1hashA");
+        let store = Store::open(&db).unwrap();
+
+        // v1 matches the stored legacy hash -> Unchanged, and the row is re-pinned.
+        assert_eq!(
+            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashA", 200).unwrap(),
+            FingerprintOutcome::Unchanged
+        );
+        let (fp_version, fingerprint): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT fp_version, fingerprint FROM tool_fingerprints WHERE tool_name = 'search'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp_version, 2, "legacy v1 row should be re-pinned to v2");
+        assert_eq!(fingerprint, "v2hashA");
+
+        // Now that the baseline folds in annotations, a later annotations-only change
+        // (same v1, different v2) IS detected as a change.
+        assert_eq!(
+            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashB", 300).unwrap(),
+            FingerprintOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn record_fingerprint_dual_hash_alerts_when_v1_changed() {
+        // A legacy v1 row whose v1 hash no longer matches is a genuine change.
+        let tmp = TempDir::new("fp-dualhash-alert");
+        let db = tmp.db();
+        write_legacy_v3_db(&db, "v1hashA");
+        let store = Store::open(&db).unwrap();
+
+        assert_eq!(
+            store.record_fingerprint(1, "srv", "search", "v1hashB", "v2hashB", 200).unwrap(),
+            FingerprintOutcome::Changed
+        );
     }
 }
