@@ -18,6 +18,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+mod clients;
+mod dash;
+
 /// Memory guard for a single un-terminated frame on the tap path. Well above any
 /// realistic JSON-RPC message (the spike must handle >=10 MB payloads), yet still
 /// bounded so a runaway stream can't exhaust memory. Forwarding ignores this.
@@ -35,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Wrap an MCP server: `mcpglass wrap [--db P] [--log P] -- <cmd> [args...]`.
+    /// Wrap an MCP server: `mcpglass wrap [--db P] [--log P] [--name L] -- <cmd> [args...]`.
     Wrap {
         /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
         #[arg(long)]
@@ -44,9 +47,49 @@ enum SubCmd {
         /// Never written to stdout/stderr — those are the protocol channels.
         #[arg(long)]
         log: Option<PathBuf>,
+        /// Human-friendly session label. Defaults to the wrapped program's name.
+        #[arg(long)]
+        name: Option<String>,
         /// The server command and its args, after `--`.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// Route a client's stdio MCP servers through mcpglass:
+    /// `mcpglass attach [claude-code|claude-desktop|cursor|all] [--project D] [--dry-run]`.
+    Attach {
+        /// Which client(s) to rewrite. Defaults to `all` (only touches ones found).
+        #[arg(default_value = "all")]
+        target: String,
+        /// For claude-code, rewrite `<dir>/.mcp.json` instead of the user config.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Print the intended changes without writing or backing up.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Reverse `attach`, restoring each wrapped server's original command/args.
+    Detach {
+        /// Which client(s) to restore. Defaults to `all`.
+        #[arg(default_value = "all")]
+        target: String,
+        /// For claude-code, restore `<dir>/.mcp.json` instead of the user config.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Print the intended changes without writing or backing up.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Serve the local HTTP dashboard: `mcpglass dashboard [--db P] [--port N] [--no-open]`.
+    Dashboard {
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Port to listen on.
+        #[arg(long, default_value_t = 7411)]
+        port: u16,
+        /// Skip opening a browser tab automatically.
+        #[arg(long)]
+        no_open: bool,
     },
 }
 
@@ -54,8 +97,31 @@ enum SubCmd {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        SubCmd::Wrap { db, log, command } => {
-            let code = run_wrap(db, log, command).await;
+        SubCmd::Wrap {
+            db,
+            log,
+            name,
+            command,
+        } => {
+            let code = run_wrap(db, log, name, command).await;
+            std::process::exit(code);
+        }
+        SubCmd::Attach {
+            target,
+            project,
+            dry_run,
+        } => {
+            std::process::exit(clients::run_attach(&target, project, dry_run));
+        }
+        SubCmd::Detach {
+            target,
+            project,
+            dry_run,
+        } => {
+            std::process::exit(clients::run_detach(&target, project, dry_run));
+        }
+        SubCmd::Dashboard { db, port, no_open } => {
+            let code = dash::run(db, port, no_open).await;
             std::process::exit(code);
         }
     }
@@ -68,9 +134,18 @@ struct TapEvent {
     raw: Vec<u8>,
 }
 
-async fn run_wrap(db: Option<PathBuf>, log: Option<PathBuf>, command: Vec<String>) -> i32 {
+async fn run_wrap(
+    db: Option<PathBuf>,
+    log: Option<PathBuf>,
+    name: Option<String>,
+    command: Vec<String>,
+) -> i32 {
     let program = command[0].clone();
     let args: Vec<String> = command[1..].to_vec();
+
+    // A session groups this whole run; label falls back to the program's basename.
+    let label = name.unwrap_or_else(|| program_label(&program));
+    let command_line = command.join(" ");
 
     let data_dir = default_data_dir();
     let log_path = log.or_else(|| data_dir.as_ref().map(|d| d.join("mcpglass.log")));
@@ -99,7 +174,7 @@ async fn run_wrap(db: Option<PathBuf>, log: Option<PathBuf>, command: Vec<String
     // Storage owns a sync rusqlite connection on a dedicated blocking thread.
     let storage = tokio::task::spawn_blocking({
         let logger = logger.clone();
-        move || storage_loop(rx, db_path, logger)
+        move || storage_loop(rx, db_path, logger, label, command_line)
     });
 
     // client -> server, tapped as c2s.
@@ -206,8 +281,14 @@ async fn pump<R, W>(
 
 /// Drain the tap channel into SQLite. Runs on a blocking thread; a DB failure is
 /// logged and the record dropped — recording stops, forwarding does not.
-fn storage_loop(mut rx: mpsc::Receiver<TapEvent>, db_path: PathBuf, logger: Logger) {
-    let store = match Store::open(&db_path) {
+fn storage_loop(
+    mut rx: mpsc::Receiver<TapEvent>,
+    db_path: PathBuf,
+    logger: Logger,
+    label: String,
+    command_line: String,
+) {
+    let store = match Store::open_with_log(&db_path, &|m| logger.info(m)) {
         Ok(s) => s,
         Err(e) => {
             logger.error(format!("db open failed ({e:#}); recording disabled"));
@@ -216,8 +297,16 @@ fn storage_loop(mut rx: mpsc::Receiver<TapEvent>, db_path: PathBuf, logger: Logg
             return;
         }
     };
+    let session_id = match store.begin_session(&label, &command_line) {
+        Ok(id) => id,
+        Err(e) => {
+            logger.error(format!("begin_session failed ({e:#}); recording disabled"));
+            while rx.blocking_recv().is_some() {}
+            return;
+        }
+    };
     while let Some(ev) = rx.blocking_recv() {
-        let parsed = parse_line(&ev.raw);
+        let parsed = parse_line(&ev.raw, ev.direction);
         let rec = Record {
             ts_ms: ev.ts_ms,
             direction: ev.direction,
@@ -225,18 +314,74 @@ fn storage_loop(mut rx: mpsc::Receiver<TapEvent>, db_path: PathBuf, logger: Logg
             method: parsed.method,
             rpc_id: parsed.rpc_id,
             is_valid_json: parsed.is_valid_json,
+            is_error: parsed.is_error,
         };
-        if let Err(e) = store.insert(&rec) {
+        if let Err(e) = store.insert(session_id, &rec) {
             logger.error(format!("insert failed (record dropped): {e:#}"));
         }
     }
+    // The pumps have hung up: the child has exited. Best-effort end stamp.
+    if let Err(e) = store.end_session(session_id) {
+        logger.error(format!("end_session failed: {e:#}"));
+    }
+}
+
+/// Basename (without extension) of the wrapped program, used as the default
+/// session label. Falls back to the raw string if there is nothing to strip.
+fn program_label(program: &str) -> String {
+    Path::new(program)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(program)
+        .to_owned()
+}
+
+/// Extensions Windows executables can carry, tried in this order when a bare
+/// `program` (e.g. `npx`) isn't directly launchable. `.bat`/`.cmd` are the
+/// shim case (`npx`, `npm`, ...) that `CreateProcess` can't launch without an
+/// extension.
+const WINDOWS_EXTENSIONS: [&str; 4] = ["com", "exe", "bat", "cmd"];
+
+/// Resolve `program` to a concrete file the way Windows would search for it:
+/// if it already contains a path separator, only try appending extensions to
+/// it directly; otherwise search each directory in `path_env` (a `;`-joined
+/// `PATH` value). Pure aside from the injected `exists` check, so tests can
+/// probe it without touching the real filesystem or environment.
+fn resolve_windows_executable(
+    program: &str,
+    path_env: &str,
+    mut exists: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    let has_path_component = program.contains('/') || program.contains('\\');
+    let dirs: Vec<&str> = if has_path_component { vec![""] } else { path_env.split(';').collect() };
+
+    for dir in dirs {
+        let base = if dir.is_empty() {
+            PathBuf::from(program)
+        } else {
+            Path::new(dir).join(program)
+        };
+        for ext in WINDOWS_EXTENSIONS {
+            let candidate = base.with_extension(ext);
+            if exists(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Spawn the server with all three stdio streams piped.
 ///
 /// On Windows, tools like `npx`/`npm` are `.cmd` shims that `CreateProcess`
-/// cannot launch directly; if the direct spawn reports NotFound we retry through
-/// `cmd /c`.
+/// cannot launch directly; if the direct spawn reports NotFound we resolve the
+/// shim's real path ourselves (searching `PATH` like Windows would) and spawn
+/// that path directly. We deliberately do NOT hand-build a `cmd /c <program>
+/// <args>` string: std's own argument quoting for `.bat`/`.cmd` targets is
+/// what protects against `&`/`|`/etc. in args being reinterpreted as shell
+/// operators (the class of bug fixed by CVE-2024-24576) — reintroducing a
+/// manual `cmd` invocation here would defeat that.
 async fn spawn_child(program: &str, args: &[String], logger: &Logger) -> anyhow::Result<Child> {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -247,24 +392,29 @@ async fn spawn_child(program: &str, args: &[String], logger: &Logger) -> anyhow:
     match cmd.spawn() {
         Ok(child) => Ok(child),
         Err(e) if e.kind() == ErrorKind::NotFound && cfg!(windows) => {
-            logger.info(format!(
-                "`{program}` not directly executable; retrying via `cmd /c`"
-            ));
-            let mut shell = Command::new("cmd");
-            shell
-                .arg("/c")
-                .arg(program)
-                .args(args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            Ok(shell.spawn()?)
+            let path_env = std::env::var("PATH").unwrap_or_default();
+            match resolve_windows_executable(program, &path_env, |p| p.exists()) {
+                Some(resolved) => {
+                    logger.info(format!(
+                        "`{program}` not directly executable; resolved to `{}`",
+                        resolved.display()
+                    ));
+                    let mut retry = Command::new(&resolved);
+                    retry
+                        .args(args)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                    Ok(retry.spawn()?)
+                }
+                None => Err(e.into()),
+            }
         }
         Err(e) => Err(e.into()),
     }
 }
 
-fn default_data_dir() -> Option<PathBuf> {
+pub(crate) fn default_data_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.data_local_dir().join("mcpglass"))
 }
 
@@ -318,5 +468,103 @@ impl Logger {
 
     fn error(&self, msg: impl AsRef<str>) {
         self.write("ERROR", msg.as_ref());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mcpglass-main-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_windows_executable_finds_shim_via_path_search() {
+        let dir = temp_dir("resolve-shim");
+        let cmd_path = dir.join("foo.cmd");
+        std::fs::write(&cmd_path, "@echo off\r\n").unwrap();
+
+        let resolved = resolve_windows_executable("foo", dir.to_str().unwrap(), |p| p.exists());
+        assert_eq!(resolved, Some(cmd_path));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_windows_executable_tries_extensions_in_order() {
+        let dir = temp_dir("resolve-order");
+        // Only the .bat form exists; .com/.exe must be tried and missed first.
+        let bat_path = dir.join("tool.bat");
+        std::fs::write(&bat_path, "@echo off\r\n").unwrap();
+
+        let resolved = resolve_windows_executable("tool", dir.to_str().unwrap(), |p| p.exists());
+        assert_eq!(resolved, Some(bat_path));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_windows_executable_handles_path_component_without_path_search() {
+        let dir = temp_dir("resolve-path-component");
+        let cmd_path = dir.join("nested.cmd");
+        std::fs::write(&cmd_path, "@echo off\r\n").unwrap();
+
+        // Program already has a path separator: PATH must not be consulted,
+        // only extensions appended to the given path itself.
+        let program = dir.join("nested").to_string_lossy().into_owned();
+        let resolved = resolve_windows_executable(&program, "", |p| p.exists());
+        assert_eq!(resolved, Some(cmd_path));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_windows_executable_returns_none_when_nothing_matches() {
+        let resolved = resolve_windows_executable("does-not-exist-xyz", "", |_| false);
+        assert!(resolved.is_none());
+    }
+
+    /// Regression test for the CVE-2024-24576 class of bug: the removed
+    /// `cmd /c <program> <args>` fallback hand-built a command line, so a
+    /// `&` inside an arg could be reinterpreted by `cmd.exe` as a command
+    /// separator. Spawning a resolved `.cmd` path directly instead relies on
+    /// std's own quoting for batch-file targets, which must keep `&`
+    /// literal.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn ampersand_in_arg_survives_direct_cmd_spawn() {
+        let dir = temp_dir("ampersand");
+        let cmd_path = dir.join("probe.cmd");
+        std::fs::write(&cmd_path, "@echo off\r\necho arg=%1\r\n").unwrap();
+
+        let mut cmd = Command::new(&cmd_path);
+        cmd.arg("arg&value")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = cmd.spawn().expect("spawn probe.cmd");
+        let output = child.wait_with_output().await.expect("wait for probe.cmd");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains("arg&value"),
+            "expected the literal `&` to survive intact, got: {stdout:?}"
+        );
+        // If `&` had been reinterpreted as a command separator, `value`
+        // would have run as a separate, nonexistent command.
+        assert!(!stdout.contains("is not recognized"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

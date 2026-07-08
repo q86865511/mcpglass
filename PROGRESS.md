@@ -1,9 +1,15 @@
 # PROGRESS — mcpglass
 
 ## 目前狀態
-Phase 0 風險尖刺通過：stdio 透明攔截以真實 client（Claude Code）＋真實 server（官方 filesystem）端到端驗證零破壞，題目可行性確立，下一步 Phase 1 MVP。
+Phase 1 MVP 完成：session 化儲存、attach/detach 設定檔一鍵接管、本機儀表板（axum＋內嵌 React）皆過雙重審查與修正，36 Rust 測試＋前端 build 全綠。下一步 Phase 2 安全層。
 
 ## 已完成
+- [2026-07-08] 🚀 R3 Phase 1 MVP（/pipeline 分層派工＋雙重審查）：
+  - **儲存層 v2**：sessions 表＋messages 歸屬 session／is_error、v0 檔遷移（僅 writer 路徑執行，唯讀 open 不動檔）、查詢 API（分頁篩選、rpc_id 配對 latency 的 stats）。
+  - **attach/detach**：一鍵改寫 Claude Code（含 `--project`）／Claude Desktop／Cursor 設定檔把 stdio server 導入 `mcpglass wrap`；原子寫入（temp＋rename）、備份、逆轉換還原、冪等、非陣列 args 等奇形設定跳過不動。
+  - **儀表板**：`mcpglass dashboard`——axum REST（5 端點）＋rust-embed 內嵌 React 前端（session 側欄、訊息時間軸分頁篩選、詳情、stats、2 秒輪詢），bind 成功才印 URL 開瀏覽器；build.rs 佔位 dist 讓乾淨 checkout 可編譯。
+  - **審查與修正**：reviewer（Opus）＋Codex 雙審共 11 條實質意見，裁決後修 9 條（前端 null latency 崩潰、設定檔半份寫入、非陣列 args 丟參數、`cmd /c` shell 注入面改 PATHEXT 解析、gitignored dist 斷 build、唯讀遷移隱患、stale response、stats 輪詢、bind 時序），2 條列待辦。
+  - **驗證**：clippy 零警告、36 Rust 測試全綠、前端 tsc strict＋build 綠、真實 client/server 端到端 smoke 通過。
 - [2026-07-08] ⚙️ R2 Phase 0 尖刺通過：Cargo workspace（proxy-core／storage／cli）＋ `mcpglass wrap` 透明代理——newline JSON-RPC 旁路 tap 落 SQLite（WAL）、fail-open（try_send 不施加背壓、超長行只限記錄緩衝不限轉發）、診斷只寫 log 檔絕不污染 stdout/stderr、Windows `.cmd` shim 以 `cmd /c` 退回。驗證：clippy 零警告、9 測試全綠（含 bytes 完全一致的 passthrough 整合測試）；真實端到端——Claude Code CLI 經代理呼叫官方 filesystem server，11 筆訊息完整入庫（initialize／tools/list／tools/call×2，含 server→client 的 roots/list 反向 RPC）。
 - [2026-07-08] 📄 R1 專案初始化：市調（兩個研究 agent 查證 MCP 生態縫隙）→ 選題「MCP 本機觀測／安全代理」→ 10 週計劃核准（計劃檔：`~/.claude/plans/godot-aivtuber-functional-toucan.md`）→ 建基礎文件與 git repo。
 
@@ -11,7 +17,7 @@ Phase 0 風險尖刺通過：stdio 透明攔截以真實 client（Claude Code）
 （無）
 
 ## 待辦
-- Phase 1（MVP）：CLI（wrap/unwrap/dashboard）＋ client 設定檔一鍵接管與還原 ＋ 本機儀表板（axum 內嵌 React 前端）。
+- 審查遺留（低優先）：`attach claude-code` 涵蓋 `~/.claude.json` 的 `projects.<path>.mcpServers`（project-local scope）；dashboard 連線快取（現為每請求開 Store，MVP 可接受）；文案微調（s2c 徽章、搜尋 placeholder、npx 手動 wrap 的預設 label）。
 - Phase 2（安全層）：tool schema 指紋釘選（防 rug-pull）、secrets 外洩過濾、per-tool allow/deny 政策、append-only 稽核日誌。
 - Phase 3（補完）：HTTP（streamable）transport、context bloat 分析、請求 replay、錯誤注入。
 - Phase 4（發佈）：英文 docs＋demo GIF、GitHub 開源、Show HN / r/mcp 發文、收進 terrychou.com 作品集。

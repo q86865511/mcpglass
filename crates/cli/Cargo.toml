@@ -18,10 +18,14 @@ path = "src/bin/echo_mcp.rs"
 [dependencies]
 proxy-core = { path = "../proxy-core" }
 storage = { path = "../storage" }
+dashboard = { path = "../dashboard" }
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 directories.workspace = true
+# preserve_order keeps client-config key order stable across attach/detach.
+serde_json = { workspace = true, features = ["preserve_order"] }
+opener = "0.7"
 
 [dev-dependencies]
 rusqlite.workspace = true

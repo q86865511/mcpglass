@@ -75,6 +75,26 @@ fn passthrough_is_byte_identical_and_recorded() {
     // (b) SQLite must hold the tapped messages with method + direction.
     let conn = rusqlite::Connection::open(&db).expect("open db");
 
+    // Schema v1: exactly one session, and it was ended after the child exited.
+    let (session_id, ended): (i64, Option<i64>) = conn
+        .query_row(
+            "SELECT id, ended_at_ms FROM sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("query session");
+    assert!(ended.is_some(), "session should have an end timestamp");
+
+    // Every tapped message hangs off that session.
+    let orphaned: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id != ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .expect("query orphaned");
+    assert_eq!(orphaned, 0, "all messages must belong to the session");
+
     let c2s_init: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE direction='c2s' AND method='initialize'",

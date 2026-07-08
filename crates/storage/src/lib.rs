@@ -1,14 +1,22 @@
-//! SQLite sink for tapped MCP messages.
+//! SQLite sink and query layer for tapped MCP messages.
 //!
-//! This lives entirely on the tap path. Every fallible operation returns a
-//! `Result` so the caller can log-and-continue: a storage failure must never
-//! propagate into the forwarding path (fail-open).
+//! The write side lives entirely on the tap path. Every fallible operation
+//! returns a `Result` so the caller can log-and-continue: a storage failure must
+//! never propagate into the forwarding path (fail-open).
+//!
+//! The read side ([`Store::list_sessions`], [`Store::messages`], [`Store::message`],
+//! [`Store::stats`]) backs the local dashboard; it is the query contract the
+//! dashboard backend builds on.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use proxy_core::Direction;
-use rusqlite::Connection;
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+
+/// Current on-disk schema version, stored in `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 1;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -19,6 +27,82 @@ pub struct Record {
     pub method: Option<String>,
     pub rpc_id: Option<String>,
     pub is_valid_json: bool,
+    /// A JSON-RPC error response (see `proxy_core::ParsedMessage::is_error`).
+    pub is_error: bool,
+}
+
+/// One `wrap` invocation: a run of the proxy against a single server process.
+pub struct SessionSummary {
+    pub id: i64,
+    pub label: String,
+    pub command: String,
+    pub started_at_ms: i64,
+    pub ended_at_ms: Option<i64>,
+    pub message_count: u64,
+}
+
+/// Filter + page window for [`Store::messages`]. All fields optional except the
+/// page size: `limit == 0` yields no rows.
+#[derive(Default)]
+pub struct MessageFilter {
+    pub direction: Option<Direction>,
+    pub method: Option<String>,
+    /// Case-sensitive substring that must appear in the raw frame.
+    pub q: Option<String>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+/// A row in the message list: metadata plus a bounded preview, never the full raw.
+pub struct MessageRow {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub direction: Direction,
+    pub method: Option<String>,
+    pub rpc_id: Option<String>,
+    pub is_valid_json: bool,
+    pub is_error: bool,
+    /// Byte length of the stored raw frame.
+    pub size: u64,
+    /// First 200 characters of the raw frame (never splits a UTF-8 sequence).
+    pub preview: String,
+}
+
+/// A single message with its full raw body, for the detail view.
+pub struct MessageDetail {
+    pub id: i64,
+    pub session_id: i64,
+    pub ts_ms: i64,
+    pub direction: Direction,
+    pub method: Option<String>,
+    pub rpc_id: Option<String>,
+    pub is_valid_json: bool,
+    pub is_error: bool,
+    pub size: u64,
+    pub preview: String,
+    pub raw: String,
+}
+
+/// Per-method aggregate for a session. Latency is derived from request/response
+/// `ts_ms` differences (see [`Store::stats`]).
+pub struct MethodStat {
+    pub method: String,
+    pub count: u64,
+    pub avg_latency_ms: Option<f64>,
+    pub max_latency_ms: Option<i64>,
+}
+
+/// Session-wide counters.
+pub struct Totals {
+    pub messages: u64,
+    pub invalid: u64,
+    pub errors: u64,
+}
+
+/// Aggregate view of one session.
+pub struct Stats {
+    pub per_method: Vec<MethodStat>,
+    pub totals: Totals,
 }
 
 /// Owns a single write connection. Intended to run on one dedicated thread that
@@ -28,94 +112,738 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating parent dirs and schema as needed) in WAL mode.
+    /// Open a read-only consumer's view of `db_path` (the dashboard's use
+    /// case). Creates parent dirs and schema as needed in WAL mode, but never
+    /// renames or deletes anything: a legacy Phase-0 (v0) file is left
+    /// untouched on disk and surfaced as an empty store instead. Destructive
+    /// migration only happens on the tap (writer) path; see
+    /// [`Store::open_with_log`].
     pub fn open(db_path: &Path) -> Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating db dir {}", parent.display()))?;
-            }
+        if is_legacy_v0(db_path) {
+            // Don't touch the file: a v0 layout has no `sessions` table (and an
+            // incompatible `messages` shape), so an empty in-memory schema
+            // gives read handlers "no data yet" instead of a query error.
+            let conn = Connection::open_in_memory()
+                .context("opening in-memory store for legacy v0 db")?;
+            let store = Self { conn };
+            store.init_schema()?;
+            return Ok(store);
         }
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("opening db {}", db_path.display()))?;
-        // WAL lets a separate reader (e.g. a future dashboard) observe the live
-        // session without blocking the writer.
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("enabling WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .context("setting synchronous")?;
+        let conn = open_physical(db_path)?;
+        let store = Self { conn };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    /// Like [`Store::open`], but performs the destructive v0 migration (see
+    /// [`migrate_legacy_v0`]) and reports one-off migration events through
+    /// `log` (the tap path has no stdout/stderr to spare, so this routes to
+    /// the proxy log file instead). Use this only on the writer path.
+    pub fn open_with_log(db_path: &Path, log: &dyn Fn(&str)) -> Result<Self> {
+        // A Phase-0 (v0) file has an incompatible `messages` shape; move it aside
+        // and start fresh before we open the live connection.
+        migrate_legacy_v0(db_path, log);
+        let conn = open_physical(db_path)?;
         let store = Self { conn };
         store.init_schema()?;
         Ok(store)
     }
 
     fn init_schema(&self) -> Result<()> {
+        // BEGIN/COMMIT makes table creation and the `user_version = 1` stamp one
+        // atomic unit, so a concurrent reader's legacy-v0 probe (see
+        // `is_legacy_v0`) can never observe the `messages` table mid-creation
+        // with `user_version` still at 0 and misclassify a fresh v1 db as v0.
         self.conn
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS messages (
+                "BEGIN;
+                CREATE TABLE IF NOT EXISTS sessions (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    label         TEXT    NOT NULL,
+                    command       TEXT    NOT NULL,
+                    started_at_ms INTEGER NOT NULL,
+                    ended_at_ms   INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id    INTEGER NOT NULL REFERENCES sessions(id),
                     ts_ms         INTEGER NOT NULL,
                     direction     TEXT    NOT NULL CHECK (direction IN ('c2s','s2c')),
                     raw           TEXT    NOT NULL,
                     method        TEXT,
                     rpc_id        TEXT,
-                    is_valid_json INTEGER NOT NULL
-                );",
+                    is_valid_json INTEGER NOT NULL,
+                    is_error      INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_messages_session_id
+                    ON messages(session_id, id);
+                PRAGMA user_version = 1;
+                COMMIT;",
             )
-            .context("creating messages table")?;
+            .context("creating v1 schema")?;
         Ok(())
     }
 
-    /// Persist one record. Errors are returned, not panicked, so the tap loop
-    /// can drop-and-continue.
-    pub fn insert(&self, rec: &Record) -> Result<()> {
+    /// Open a new session; returns its id. Call once per `wrap` invocation.
+    pub fn begin_session(&self, label: &str, command: &str) -> Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO messages (ts_ms, direction, raw, method, rpc_id, is_valid_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
+                "INSERT INTO sessions (label, command, started_at_ms) VALUES (?1, ?2, ?3)",
+                params![label, command, now_ms()],
+            )
+            .context("beginning session")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Stamp a session's end time. Best-effort: safe to skip if the proxy dies.
+    pub fn end_session(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET ended_at_ms = ?2 WHERE id = ?1",
+                params![id, now_ms()],
+            )
+            .context("ending session")?;
+        Ok(())
+    }
+
+    /// Persist one record under `session_id`. Errors are returned, not panicked,
+    /// so the tap loop can drop-and-continue.
+    pub fn insert(&self, session_id: i64, rec: &Record) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO messages
+                    (session_id, ts_ms, direction, raw, method, rpc_id, is_valid_json, is_error)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    session_id,
                     rec.ts_ms,
                     rec.direction.as_str(),
                     rec.raw,
                     rec.method,
                     rec.rpc_id,
                     rec.is_valid_json as i64,
+                    rec.is_error as i64,
                 ],
             )
             .context("inserting message")?;
         Ok(())
     }
+
+    /// All sessions, newest first, each with a live message count.
+    pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.label, s.command, s.started_at_ms, s.ended_at_ms,
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+             FROM sessions s
+             ORDER BY s.id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SessionSummary {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    command: r.get(2)?,
+                    started_at_ms: r.get(3)?,
+                    ended_at_ms: r.get(4)?,
+                    message_count: r.get::<_, i64>(5)? as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A filtered, paged window of a session's messages, plus the total match
+    /// count (ignoring the page window) so callers can render pagination.
+    /// Rows come back in chronological (`id ASC`) order.
+    pub fn messages(
+        &self,
+        session_id: i64,
+        filter: &MessageFilter,
+    ) -> Result<(u64, Vec<MessageRow>)> {
+        let (where_sql, params) = build_where(session_id, filter);
+
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM messages WHERE {where_sql}"),
+            params_from_iter(params.iter()),
+            |r| r.get(0),
+        )?;
+
+        let mut page_params = params.clone();
+        page_params.push(Value::Integer(filter.limit as i64));
+        page_params.push(Value::Integer(filter.offset as i64));
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, ts_ms, direction, method, rpc_id, is_valid_json, is_error,
+                    length(CAST(raw AS BLOB)), substr(raw, 1, 200)
+             FROM messages
+             WHERE {where_sql}
+             ORDER BY id ASC
+             LIMIT ? OFFSET ?"
+        ))?;
+        let rows = stmt
+            .query_map(params_from_iter(page_params.iter()), map_message_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((total as u64, rows))
+    }
+
+    /// A single message with its full raw body, or `None` if the id is unknown.
+    pub fn message(&self, id: i64) -> Result<Option<MessageDetail>> {
+        let detail = self
+            .conn
+            .query_row(
+                "SELECT id, session_id, ts_ms, direction, method, rpc_id,
+                        is_valid_json, is_error, length(CAST(raw AS BLOB)),
+                        substr(raw, 1, 200), raw
+                 FROM messages WHERE id = ?1",
+                params![id],
+                |r| {
+                    let dir: String = r.get(3)?;
+                    Ok(MessageDetail {
+                        id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        ts_ms: r.get(2)?,
+                        direction: parse_direction(&dir, 3)?,
+                        method: r.get(4)?,
+                        rpc_id: r.get(5)?,
+                        is_valid_json: r.get(6)?,
+                        is_error: r.get(7)?,
+                        size: r.get::<_, i64>(8)? as u64,
+                        preview: r.get(9)?,
+                        raw: r.get(10)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(detail)
+    }
+
+    /// Per-method counts and request->response latency, plus session totals.
+    ///
+    /// Latency pairs each c2s request (with a non-null `rpc_id`) to the earliest
+    /// s2c frame sharing that `rpc_id` at or after the request time, via a
+    /// correlated subquery — so a request never fans out across duplicate ids and
+    /// notifications (null `rpc_id`) stay unpaired (latency `NULL`).
+    pub fn stats(&self, session_id: i64) -> Result<Stats> {
+        let mut stmt = self.conn.prepare(
+            "SELECT method,
+                    COUNT(*),
+                    AVG(latency),
+                    MAX(latency)
+             FROM (
+                SELECT req.method AS method,
+                       (SELECT MIN(resp.ts_ms)
+                          FROM messages resp
+                         WHERE resp.session_id = req.session_id
+                           AND resp.direction = 's2c'
+                           AND resp.rpc_id = req.rpc_id
+                           AND resp.ts_ms >= req.ts_ms) - req.ts_ms AS latency
+                  FROM messages req
+                 WHERE req.session_id = ?1
+                   AND req.direction = 'c2s'
+                   AND req.method IS NOT NULL
+             )
+             GROUP BY method
+             ORDER BY COUNT(*) DESC, method ASC",
+        )?;
+        let per_method = stmt
+            .query_map(params![session_id], |r| {
+                Ok(MethodStat {
+                    method: r.get(0)?,
+                    count: r.get::<_, i64>(1)? as u64,
+                    avg_latency_ms: r.get(2)?,
+                    max_latency_ms: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let totals = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN is_valid_json = 0 THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN is_error = 1 THEN 1 ELSE 0 END), 0)
+             FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |r| {
+                Ok(Totals {
+                    messages: r.get::<_, i64>(0)? as u64,
+                    invalid: r.get::<_, i64>(1)? as u64,
+                    errors: r.get::<_, i64>(2)? as u64,
+                })
+            },
+        )?;
+
+        Ok(Stats {
+            per_method,
+            totals,
+        })
+    }
+}
+
+/// Build the shared `WHERE` fragment (using anonymous `?` placeholders) and its
+/// bound values for the message list + count queries.
+fn build_where(session_id: i64, f: &MessageFilter) -> (String, Vec<Value>) {
+    let mut clauses = vec!["session_id = ?".to_owned()];
+    let mut params = vec![Value::Integer(session_id)];
+    if let Some(d) = f.direction {
+        clauses.push("direction = ?".to_owned());
+        params.push(Value::Text(d.as_str().to_owned()));
+    }
+    if let Some(m) = &f.method {
+        clauses.push("method = ?".to_owned());
+        params.push(Value::Text(m.clone()));
+    }
+    if let Some(q) = &f.q {
+        // instr(): literal substring, so `%`/`_` in the query are not wildcards.
+        clauses.push("instr(raw, ?) > 0".to_owned());
+        params.push(Value::Text(q.clone()));
+    }
+    (clauses.join(" AND "), params)
+}
+
+fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
+    let dir: String = r.get(2)?;
+    Ok(MessageRow {
+        id: r.get(0)?,
+        ts_ms: r.get(1)?,
+        direction: parse_direction(&dir, 2)?,
+        method: r.get(3)?,
+        rpc_id: r.get(4)?,
+        is_valid_json: r.get(5)?,
+        is_error: r.get(6)?,
+        size: r.get::<_, i64>(7)? as u64,
+        preview: r.get(8)?,
+    })
+}
+
+/// The `direction` CHECK constraint makes an unknown token impossible, but map it
+/// to a conversion error rather than assuming.
+fn parse_direction(s: &str, col: usize) -> rusqlite::Result<Direction> {
+    s.parse::<Direction>().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            col,
+            rusqlite::types::Type::Text,
+            format!("unexpected direction {s:?}").into(),
+        )
+    })
+}
+
+/// Open the physical sqlite file at `db_path` in WAL mode, creating parent
+/// dirs as needed. Does not touch schema/`user_version`; callers must follow
+/// up with `init_schema`.
+fn open_physical(db_path: &Path) -> Result<Connection> {
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating db dir {}", parent.display()))?;
+        }
+    }
+    let conn = Connection::open(db_path)
+        .with_context(|| format!("opening db {}", db_path.display()))?;
+    // WAL lets a separate reader (e.g. the dashboard) observe the live session
+    // without blocking the writer.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("enabling WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .context("setting synchronous")?;
+    Ok(conn)
+}
+
+/// Probe `db_path` on a short-lived connection for the Phase-0 (v0) layout:
+/// `user_version == 0` with a `messages` table. Returns `false` if the path
+/// doesn't exist or can't be probed, leaving it for the real open to surface.
+fn is_legacy_v0(db_path: &Path) -> bool {
+    if !db_path.exists() {
+        return false;
+    }
+    match Connection::open(db_path) {
+        Ok(probe) => {
+            let version: i64 = probe
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap_or(SCHEMA_VERSION);
+            let has_messages = probe
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map(|o| o.is_some())
+                .unwrap_or(false);
+            version == 0 && has_messages
+        }
+        // Can't even open it to probe: leave it for the real open to surface.
+        Err(_) => false,
+    }
+}
+
+/// Move an existing Phase-0 (`user_version = 0` with a `messages` table) file to
+/// `<db>.v0-backup` so a clean v1 file can take its place. Phase-0 data is
+/// disposable. On any failure we fall open: leave the file and let `init_schema`
+/// do what it can. Best-effort throughout; the connection is not open yet.
+fn migrate_legacy_v0(db_path: &Path, log: &dyn Fn(&str)) {
+    // Probing on a short-lived connection keeps the file unlocked before we
+    // rename it (Windows will not rename a file with an open handle).
+    if !is_legacy_v0(db_path) {
+        return;
+    }
+
+    let backup = append_suffix(db_path, ".v0-backup");
+    match std::fs::rename(db_path, &backup) {
+        Ok(()) => {
+            // The WAL/SHM sidecars belong to the discarded db; drop them so the
+            // fresh file starts clean rather than adopting stale journal state.
+            for suffix in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(append_suffix(db_path, suffix));
+            }
+            log(&format!(
+                "migrated legacy v0 db to {} (phase-0 data discarded)",
+                backup.display()
+            ));
+        }
+        Err(e) => {
+            // Fail-open: continue on the existing file. init_schema adds what it
+            // can; degraded recording is acceptable, a hard failure is not.
+            log(&format!(
+                "could not back up legacy v0 db ({e}); continuing on existing file"
+            ));
+        }
+    }
+}
+
+/// `path` with `suffix` appended to the full file name (not a path component).
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A private temp dir unique to each test, cleaned on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mcpglass-test-{}-{}-{:?}",
+                tag,
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+        fn db(&self) -> PathBuf {
+            self.0.join("sessions.db")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn rec(direction: Direction, ts_ms: i64, raw: &str) -> Record {
+        let p = proxy_core::parse_line(raw.as_bytes(), direction);
+        Record {
+            ts_ms,
+            direction,
+            raw: raw.to_owned(),
+            method: p.method,
+            rpc_id: p.rpc_id,
+            is_valid_json: p.is_valid_json,
+            is_error: p.is_error,
+        }
+    }
+
     #[test]
-    fn open_and_insert_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("mcpglass-test-{}", std::process::id()));
-        let db = dir.join("sessions.db");
-        let store = Store::open(&db).unwrap();
+    fn begin_end_and_list_sessions() {
+        let tmp = TempDir::new("sessions");
+        let store = Store::open(&tmp.db()).unwrap();
+        let s1 = store.begin_session("first", "echo a").unwrap();
+        let s2 = store.begin_session("second", "echo b").unwrap();
         store
-            .insert(&Record {
-                ts_ms: 123,
-                direction: Direction::C2s,
-                raw: r#"{"method":"ping"}"#.to_owned(),
-                method: Some("ping".to_owned()),
-                rpc_id: Some("1".to_owned()),
-                is_valid_json: true,
-            })
+            .insert(s1, &rec(Direction::C2s, 1, r#"{"id":1,"method":"ping"}"#))
             .unwrap();
-        let (dir_s, method): (String, Option<String>) = store
+        store.end_session(s1).unwrap();
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        // Newest first.
+        assert_eq!(sessions[0].id, s2);
+        assert_eq!(sessions[1].id, s1);
+        assert_eq!(sessions[1].label, "first");
+        assert_eq!(sessions[1].message_count, 1);
+        assert!(sessions[1].ended_at_ms.is_some());
+        assert!(sessions[0].ended_at_ms.is_none());
+    }
+
+    /// Hand-build a v0 file: the old single-table schema, user_version left 0.
+    fn write_legacy_v0_db(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL,
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (ts_ms, direction, raw, is_valid_json)
+             VALUES (1, 'c2s', 'old', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn writer_open_migrates_legacy_v0_file() {
+        let tmp = TempDir::new("v0-writer");
+        let db = tmp.db();
+        write_legacy_v0_db(&db);
+
+        let store = Store::open_with_log(&db, &|_| {}).unwrap();
+        // Old file preserved as a backup...
+        assert!(append_suffix(&db, ".v0-backup").exists());
+        // ...and the new file is a clean, functional v1 (empty, insert works).
+        let version: i64 = store
             .conn
-            .query_row(
-                "SELECT direction, method FROM messages WHERE ts_ms = 123",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let sid = store.begin_session("fresh", "echo").unwrap();
+        store
+            .insert(sid, &rec(Direction::C2s, 2, r#"{"id":1,"method":"ping"}"#))
+            .unwrap();
+        let (total, _) = store.messages(sid, &page(50)).unwrap();
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn read_only_open_does_not_migrate_and_sees_no_data() {
+        let tmp = TempDir::new("v0-reader");
+        let db = tmp.db();
+        write_legacy_v0_db(&db);
+
+        // The dashboard's read-only path must never rename/delete the file...
+        let store = Store::open(&db).unwrap();
+        assert!(db.exists());
+        assert!(!append_suffix(&db, ".v0-backup").exists());
+        // ...and must see it as empty rather than erroring on a missing
+        // `sessions` table.
+        assert!(store.list_sessions().unwrap().is_empty());
+        let (total, rows) = store.messages(1, &page(50)).unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+
+        // The on-disk v0 file is untouched; a later writer open can still
+        // migrate it normally.
+        let writer = Store::open_with_log(&db, &|_| {}).unwrap();
+        assert!(append_suffix(&db, ".v0-backup").exists());
+        assert!(writer.list_sessions().unwrap().is_empty());
+    }
+
+    fn page(limit: u32) -> MessageFilter {
+        MessageFilter {
+            limit,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn message_filter_and_pagination() {
+        let tmp = TempDir::new("filter");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        store
+            .insert(sid, &rec(Direction::C2s, 1, r#"{"id":1,"method":"initialize"}"#))
+            .unwrap();
+        store
+            .insert(sid, &rec(Direction::S2c, 2, r#"{"id":1,"result":{"ok":true}}"#))
+            .unwrap();
+        store
+            .insert(sid, &rec(Direction::C2s, 3, r#"{"id":2,"method":"tools/list"}"#))
+            .unwrap();
+        store
+            .insert(sid, &rec(Direction::S2c, 4, r#"{"id":2,"result":{"tools":[]}}"#))
+            .unwrap();
+
+        // Direction filter.
+        let (total, rows) = store
+            .messages(
+                sid,
+                &MessageFilter {
+                    direction: Some(Direction::C2s),
+                    ..page(50)
+                },
             )
             .unwrap();
-        assert_eq!(dir_s, "c2s");
-        assert_eq!(method.as_deref(), Some("ping"));
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(total, 2);
+        assert!(rows.iter().all(|r| r.direction == Direction::C2s));
+
+        // Method filter.
+        let (total, rows) = store
+            .messages(
+                sid,
+                &MessageFilter {
+                    method: Some("tools/list".to_owned()),
+                    ..page(50)
+                },
+            )
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].method.as_deref(), Some("tools/list"));
+
+        // Raw substring filter.
+        let (total, _) = store
+            .messages(
+                sid,
+                &MessageFilter {
+                    q: Some("\"ok\":true".to_owned()),
+                    ..page(50)
+                },
+            )
+            .unwrap();
+        assert_eq!(total, 1);
+
+        // Pagination: total ignores the window, rows respect it and stay ordered.
+        let (total, rows) = store
+            .messages(
+                sid,
+                &MessageFilter {
+                    limit: 2,
+                    offset: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].id < rows[1].id);
+    }
+
+    #[test]
+    fn preview_truncates_at_200_chars_without_splitting_utf8() {
+        let tmp = TempDir::new("preview");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        // 300 multi-byte chars: preview must be exactly the first 200, intact.
+        let raw: String = "あ".repeat(300);
+        store
+            .insert(sid, &rec(Direction::S2c, 1, &raw))
+            .unwrap();
+        let (_, rows) = store.messages(sid, &page(50)).unwrap();
+        assert_eq!(rows[0].preview.chars().count(), 200);
+        assert!(rows[0].preview.chars().all(|c| c == 'あ'));
+        // size is the byte length of the full raw (300 * 3 bytes for 'あ').
+        assert_eq!(rows[0].size, 900);
+    }
+
+    #[test]
+    fn stats_pairs_latency_and_counts_errors() {
+        let tmp = TempDir::new("stats");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        // ping: request at 100, response at 150  -> latency 50.
+        store
+            .insert(sid, &rec(Direction::C2s, 100, r#"{"id":1,"method":"ping"}"#))
+            .unwrap();
+        store
+            .insert(sid, &rec(Direction::S2c, 150, r#"{"id":1,"result":{}}"#))
+            .unwrap();
+        // ping again: request at 200, response at 260 -> latency 60.
+        store
+            .insert(sid, &rec(Direction::C2s, 200, r#"{"id":2,"method":"ping"}"#))
+            .unwrap();
+        store
+            .insert(sid, &rec(Direction::S2c, 260, r#"{"id":2,"result":{}}"#))
+            .unwrap();
+        // A notification: has a method, no id -> must NOT be paired.
+        store
+            .insert(
+                sid,
+                &rec(Direction::C2s, 300, r#"{"method":"notifications/x"}"#),
+            )
+            .unwrap();
+        // An error response to a tools/call request.
+        store
+            .insert(sid, &rec(Direction::C2s, 400, r#"{"id":3,"method":"tools/call"}"#))
+            .unwrap();
+        store
+            .insert(
+                sid,
+                &rec(
+                    Direction::S2c,
+                    470,
+                    r#"{"id":3,"error":{"code":-32601,"message":"no"}}"#,
+                ),
+            )
+            .unwrap();
+        // A non-JSON line -> counts as invalid.
+        store
+            .insert(sid, &rec(Direction::S2c, 500, "not json"))
+            .unwrap();
+
+        let stats = store.stats(sid).unwrap();
+
+        let ping = stats
+            .per_method
+            .iter()
+            .find(|m| m.method == "ping")
+            .expect("ping stats");
+        assert_eq!(ping.count, 2);
+        assert_eq!(ping.avg_latency_ms, Some(55.0)); // (50 + 60) / 2
+        assert_eq!(ping.max_latency_ms, Some(60));
+
+        // Notification is counted once but never paired -> no latency.
+        let notif = stats
+            .per_method
+            .iter()
+            .find(|m| m.method == "notifications/x")
+            .expect("notification stats");
+        assert_eq!(notif.count, 1);
+        assert_eq!(notif.avg_latency_ms, None);
+        assert_eq!(notif.max_latency_ms, None);
+
+        let call = stats
+            .per_method
+            .iter()
+            .find(|m| m.method == "tools/call")
+            .expect("tools/call stats");
+        assert_eq!(call.max_latency_ms, Some(70));
+
+        assert_eq!(stats.totals.messages, 8);
+        assert_eq!(stats.totals.invalid, 1);
+        assert_eq!(stats.totals.errors, 1);
+    }
+
+    #[test]
+    fn message_detail_returns_full_raw_or_none() {
+        let tmp = TempDir::new("detail");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        let raw = r#"{"id":1,"method":"ping","params":{"big":"payload"}}"#;
+        store.insert(sid, &rec(Direction::C2s, 1, raw)).unwrap();
+        let (_, rows) = store.messages(sid, &page(50)).unwrap();
+        let id = rows[0].id;
+
+        let detail = store.message(id).unwrap().expect("detail");
+        assert_eq!(detail.raw, raw);
+        assert_eq!(detail.session_id, sid);
+        assert_eq!(detail.direction, Direction::C2s);
+        assert!(store.message(999_999).unwrap().is_none());
     }
 }

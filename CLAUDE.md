@@ -8,7 +8,8 @@ MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 A
 - Build：`cargo build --workspace`
 - Test：`cargo test --workspace`
 - Lint：`cargo clippy --workspace -- -D warnings`
-- 前端（Phase 1 起）：TODO（dashboard/frontend 建立後補：pnpm dev / pnpm build）
+- 前端（`crates/dashboard/frontend/`，pnpm）：`pnpm build`（tsc strict＋vite，產 dist 供 rust-embed）；`pnpm mock`＋`pnpm dev` 本地開發
+- 前端要先 build 過，`cargo build` 才會內嵌真 UI（否則 build.rs 生佔位頁）
 
 ## 架構約定
 

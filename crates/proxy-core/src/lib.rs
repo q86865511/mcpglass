@@ -24,6 +24,19 @@ impl Direction {
     }
 }
 
+impl std::str::FromStr for Direction {
+    type Err = ();
+
+    /// Inverse of [`Direction::as_str`]; used when reading rows back out of storage.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "c2s" => Ok(Direction::C2s),
+            "s2c" => Ok(Direction::S2c),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Incrementally splits a byte stream into newline-delimited frames.
 ///
 /// The MCP stdio transport is one JSON-RPC message per `\n`-terminated line.
@@ -85,11 +98,17 @@ pub struct ParsedMessage {
     pub method: Option<String>,
     pub rpc_id: Option<String>,
     pub is_valid_json: bool,
+    /// A JSON-RPC error *response*: valid JSON travelling server->client whose top
+    /// level carries an `error` member. Only meaningful for [`Direction::S2c`].
+    pub is_error: bool,
 }
 
 /// Best-effort parse of a single framed line. A non-JSON line is not an error:
 /// it is recorded verbatim with `is_valid_json = false` so nothing is ever lost.
-pub fn parse_line(line: &[u8]) -> ParsedMessage {
+///
+/// `direction` gates the `is_error` classification: an `error` member only counts
+/// as a failed response on the server->client leg.
+pub fn parse_line(line: &[u8], direction: Direction) -> ParsedMessage {
     match serde_json::from_slice::<serde_json::Value>(line) {
         Ok(value) => {
             let method = value
@@ -102,16 +121,19 @@ pub fn parse_line(line: &[u8]) -> ParsedMessage {
                 serde_json::Value::String(s) => Some(s.clone()),
                 other => Some(other.to_string()),
             });
+            let is_error = direction == Direction::S2c && value.get("error").is_some();
             ParsedMessage {
                 method,
                 rpc_id,
                 is_valid_json: true,
+                is_error,
             }
         }
         Err(_) => ParsedMessage {
             method: None,
             rpc_id: None,
             is_valid_json: false,
+            is_error: false,
         },
     }
 }
@@ -179,15 +201,22 @@ mod tests {
 
     #[test]
     fn parse_request_extracts_method_and_id() {
-        let p = parse_line(br#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#);
+        let p = parse_line(
+            br#"{"jsonrpc":"2.0","id":7,"method":"initialize"}"#,
+            Direction::C2s,
+        );
         assert_eq!(p.method.as_deref(), Some("initialize"));
         assert_eq!(p.rpc_id.as_deref(), Some("7"));
         assert!(p.is_valid_json);
+        assert!(!p.is_error);
     }
 
     #[test]
     fn parse_notification_has_no_id() {
-        let p = parse_line(br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        let p = parse_line(
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            Direction::C2s,
+        );
         assert_eq!(p.method.as_deref(), Some("notifications/initialized"));
         assert_eq!(p.rpc_id, None);
         assert!(p.is_valid_json);
@@ -195,9 +224,32 @@ mod tests {
 
     #[test]
     fn parse_non_json_line_is_recorded_as_invalid() {
-        let p = parse_line(b"this is not json");
+        let p = parse_line(b"this is not json", Direction::S2c);
         assert_eq!(p.method, None);
         assert_eq!(p.rpc_id, None);
         assert!(!p.is_valid_json);
+        assert!(!p.is_error);
+    }
+
+    #[test]
+    fn error_response_is_flagged_only_server_to_client() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#;
+        // Same bytes: an error member counts only on the s2c leg.
+        assert!(parse_line(body, Direction::S2c).is_error);
+        assert!(!parse_line(body, Direction::C2s).is_error);
+        // A plain result response is not an error.
+        assert!(!parse_line(
+            br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            Direction::S2c,
+        )
+        .is_error);
+    }
+
+    #[test]
+    fn direction_round_trips_through_str() {
+        for d in [Direction::C2s, Direction::S2c] {
+            assert_eq!(d.as_str().parse::<Direction>(), Ok(d));
+        }
+        assert!("bogus".parse::<Direction>().is_err());
     }
 }

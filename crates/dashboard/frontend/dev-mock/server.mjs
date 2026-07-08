@@ -1,0 +1,244 @@
+// Zero-dependency mock server for local frontend development.
+// Serves fixed fixture data that matches the mcpglass dashboard API contract
+// (see crates/dashboard/frontend — the real Rust backend implements the same
+// shape). Run with `pnpm mock` (or `node dev-mock/server.mjs`).
+
+import { createServer } from "node:http";
+
+const HOST = "127.0.0.1";
+const PORT = 7411;
+
+const NOW = Date.parse("2026-07-08T12:00:00Z");
+
+const METHODS = [
+  "initialize",
+  "tools/list",
+  "tools/call",
+  "resources/list",
+  "resources/read",
+  "prompts/list",
+];
+
+function buildSessionMessages(sessionId, count, startTs) {
+  const messages = [];
+  let rpcCounter = 1;
+  for (let i = 0; i < count; i++) {
+    const id = sessionId * 100000 + i + 1;
+    const ts = startTs + i * 750;
+    const method = METHODS[i % METHODS.length];
+    const isNotification = i % 17 === 0; // notifications have no rpc_id
+    const direction = i % 2 === 0 ? "c2s" : "s2c";
+    const isError = direction === "s2c" && i % 23 === 0;
+    const isValidJson = !(i % 41 === 0); // sprinkle a few malformed entries
+    const rpcId = isNotification ? null : String(rpcCounter++);
+
+    let raw;
+    if (!isValidJson) {
+      raw = "{not valid json,,,";
+    } else if (direction === "c2s") {
+      raw = JSON.stringify({
+        jsonrpc: "2.0",
+        id: rpcId,
+        method,
+        params: { index: i, note: `request #${i} for session ${sessionId}` },
+      });
+    } else if (isError) {
+      raw = JSON.stringify({
+        jsonrpc: "2.0",
+        id: rpcId,
+        error: { code: -32000, message: `synthetic error for ${method}` },
+      });
+    } else {
+      raw = JSON.stringify({
+        jsonrpc: "2.0",
+        id: rpcId,
+        result: { ok: true, echoedMethod: method, index: i },
+      });
+    }
+
+    messages.push({
+      id,
+      session_id: sessionId,
+      ts_ms: ts,
+      direction,
+      method: isNotification && direction === "s2c" ? null : method,
+      rpc_id: rpcId,
+      is_valid_json: isValidJson,
+      is_error: isError,
+      size: Buffer.byteLength(raw, "utf8"),
+      raw,
+    });
+  }
+  return messages;
+}
+
+const sessionDefs = [
+  {
+    id: 2,
+    label: "server-filesystem",
+    command: "npx -y @modelcontextprotocol/server-filesystem .",
+    started_at_ms: NOW - 5 * 60_000,
+    ended_at_ms: null, // live
+    count: 128,
+  },
+  {
+    id: 1,
+    label: "server-fetch",
+    command: "npx -y @modelcontextprotocol/server-fetch",
+    started_at_ms: NOW - 60 * 60_000,
+    ended_at_ms: NOW - 55 * 60_000,
+    count: 42,
+  },
+];
+
+const messagesBySession = new Map();
+const messagesById = new Map();
+for (const def of sessionDefs) {
+  const msgs = buildSessionMessages(def.id, def.count, def.started_at_ms);
+  messagesBySession.set(def.id, msgs);
+  for (const m of msgs) messagesById.set(m.id, m);
+}
+
+function toSummary(full) {
+  const { raw, session_id, ...rest } = full;
+  const preview = raw.length > 120 ? raw.slice(0, 120) : raw;
+  return { ...rest, preview };
+}
+
+function sessionsPayload() {
+  const sessions = sessionDefs
+    .slice()
+    .sort((a, b) => b.started_at_ms - a.started_at_ms)
+    .map((def) => ({
+      id: def.id,
+      label: def.label,
+      command: def.command,
+      started_at_ms: def.started_at_ms,
+      ended_at_ms: def.ended_at_ms,
+      message_count: messagesBySession.get(def.id).length,
+    }));
+  return { sessions };
+}
+
+function messagesPayload(sessionId, query) {
+  const all = messagesBySession.get(sessionId) ?? [];
+  const limit = Math.max(1, Number(query.get("limit")) || 100);
+  const offset = Math.max(0, Number(query.get("offset")) || 0);
+  const direction = query.get("direction") || "";
+  const method = query.get("method") || "";
+  const q = query.get("q") || "";
+
+  let filtered = all;
+  if (direction) filtered = filtered.filter((m) => m.direction === direction);
+  if (method) filtered = filtered.filter((m) => m.method === method);
+  if (q) filtered = filtered.filter((m) => m.raw.includes(q));
+
+  const total = filtered.length;
+  const page = filtered.slice(offset, offset + limit);
+  return { total, messages: page.map(toSummary) };
+}
+
+function statsPayload(sessionId) {
+  const all = messagesBySession.get(sessionId) ?? [];
+  const byMethod = new Map();
+  let invalid = 0;
+  let errors = 0;
+
+  for (const m of all) {
+    if (!m.is_valid_json) invalid++;
+    if (m.is_error) errors++;
+    if (!m.method) continue;
+    const key = m.method;
+    if (!byMethod.has(key)) byMethod.set(key, []);
+    // Synthetic latency: derive a stable pseudo-random value from id.
+    const latency = 20 + ((m.id * 37) % 900);
+    byMethod.get(key).push(latency);
+  }
+
+  const per_method = Array.from(byMethod.entries()).map(([method, latencies]) => {
+    // Mirror the real backend: "prompts/list" stands in for a method whose
+    // occurrences are all notifications/unpaired responses, so there is no
+    // measurable round-trip latency — the API reports null, not 0.
+    if (method === "prompts/list") {
+      return { method, count: latencies.length, avg_latency_ms: null, max_latency_ms: null };
+    }
+    const sum = latencies.reduce((a, b) => a + b, 0);
+    return {
+      method,
+      count: latencies.length,
+      avg_latency_ms: Math.round((sum / latencies.length) * 10) / 10,
+      max_latency_ms: Math.max(...latencies),
+    };
+  });
+
+  return {
+    per_method,
+    totals: { messages: all.length, invalid, errors },
+  };
+}
+
+const server = createServer((req, res) => {
+  const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
+  const parts = url.pathname.split("/").filter(Boolean); // e.g. ["api","sessions","2","messages"]
+
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const send = (status, body) => {
+    res.writeHead(status);
+    res.end(JSON.stringify(body));
+  };
+
+  if (parts[0] !== "api") {
+    send(404, { error: "not found" });
+    return;
+  }
+
+  if (parts.length === 2 && parts[1] === "sessions" && req.method === "GET") {
+    send(200, sessionsPayload());
+    return;
+  }
+
+  if (parts.length === 2 && parts[1] === "health" && req.method === "GET") {
+    send(200, { version: "0.1.0" });
+    return;
+  }
+
+  if (parts.length === 4 && parts[1] === "sessions" && parts[3] === "messages" && req.method === "GET") {
+    const sessionId = Number(parts[2]);
+    if (!messagesBySession.has(sessionId)) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    send(200, messagesPayload(sessionId, url.searchParams));
+    return;
+  }
+
+  if (parts.length === 4 && parts[1] === "sessions" && parts[3] === "stats" && req.method === "GET") {
+    const sessionId = Number(parts[2]);
+    if (!messagesBySession.has(sessionId)) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    send(200, statsPayload(sessionId));
+    return;
+  }
+
+  if (parts.length === 3 && parts[1] === "messages" && req.method === "GET") {
+    const id = Number(parts[2]);
+    const full = messagesById.get(id);
+    if (!full) {
+      send(404, { error: "message not found" });
+      return;
+    }
+    const preview = full.raw.length > 120 ? full.raw.slice(0, 120) : full.raw;
+    send(200, { ...full, preview });
+    return;
+  }
+
+  send(404, { error: "not found" });
+});
+
+server.listen(PORT, HOST, () => {
+  console.log(`mcpglass mock API listening on http://${HOST}:${PORT}`);
+});
