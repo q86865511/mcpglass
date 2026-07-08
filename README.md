@@ -4,7 +4,7 @@
 between any AI client (Claude Code, Claude Desktop, Cursor, ...) and your MCP servers, giving you
 debugging, observability, auditing, and security. All data stays on your machine.
 
-> Status: early development (Phase 1 MVP — interception, config takeover, local dashboard).
+> Status: early development (Phase 2 — interception, config takeover, dashboard, security layer).
 
 ## Why
 
@@ -17,9 +17,23 @@ debugging, observability, auditing, and security. All data stays on your machine
 
 - **Transparent interception** — `mcpglass wrap -- <server command>` runs any stdio MCP server with zero behavior change (fail-open: proxy errors never block traffic).
 - **One-command takeover** — `mcpglass attach [claude-code|claude-desktop|cursor|all]` rewrites client configs to route existing servers through the proxy (with backups); `mcpglass detach` restores them. `--dry-run` previews.
-- **Local dashboard** — `mcpglass dashboard` opens a timeline of every request/response/notification: per-session view, filters, payload inspector, per-method latency.
+- **Local dashboard** — `mcpglass dashboard` opens a timeline of every request/response/notification: per-session view, filters, payload inspector, per-method latency, and a Security tab.
+- **Security layer** — `mcpglass wrap --policy <file>` enforces a TOML policy:
+  - **Tool integrity pinning** — fingerprints each server's tool definitions and flags a change across runs (rug-pull detection).
+  - **Secret-leak filtering** — scans outgoing `tools/call` arguments for API keys/tokens (AWS, GitHub, OpenAI, Anthropic, ...) and flags them (masked in storage).
+  - **Per-tool allow/deny** — allow-lists or deny-lists tools by name.
+  - **Append-only audit log** — every decision is recorded, visible in the dashboard's Security tab.
 
-Planned (Phase 2+): tool integrity pinning (rug-pull detection), secret-leak filtering, per-tool allow/deny policies, audit log, HTTP transport, context bloat analytics.
+  Default mode is **monitor** (observe and flag, never block). Opt into **enforce** (`--enforce`
+  or `mode = "enforce"`) to actively refuse denied/leaking calls: the proxy returns an in-protocol
+  JSON-RPC error to the client instead of forwarding — it never severs the connection, and any
+  proxy-internal error always fails open.
+
+Planned (Phase 3+): HTTP (streamable) transport, context bloat analytics, request replay.
+
+> **Privacy note:** the local SQLite database records **full raw traffic**, including any secret
+> that flows through it. This is by design (it is a traffic recorder) and the data never leaves
+> your machine; secret filtering masks values only in the security audit view.
 
 ## Build
 

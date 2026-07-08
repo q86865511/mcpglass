@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use proxy_core::{parse_line, Direction};
-use storage::{Record, Store};
+use storage::{ActionTaken, Record, SecurityEvent, SecurityEventKind, Store};
 
 /// A private temp dir unique to this test run, cleaned on drop.
 struct TempDir(PathBuf);
@@ -95,6 +95,54 @@ fn build_fixture() -> (TempDir, i64) {
             ),
         )
         .unwrap();
+
+    // Security events: one of each kind, mixing flagged and blocked, so the
+    // dashboard's badge counts and event table both have something to show.
+    store
+        .insert_security_event(
+            sid,
+            &SecurityEvent {
+                ts_ms: ts,
+                kind: SecurityEventKind::PolicyDeny,
+                rule: "deny-write-tools".to_owned(),
+                detail: "tool 'fs_write' denied by policy".to_owned(),
+                tool_name: Some("fs_write".to_owned()),
+                rpc_id: Some("42".to_owned()),
+                action_taken: ActionTaken::Blocked,
+            },
+        )
+        .unwrap();
+    ts += 1;
+    store
+        .insert_security_event(
+            sid,
+            &SecurityEvent {
+                ts_ms: ts,
+                kind: SecurityEventKind::SecretLeak,
+                rule: "aws-access-key".to_owned(),
+                detail: "AKIA**** redacted in tool result".to_owned(),
+                tool_name: Some("http_fetch".to_owned()),
+                rpc_id: None,
+                action_taken: ActionTaken::Flagged,
+            },
+        )
+        .unwrap();
+    ts += 1;
+    store
+        .insert_security_event(
+            sid,
+            &SecurityEvent {
+                ts_ms: ts,
+                kind: SecurityEventKind::FingerprintChange,
+                rule: "tool-fingerprint".to_owned(),
+                detail: "fingerprint for 'search' changed since first sighting".to_owned(),
+                tool_name: Some("search".to_owned()),
+                rpc_id: None,
+                action_taken: ActionTaken::Flagged,
+            },
+        )
+        .unwrap();
+
     store.end_session(sid).unwrap();
 
     (tmp, sid)
@@ -283,6 +331,63 @@ async fn full_api_surface() {
     assert_eq!(stats["totals"]["messages"].as_u64().unwrap(), 122);
     assert_eq!(stats["totals"]["errors"].as_u64().unwrap(), 1);
 
+    // --- /api/sessions/{id}/security ---
+    let security: serde_json::Value = client
+        .get(format!("{base}/api/sessions/{sid}/security?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(security["total"].as_u64().unwrap(), 3);
+    let events = security["events"].as_array().unwrap();
+    assert_eq!(events.len(), 3);
+    // Oldest-first (ascending id), matching the messages endpoint's ordering.
+    assert_eq!(events[0]["kind"], "policy_deny");
+    assert_eq!(events[0]["action_taken"], "blocked");
+    assert_eq!(events[0]["tool_name"], "fs_write");
+    assert_eq!(events[0]["rpc_id"], "42");
+    assert_eq!(events[1]["kind"], "secret_leak");
+    assert_eq!(events[1]["action_taken"], "flagged");
+    assert!(events[1]["detail"].as_str().unwrap().contains("AKIA"));
+    assert_eq!(events[2]["kind"], "fingerprint_change");
+
+    // --- /api/sessions/{id}/security: pagination ---
+    let security_page1: serde_json::Value = client
+        .get(format!("{base}/api/sessions/{sid}/security?limit=2&offset=0"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(security_page1["total"].as_u64().unwrap(), 3);
+    assert_eq!(security_page1["events"].as_array().unwrap().len(), 2);
+    let security_page2: serde_json::Value = client
+        .get(format!("{base}/api/sessions/{sid}/security?limit=2&offset=2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(security_page2["events"].as_array().unwrap().len(), 1);
+
+    // --- /api/sessions/{id}/security/counts ---
+    let counts: serde_json::Value = client
+        .get(format!("{base}/api/sessions/{sid}/security/counts"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(counts["policy_deny"].as_u64().unwrap(), 1);
+    assert_eq!(counts["secret_leak"].as_u64().unwrap(), 1);
+    assert_eq!(counts["fingerprint_change"].as_u64().unwrap(), 1);
+    assert_eq!(counts["blocked"].as_u64().unwrap(), 1);
+
     // --- static frontend: SPA index at / ---
     let root = client.get(&base).send().await.unwrap();
     assert!(root
@@ -330,6 +435,31 @@ async fn empty_db_yields_empty_lists_not_errors() {
         .await
         .unwrap();
     assert_eq!(sessions["sessions"].as_array().unwrap().len(), 0);
+
+    // --- security endpoints on a session that doesn't exist: (0, []) not an error ---
+    let security: serde_json::Value = client
+        .get(format!("{base}/api/sessions/9999/security"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(security["total"].as_u64().unwrap(), 0);
+    assert_eq!(security["events"].as_array().unwrap().len(), 0);
+
+    let counts: serde_json::Value = client
+        .get(format!("{base}/api/sessions/9999/security/counts"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(counts["policy_deny"].as_u64().unwrap(), 0);
+    assert_eq!(counts["secret_leak"].as_u64().unwrap(), 0);
+    assert_eq!(counts["fingerprint_change"].as_u64().unwrap(), 0);
+    assert_eq!(counts["blocked"].as_u64().unwrap(), 0);
 }
 
 /// `on_ready` must fire with an address the listener actually bound to a real

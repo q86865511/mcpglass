@@ -16,7 +16,16 @@ use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 /// Current on-disk schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+///
+/// v1 -> v2 is a purely additive migration: it appends the `security_events` and
+/// `tool_fingerprints` tables and never touches existing `sessions`/`messages`
+/// rows, so an in-place upgrade of a v1 file preserves all recorded data.
+///
+/// v2 -> v3 is likewise additive: it adds a `server_key` column to
+/// `tool_fingerprints` (via `ALTER TABLE ADD COLUMN`, so existing fingerprint rows
+/// are preserved with an empty `server_key`) to scope rug-pull detection by server
+/// identity *across sessions*, and never touches `sessions`/`messages` rows.
+const SCHEMA_VERSION: i64 = 3;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -105,6 +114,125 @@ pub struct Stats {
     pub totals: Totals,
 }
 
+/// What a security event flags. Mirrors `policy::PolicyEvent`; the string tokens
+/// match the `security_events.kind` CHECK constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityEventKind {
+    /// A request denied by a policy rule.
+    PolicyDeny,
+    /// A (masked) secret detected in a frame.
+    SecretLeak,
+    /// A tool's fingerprint changed after first sighting (rug-pull suspicion).
+    FingerprintChange,
+}
+
+impl SecurityEventKind {
+    /// Stable on-disk token; matches the `security_events.kind` CHECK values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecurityEventKind::PolicyDeny => "policy_deny",
+            SecurityEventKind::SecretLeak => "secret_leak",
+            SecurityEventKind::FingerprintChange => "fingerprint_change",
+        }
+    }
+}
+
+impl std::str::FromStr for SecurityEventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "policy_deny" => Ok(SecurityEventKind::PolicyDeny),
+            "secret_leak" => Ok(SecurityEventKind::SecretLeak),
+            "fingerprint_change" => Ok(SecurityEventKind::FingerprintChange),
+            _ => Err(()),
+        }
+    }
+}
+
+/// What the proxy did about a flagged frame. `Flagged` records-only; `Blocked`
+/// means the frame was suppressed on the forwarding path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionTaken {
+    Flagged,
+    Blocked,
+}
+
+impl ActionTaken {
+    /// Stable on-disk token; matches the `security_events.action_taken` CHECK values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActionTaken::Flagged => "flagged",
+            ActionTaken::Blocked => "blocked",
+        }
+    }
+}
+
+impl std::str::FromStr for ActionTaken {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "flagged" => Ok(ActionTaken::Flagged),
+            "blocked" => Ok(ActionTaken::Blocked),
+            _ => Err(()),
+        }
+    }
+}
+
+/// One security event, ready to persist. Append-only: there is no update/delete
+/// API. `detail` is expected to be already masked by the caller.
+pub struct SecurityEvent {
+    pub ts_ms: i64,
+    pub kind: SecurityEventKind,
+    /// The rule that fired (tool name / pattern name / tool name, per `kind`).
+    pub rule: String,
+    /// Human-readable explanation; any secret is already redacted.
+    pub detail: String,
+    pub tool_name: Option<String>,
+    /// The request `rpc_id` this event relates to, if any.
+    pub rpc_id: Option<String>,
+    pub action_taken: ActionTaken,
+}
+
+/// A persisted security event row, for the dashboard list view.
+pub struct SecurityEventRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub ts_ms: i64,
+    pub kind: SecurityEventKind,
+    pub rule: String,
+    pub detail: String,
+    pub tool_name: Option<String>,
+    pub rpc_id: Option<String>,
+    pub action_taken: ActionTaken,
+}
+
+/// Per-kind security event tallies plus the blocked count, for a session's
+/// dashboard alert badge.
+pub struct SecurityCounts {
+    pub policy_deny: u64,
+    pub secret_leak: u64,
+    pub fingerprint_change: u64,
+    pub blocked: u64,
+}
+
+/// Classification returned by [`Store::record_fingerprint`]: whether an observed
+/// tool fingerprint is new, already seen, or a change from a prior fingerprint.
+///
+/// Scope is `(server_key, tool_name)` and spans sessions: the same server wrapped
+/// again in a later session compares against the fingerprints it advertised before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintOutcome {
+    /// This exact `(server_key, tool, fingerprint)` was already recorded.
+    Unchanged,
+    /// First fingerprint seen for this `(server_key, tool)`.
+    New,
+    /// This `(server_key, tool)` was seen before under a different fingerprint
+    /// (rug-pull suspicion), possibly in an earlier session.
+    Changed,
+}
+
 /// Owns a single write connection. Intended to run on one dedicated thread that
 /// drains the tap channel; rusqlite `Connection` is not `Sync`.
 pub struct Store {
@@ -150,10 +278,24 @@ impl Store {
     }
 
     fn init_schema(&self) -> Result<()> {
-        // BEGIN/COMMIT makes table creation and the `user_version = 1` stamp one
+        // v2 -> v3 additive upgrade FIRST, so the CREATE batch below always sees a
+        // `tool_fingerprints` table that carries `server_key`. On a pre-v3 file the
+        // table exists without the column and is patched in place with ADD COLUMN
+        // (existing rows backfill to '' — acceptable: those are early Phase-2
+        // fingerprints that predate server scoping). On a fresh db the table does
+        // not exist yet, so this is a no-op and the CREATE below builds the column
+        // from the start. Idempotent: re-opening a v3 file finds the column and
+        // skips the ALTER.
+        self.migrate_v3_add_server_key()?;
+
+        // BEGIN/COMMIT makes table creation and the `user_version = 3` stamp one
         // atomic unit, so a concurrent reader's legacy-v0 probe (see
         // `is_legacy_v0`) can never observe the `messages` table mid-creation
-        // with `user_version` still at 0 and misclassify a fresh v1 db as v0.
+        // with `user_version` still at 0 and misclassify a fresh db as v0.
+        //
+        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3 upgrade additive: on an
+        // existing file the sessions/messages tables are left untouched, any missing
+        // tables are appended, and `user_version` is bumped to 3.
         self.conn
             .execute_batch(
                 "BEGIN;
@@ -177,10 +319,71 @@ impl Store {
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_session_id
                     ON messages(session_id, id);
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS security_events (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id   INTEGER NOT NULL REFERENCES sessions(id),
+                    ts_ms        INTEGER NOT NULL,
+                    kind         TEXT    NOT NULL CHECK (kind IN ('policy_deny','secret_leak','fingerprint_change')),
+                    rule         TEXT    NOT NULL,
+                    detail       TEXT    NOT NULL,
+                    tool_name    TEXT,
+                    rpc_id       TEXT,
+                    action_taken TEXT    NOT NULL CHECK (action_taken IN ('flagged','blocked'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_security_events_session_id
+                    ON security_events(session_id, id);
+                CREATE TABLE IF NOT EXISTS tool_fingerprints (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id       INTEGER NOT NULL REFERENCES sessions(id),
+                    tool_name        TEXT    NOT NULL,
+                    fingerprint      TEXT    NOT NULL,
+                    first_seen_ts_ms INTEGER NOT NULL,
+                    server_key       TEXT    NOT NULL DEFAULT '',
+                    UNIQUE (server_key, tool_name, fingerprint)
+                );
+                CREATE INDEX IF NOT EXISTS idx_tool_fingerprints_scope
+                    ON tool_fingerprints(server_key, tool_name, id);
+                PRAGMA user_version = 3;
                 COMMIT;",
             )
-            .context("creating v1 schema")?;
+            .context("creating v3 schema")?;
+        Ok(())
+    }
+
+    /// Add the `server_key` column to a pre-v3 `tool_fingerprints` table so
+    /// rug-pull detection can be scoped by server identity across sessions. A
+    /// no-op when the table is absent (fresh db, handled by the CREATE in
+    /// [`Store::init_schema`]) or the column already exists (a v3 file).
+    ///
+    /// Kept separate from the CREATE batch because `ALTER TABLE ADD COLUMN` is not
+    /// conditional in SQLite: running it when the column already exists is an
+    /// error, so we gate it on an explicit column probe.
+    fn migrate_v3_add_server_key(&self) -> Result<()> {
+        let table_exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tool_fingerprints'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !table_exists {
+            return Ok(());
+        }
+        let has_server_key: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('tool_fingerprints') WHERE name = 'server_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_server_key == 0 {
+            self.conn
+                .execute_batch(
+                    "ALTER TABLE tool_fingerprints
+                        ADD COLUMN server_key TEXT NOT NULL DEFAULT ''",
+                )
+                .context("adding server_key column (v2 -> v3)")?;
+        }
         Ok(())
     }
 
@@ -375,6 +578,151 @@ impl Store {
             totals,
         })
     }
+
+    /// Append one security event under `session_id`. Append-only: there is no
+    /// update or delete counterpart. Like [`Store::insert`], errors are returned
+    /// so the tap loop can log-and-continue.
+    pub fn insert_security_event(&self, session_id: i64, ev: &SecurityEvent) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO security_events
+                    (session_id, ts_ms, kind, rule, detail, tool_name, rpc_id, action_taken)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    session_id,
+                    ev.ts_ms,
+                    ev.kind.as_str(),
+                    ev.rule,
+                    ev.detail,
+                    ev.tool_name,
+                    ev.rpc_id,
+                    ev.action_taken.as_str(),
+                ],
+            )
+            .context("inserting security event")?;
+        Ok(())
+    }
+
+    /// Record an observed `(tool_name, fingerprint)` under `server_key` and classify
+    /// it. `New` = first fingerprint seen for this `(server_key, tool)`;
+    /// `Unchanged` = this exact fingerprint was already recorded; `Changed` = this
+    /// `(server_key, tool)` was seen before under a different fingerprint (rug-pull
+    /// suspicion). The caller decides whether a `Changed` outcome warrants a
+    /// `fingerprint_change` event.
+    ///
+    /// The comparison scope is `(server_key, tool_name)` and deliberately spans
+    /// sessions: the canonical rug-pull is a server that is approved on one `wrap`
+    /// and then mutates a tool's definition on a *later* one, so a same-session-only
+    /// comparison would miss the primary attack. `session_id` is still stored for
+    /// traceability (which run first saw a given fingerprint).
+    ///
+    /// Append-only: a `Changed` outcome inserts a new row and keeps the prior
+    /// fingerprint(s), so the history of a tool's fingerprints is preserved.
+    pub fn record_fingerprint(
+        &self,
+        session_id: i64,
+        server_key: &str,
+        tool_name: &str,
+        fingerprint: &str,
+        ts_ms: i64,
+    ) -> Result<FingerprintOutcome> {
+        // Exact (server_key, tool, fingerprint) already known -> nothing to record.
+        let same_seen = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tool_fingerprints
+                 WHERE server_key = ?1 AND tool_name = ?2 AND fingerprint = ?3",
+                params![server_key, tool_name, fingerprint],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if same_seen {
+            return Ok(FingerprintOutcome::Unchanged);
+        }
+        // Fingerprint is new for this (server, tool); distinguish first sighting
+        // from a change (across any prior session under the same server_key).
+        let tool_seen = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM tool_fingerprints
+                 WHERE server_key = ?1 AND tool_name = ?2",
+                params![server_key, tool_name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        // Insert scoped by server_key. The v3 UNIQUE(server_key, tool_name,
+        // fingerprint) rejects a duplicate, but the `same_seen` check above already
+        // returns before reaching here for known pairs. (On a file upgraded from v2
+        // the pre-v3 UNIQUE(session_id, tool_name, fingerprint) also still exists;
+        // it cannot collide here because session ids are fresh per `wrap` run.)
+        self.conn
+            .execute(
+                "INSERT INTO tool_fingerprints
+                    (session_id, server_key, tool_name, fingerprint, first_seen_ts_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![session_id, server_key, tool_name, fingerprint, ts_ms],
+            )
+            .context("recording tool fingerprint")?;
+        Ok(if tool_seen {
+            FingerprintOutcome::Changed
+        } else {
+            FingerprintOutcome::New
+        })
+    }
+
+    /// A paged window of a session's security events plus the total match count
+    /// (ignoring the window), for the dashboard. Rows come back oldest-first
+    /// (`id ASC`).
+    pub fn security_events(
+        &self,
+        session_id: i64,
+        limit: u32,
+        offset: u32,
+    ) -> Result<(u64, Vec<SecurityEventRow>)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM security_events WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, ts_ms, kind, rule, detail, tool_name, rpc_id, action_taken
+             FROM security_events
+             WHERE session_id = ?1
+             ORDER BY id ASC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![session_id, limit as i64, offset as i64],
+                map_security_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((total as u64, rows))
+    }
+
+    /// Per-kind counts plus the blocked count for a session, for the alert badge.
+    pub fn security_event_counts(&self, session_id: i64) -> Result<SecurityCounts> {
+        let counts = self.conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN kind = 'policy_deny' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN kind = 'secret_leak' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN kind = 'fingerprint_change' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN action_taken = 'blocked' THEN 1 ELSE 0 END), 0)
+             FROM security_events WHERE session_id = ?1",
+            params![session_id],
+            |r| {
+                Ok(SecurityCounts {
+                    policy_deny: r.get::<_, i64>(0)? as u64,
+                    secret_leak: r.get::<_, i64>(1)? as u64,
+                    fingerprint_change: r.get::<_, i64>(2)? as u64,
+                    blocked: r.get::<_, i64>(3)? as u64,
+                })
+            },
+        )?;
+        Ok(counts)
+    }
 }
 
 /// Build the shared `WHERE` fragment (using anonymous `?` placeholders) and its
@@ -421,6 +769,34 @@ fn parse_direction(s: &str, col: usize) -> rusqlite::Result<Direction> {
             col,
             rusqlite::types::Type::Text,
             format!("unexpected direction {s:?}").into(),
+        )
+    })
+}
+
+fn map_security_event_row(r: &rusqlite::Row) -> rusqlite::Result<SecurityEventRow> {
+    let kind: String = r.get(3)?;
+    let action: String = r.get(8)?;
+    Ok(SecurityEventRow {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        ts_ms: r.get(2)?,
+        kind: parse_token(&kind, 3, "security event kind")?,
+        rule: r.get(4)?,
+        detail: r.get(5)?,
+        tool_name: r.get(6)?,
+        rpc_id: r.get(7)?,
+        action_taken: parse_token(&action, 8, "action_taken")?,
+    })
+}
+
+/// Parse a CHECK-constrained token back into its enum. The constraint makes an
+/// unknown value impossible, but map it to a conversion error rather than assume.
+fn parse_token<T: std::str::FromStr>(s: &str, col: usize, what: &str) -> rusqlite::Result<T> {
+    s.parse::<T>().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            col,
+            rusqlite::types::Type::Text,
+            format!("unexpected {what} {s:?}").into(),
         )
     })
 }
@@ -845,5 +1221,373 @@ mod tests {
         assert_eq!(detail.session_id, sid);
         assert_eq!(detail.direction, Direction::C2s);
         assert!(store.message(999_999).unwrap().is_none());
+    }
+
+    fn sec_event(kind: SecurityEventKind, action: ActionTaken) -> SecurityEvent {
+        SecurityEvent {
+            ts_ms: 1,
+            kind,
+            rule: "rule".to_owned(),
+            detail: "masked detail".to_owned(),
+            tool_name: Some("tool".to_owned()),
+            rpc_id: Some("7".to_owned()),
+            action_taken: action,
+        }
+    }
+
+    /// Hand-build a v1 file: the v1 schema (sessions + messages) with a session
+    /// and a message, `user_version` stamped 1.
+    fn write_legacy_v1_db(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                command TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL,
+                is_error INTEGER NOT NULL DEFAULT 0
+            );
+            PRAGMA user_version = 1;
+            COMMIT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label, command, started_at_ms) VALUES ('old', 'echo old', 42)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (session_id, ts_ms, direction, raw, method, rpc_id, is_valid_json, is_error)
+             VALUES (1, 100, 'c2s', '{\"id\":1,\"method\":\"ping\"}', 'ping', '1', 1, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v1_to_v3_additive_upgrade_preserves_data() {
+        let tmp = TempDir::new("v1-upgrade");
+        let db = tmp.db();
+        write_legacy_v1_db(&db);
+
+        // Opening a v1 file upgrades it in place to the current schema...
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(SCHEMA_VERSION, 3);
+
+        // ...without disturbing the pre-existing v1 data.
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].label, "old");
+        assert_eq!(sessions[0].message_count, 1);
+        let (total, rows) = store.messages(1, &page(50)).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].method.as_deref(), Some("ping"));
+
+        // The new v2/v3 tables are present and usable on the upgraded file.
+        store
+            .insert_security_event(1, &sec_event(SecurityEventKind::PolicyDeny, ActionTaken::Blocked))
+            .unwrap();
+        let (n, ev_rows) = store.security_events(1, 50, 0).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(ev_rows.len(), 1);
+        assert_eq!(
+            store.record_fingerprint(1, "srv", "t", "fp", 1).unwrap(),
+            FingerprintOutcome::New
+        );
+    }
+
+    /// Hand-build a v2 file: the v2 schema (sessions + messages + security_events +
+    /// the *pre-v3* tool_fingerprints without `server_key`) with one row in each,
+    /// `user_version` stamped 2.
+    fn write_legacy_v2_db(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                command TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL,
+                is_error INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('policy_deny','secret_leak','fingerprint_change')),
+                rule TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                tool_name TEXT,
+                rpc_id TEXT,
+                action_taken TEXT NOT NULL CHECK (action_taken IN ('flagged','blocked'))
+            );
+            CREATE TABLE tool_fingerprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                tool_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                first_seen_ts_ms INTEGER NOT NULL,
+                UNIQUE (session_id, tool_name, fingerprint)
+            );
+            PRAGMA user_version = 2;
+            COMMIT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label, command, started_at_ms) VALUES ('old', 'echo old', 42)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (session_id, ts_ms, direction, raw, method, rpc_id, is_valid_json, is_error)
+             VALUES (1, 100, 'c2s', '{\"id\":1,\"method\":\"ping\"}', 'ping', '1', 1, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO security_events
+                (session_id, ts_ms, kind, rule, detail, tool_name, rpc_id, action_taken)
+             VALUES (1, 100, 'policy_deny', 'r', 'd', 't', '1', 'flagged')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tool_fingerprints
+                (session_id, tool_name, fingerprint, first_seen_ts_ms)
+             VALUES (1, 'legacy_tool', 'legacy_fp', 100)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v2_to_v3_additive_upgrade_preserves_data() {
+        let tmp = TempDir::new("v2-upgrade");
+        let db = tmp.db();
+        write_legacy_v2_db(&db);
+
+        // Opening a v2 file upgrades it in place to v3 via ALTER TABLE ADD COLUMN...
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+
+        // ...preserving all pre-existing v2 rows (sessions/messages/events).
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].label, "old");
+        assert_eq!(sessions[0].message_count, 1);
+        let (n, _) = store.security_events(1, 50, 0).unwrap();
+        assert_eq!(n, 1);
+
+        // The pre-v3 fingerprint row survives, now carrying an empty server_key.
+        let (fp_session, fp_server): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT session_id, server_key FROM tool_fingerprints WHERE tool_name = 'legacy_tool'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp_session, 1);
+        assert_eq!(fp_server, "");
+
+        // New fingerprints record under the v3 server_key scope on the upgraded file.
+        assert_eq!(
+            store.record_fingerprint(1, "srv", "t", "fp", 200).unwrap(),
+            FingerprintOutcome::New
+        );
+
+        // Re-opening the upgraded file is a no-op (ALTER not re-run) and still v3.
+        let store2 = Store::open(&db).unwrap();
+        let version2: i64 = store2
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version2, 3);
+    }
+
+    #[test]
+    fn security_events_insert_and_paginate() {
+        let tmp = TempDir::new("secev");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        for i in 0..5 {
+            let ev = SecurityEvent {
+                ts_ms: i,
+                kind: SecurityEventKind::SecretLeak,
+                rule: format!("pattern{i}"),
+                detail: "***".to_owned(),
+                tool_name: None,
+                rpc_id: Some(i.to_string()),
+                action_taken: ActionTaken::Flagged,
+            };
+            store.insert_security_event(sid, &ev).unwrap();
+        }
+
+        // total ignores the window; rows respect it and stay ordered (id ASC).
+        let (total, rows) = store.security_events(sid, 2, 1).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].id < rows[1].id);
+        // offset 1 -> the second-oldest event.
+        assert_eq!(rows[0].rule, "pattern1");
+        assert_eq!(rows[0].kind, SecurityEventKind::SecretLeak);
+        assert_eq!(rows[0].action_taken, ActionTaken::Flagged);
+        assert_eq!(rows[0].tool_name, None);
+        assert_eq!(rows[0].rpc_id.as_deref(), Some("1"));
+        assert_eq!(rows[0].session_id, sid);
+    }
+
+    #[test]
+    fn security_events_empty_session_returns_zero() {
+        let tmp = TempDir::new("secev-empty");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        let (total, rows) = store.security_events(sid, 50, 0).unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+        let counts = store.security_event_counts(sid).unwrap();
+        assert_eq!(counts.policy_deny, 0);
+        assert_eq!(counts.secret_leak, 0);
+        assert_eq!(counts.fingerprint_change, 0);
+        assert_eq!(counts.blocked, 0);
+    }
+
+    #[test]
+    fn security_event_counts_by_kind_and_blocked() {
+        let tmp = TempDir::new("seccount");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        store
+            .insert_security_event(sid, &sec_event(SecurityEventKind::PolicyDeny, ActionTaken::Blocked))
+            .unwrap();
+        store
+            .insert_security_event(sid, &sec_event(SecurityEventKind::PolicyDeny, ActionTaken::Flagged))
+            .unwrap();
+        store
+            .insert_security_event(sid, &sec_event(SecurityEventKind::SecretLeak, ActionTaken::Flagged))
+            .unwrap();
+        store
+            .insert_security_event(
+                sid,
+                &sec_event(SecurityEventKind::FingerprintChange, ActionTaken::Blocked),
+            )
+            .unwrap();
+
+        let c = store.security_event_counts(sid).unwrap();
+        assert_eq!(c.policy_deny, 2);
+        assert_eq!(c.secret_leak, 1);
+        assert_eq!(c.fingerprint_change, 1);
+        assert_eq!(c.blocked, 2);
+    }
+
+    #[test]
+    fn record_fingerprint_new_unchanged_changed() {
+        let tmp = TempDir::new("fp");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        let srv = "echo";
+
+        // First sighting of a tool -> New.
+        assert_eq!(store.record_fingerprint(sid, srv, "search", "aaa", 1).unwrap(), FingerprintOutcome::New);
+        // Same tool, same fingerprint -> Unchanged.
+        assert_eq!(store.record_fingerprint(sid, srv, "search", "aaa", 2).unwrap(), FingerprintOutcome::Unchanged);
+        // Same tool, different fingerprint -> Changed (rug-pull suspicion).
+        assert_eq!(store.record_fingerprint(sid, srv, "search", "bbb", 3).unwrap(), FingerprintOutcome::Changed);
+        // A different tool is New again, independent of `search`.
+        assert_eq!(store.record_fingerprint(sid, srv, "fetch", "aaa", 4).unwrap(), FingerprintOutcome::New);
+    }
+
+    #[test]
+    fn record_fingerprint_detects_rug_pull_across_sessions() {
+        let tmp = TempDir::new("fp-cross-session");
+        let store = Store::open(&tmp.db()).unwrap();
+        let srv = "npx some-server";
+
+        // Session 1 approves `search` under fingerprint aaa.
+        let s1 = store.begin_session("run1", srv).unwrap();
+        assert_eq!(store.record_fingerprint(s1, srv, "search", "aaa", 1).unwrap(), FingerprintOutcome::New);
+
+        // A LATER session wrapping the SAME server re-advertises `search`...
+        let s2 = store.begin_session("run2", srv).unwrap();
+        // ...with the same definition -> Unchanged (no false positive across runs).
+        assert_eq!(store.record_fingerprint(s2, srv, "search", "aaa", 2).unwrap(), FingerprintOutcome::Unchanged);
+        // ...but a mutated definition is caught as Changed even though it is the
+        // first time THIS session saw the tool (the canonical rug-pull).
+        assert_eq!(store.record_fingerprint(s2, srv, "search", "bbb", 3).unwrap(), FingerprintOutcome::Changed);
+    }
+
+    #[test]
+    fn record_fingerprint_isolates_distinct_server_keys() {
+        let tmp = TempDir::new("fp-server-isolation");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+
+        // The same tool name under a different server_key is a different tool: its
+        // fingerprint does not interfere with the other server's history.
+        assert_eq!(store.record_fingerprint(sid, "server-a", "search", "aaa", 1).unwrap(), FingerprintOutcome::New);
+        assert_eq!(store.record_fingerprint(sid, "server-b", "search", "zzz", 2).unwrap(), FingerprintOutcome::New);
+        // server-a's `search` re-advertised as aaa is still Unchanged; server-b's
+        // divergent fingerprint never counted as a change for server-a.
+        assert_eq!(store.record_fingerprint(sid, "server-a", "search", "aaa", 3).unwrap(), FingerprintOutcome::Unchanged);
+    }
+
+    #[test]
+    fn record_fingerprint_keeps_history_append_only() {
+        let tmp = TempDir::new("fp-history");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        let srv = "echo";
+        store.record_fingerprint(sid, srv, "search", "aaa", 1).unwrap();
+        assert_eq!(store.record_fingerprint(sid, srv, "search", "bbb", 2).unwrap(), FingerprintOutcome::Changed);
+
+        // Both fingerprint rows are retained (no overwrite on a change).
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_fingerprints
+                 WHERE server_key = ?1 AND tool_name = 'search'",
+                params![srv],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Re-recording either historical fingerprint is still Unchanged.
+        assert_eq!(store.record_fingerprint(sid, srv, "search", "aaa", 3).unwrap(), FingerprintOutcome::Unchanged);
+        assert_eq!(store.record_fingerprint(sid, srv, "search", "bbb", 4).unwrap(), FingerprintOutcome::Unchanged);
     }
 }

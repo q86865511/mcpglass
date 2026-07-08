@@ -99,6 +99,96 @@ for (const def of sessionDefs) {
   for (const m of msgs) messagesById.set(m.id, m);
 }
 
+// Security events fixture: session 2 (the "live" one) gets a mix of all three
+// kinds plus both flagged/blocked outcomes, so the badge row and table have
+// something interesting to render in dev. Session 1 stays clean (empty state).
+function buildSecurityEvents(sessionId, startTs) {
+  const rows = [
+    {
+      kind: "policy_deny",
+      rule: "deny-write-tools",
+      detail: "tool 'fs_write' denied by policy (write tools disabled)",
+      tool_name: "fs_write",
+      rpc_id: "17",
+      action_taken: "blocked",
+    },
+    {
+      kind: "secret_leak",
+      rule: "aws-access-key",
+      detail: "AKIA****************** redacted in tool result",
+      tool_name: "http_fetch",
+      rpc_id: null,
+      action_taken: "flagged",
+    },
+    {
+      kind: "secret_leak",
+      rule: "generic-api-key",
+      detail: "sk-live-**************** redacted in tool result",
+      tool_name: "http_fetch",
+      rpc_id: "23",
+      action_taken: "blocked",
+    },
+    {
+      kind: "fingerprint_change",
+      rule: "tool-fingerprint",
+      detail: "fingerprint for 'search' changed since first sighting (rug-pull suspicion)",
+      tool_name: "search",
+      rpc_id: null,
+      action_taken: "flagged",
+    },
+    {
+      kind: "policy_deny",
+      rule: "deny-network-tools",
+      detail: "tool 'http_fetch' denied by policy (outbound host not allow-listed)",
+      tool_name: "http_fetch",
+      rpc_id: "31",
+      action_taken: "flagged",
+    },
+    {
+      kind: "fingerprint_change",
+      rule: "tool-fingerprint",
+      detail: "fingerprint for 'tools/list' changed since first sighting",
+      tool_name: null,
+      rpc_id: null,
+      action_taken: "blocked",
+    },
+  ];
+  return rows.map((r, i) => ({
+    id: sessionId * 1000 + i + 1,
+    session_id: sessionId,
+    ts_ms: startTs + i * 1500,
+    ...r,
+  }));
+}
+
+const securityEventsBySession = new Map();
+securityEventsBySession.set(2, buildSecurityEvents(2, sessionDefs[0].started_at_ms));
+securityEventsBySession.set(1, []); // clean session -> exercises the empty state
+
+function securityEventsPayload(sessionId, query) {
+  const all = securityEventsBySession.get(sessionId) ?? [];
+  const limit = Math.max(1, Number(query.get("limit")) || 100);
+  const offset = Math.max(0, Number(query.get("offset")) || 0);
+  const total = all.length;
+  const page = all.slice(offset, offset + limit).map(({ session_id, ...rest }) => rest);
+  return { total, events: page };
+}
+
+function securityCountsPayload(sessionId) {
+  const all = securityEventsBySession.get(sessionId) ?? [];
+  let policy_deny = 0;
+  let secret_leak = 0;
+  let fingerprint_change = 0;
+  let blocked = 0;
+  for (const e of all) {
+    if (e.kind === "policy_deny") policy_deny++;
+    if (e.kind === "secret_leak") secret_leak++;
+    if (e.kind === "fingerprint_change") fingerprint_change++;
+    if (e.action_taken === "blocked") blocked++;
+  }
+  return { policy_deny, secret_leak, fingerprint_change, blocked };
+}
+
 function toSummary(full) {
   const { raw, session_id, ...rest } = full;
   const preview = raw.length > 120 ? raw.slice(0, 120) : raw;
@@ -221,6 +311,32 @@ const server = createServer((req, res) => {
       return;
     }
     send(200, statsPayload(sessionId));
+    return;
+  }
+
+  if (parts.length === 4 && parts[1] === "sessions" && parts[3] === "security" && req.method === "GET") {
+    const sessionId = Number(parts[2]);
+    if (!messagesBySession.has(sessionId)) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    send(200, securityEventsPayload(sessionId, url.searchParams));
+    return;
+  }
+
+  if (
+    parts.length === 5 &&
+    parts[1] === "sessions" &&
+    parts[3] === "security" &&
+    parts[4] === "counts" &&
+    req.method === "GET"
+  ) {
+    const sessionId = Number(parts[2]);
+    if (!messagesBySession.has(sessionId)) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    send(200, securityCountsPayload(sessionId));
     return;
   }
 

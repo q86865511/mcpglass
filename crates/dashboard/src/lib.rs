@@ -18,7 +18,10 @@ use axum::{Json, Router};
 use proxy_core::Direction;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use storage::{MessageDetail, MessageFilter, MessageRow, SessionSummary, Stats, Store};
+use storage::{
+    MessageDetail, MessageFilter, MessageRow, SecurityCounts, SecurityEventRow, SessionSummary,
+    Stats, Store,
+};
 
 /// The built frontend, baked into the binary so `mcpglass dashboard` needs no
 /// separate static-file directory at runtime.
@@ -59,6 +62,11 @@ pub async fn serve(
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/sessions/{id}/stats", get(session_stats))
+        .route("/api/sessions/{id}/security", get(session_security))
+        .route(
+            "/api/sessions/{id}/security/counts",
+            get(session_security_counts),
+        )
         .route("/api/messages/{id}", get(message_detail))
         .fallback(static_asset)
         .with_state(state);
@@ -321,6 +329,90 @@ async fn session_stats(
 ) -> Result<Json<StatsDto>, AppError> {
     let stats = run_blocking(state.db_path, move |store| store.stats(id)).await?;
     Ok(Json(StatsDto::from(stats)))
+}
+
+#[derive(Serialize)]
+struct SecurityEventDto {
+    id: i64,
+    ts_ms: i64,
+    kind: String,
+    rule: String,
+    detail: String,
+    tool_name: Option<String>,
+    rpc_id: Option<String>,
+    action_taken: String,
+}
+
+impl From<SecurityEventRow> for SecurityEventDto {
+    fn from(e: SecurityEventRow) -> Self {
+        Self {
+            id: e.id,
+            ts_ms: e.ts_ms,
+            kind: e.kind.as_str().to_owned(),
+            rule: e.rule,
+            detail: e.detail,
+            tool_name: e.tool_name,
+            rpc_id: e.rpc_id,
+            action_taken: e.action_taken.as_str().to_owned(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SecurityEventsResponse {
+    total: u64,
+    events: Vec<SecurityEventDto>,
+}
+
+#[derive(Deserialize)]
+struct SecurityEventsQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn session_security(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Query(q): Query<SecurityEventsQuery>,
+) -> Result<Json<SecurityEventsResponse>, AppError> {
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+    let (total, rows) = run_blocking(state.db_path, move |store| {
+        store.security_events(id, limit, offset)
+    })
+    .await?;
+    Ok(Json(SecurityEventsResponse {
+        total,
+        events: rows.into_iter().map(SecurityEventDto::from).collect(),
+    }))
+}
+
+#[derive(Serialize)]
+struct SecurityCountsDto {
+    policy_deny: u64,
+    secret_leak: u64,
+    fingerprint_change: u64,
+    blocked: u64,
+}
+
+impl From<SecurityCounts> for SecurityCountsDto {
+    fn from(c: SecurityCounts) -> Self {
+        Self {
+            policy_deny: c.policy_deny,
+            secret_leak: c.secret_leak,
+            fingerprint_change: c.fingerprint_change,
+            blocked: c.blocked,
+        }
+    }
+}
+
+async fn session_security_counts(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<SecurityCountsDto>, AppError> {
+    let counts =
+        run_blocking(state.db_path, move |store| store.security_event_counts(id)).await?;
+    Ok(Json(SecurityCountsDto::from(counts)))
 }
 
 /// Serve an embedded frontend asset by request path, falling back to

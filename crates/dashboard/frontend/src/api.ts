@@ -59,6 +59,34 @@ export interface SessionStats {
   };
 }
 
+export type SecurityEventKind = "policy_deny" | "secret_leak" | "fingerprint_change";
+export type ActionTaken = "flagged" | "blocked";
+
+export interface SecurityEvent {
+  id: number;
+  ts_ms: number;
+  kind: SecurityEventKind;
+  rule: string;
+  // Already masked by the backend (e.g. a leaked key comes back as
+  // "AKIA****...**") — safe to render as-is.
+  detail: string;
+  tool_name: string | null;
+  rpc_id: string | null;
+  action_taken: ActionTaken;
+}
+
+export interface SecurityEventsResponse {
+  total: number;
+  events: SecurityEvent[];
+}
+
+export interface SecurityCounts {
+  policy_deny: number;
+  secret_leak: number;
+  fingerprint_change: number;
+  blocked: number;
+}
+
 export interface HealthResponse {
   version: string;
 }
@@ -108,4 +136,25 @@ export function fetchSessionStats(sessionId: number): Promise<SessionStats> {
 
 export function fetchHealth(): Promise<HealthResponse> {
   return getJson<HealthResponse>("/api/health");
+}
+
+export interface SecurityEventsFilters {
+  limit: number;
+  offset: number;
+}
+
+export function fetchSecurityEvents(
+  sessionId: number,
+  filters: SecurityEventsFilters,
+): Promise<SecurityEventsResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(filters.limit));
+  params.set("offset", String(filters.offset));
+  return getJson<SecurityEventsResponse>(
+    `/api/sessions/${sessionId}/security?${params.toString()}`,
+  );
+}
+
+export function fetchSecurityCounts(sessionId: number): Promise<SecurityCounts> {
+  return getJson<SecurityCounts>(`/api/sessions/${sessionId}/security/counts`);
 }

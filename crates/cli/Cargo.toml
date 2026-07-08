@@ -17,6 +17,7 @@ path = "src/bin/echo_mcp.rs"
 
 [dependencies]
 proxy-core = { path = "../proxy-core" }
+policy = { path = "../policy" }
 storage = { path = "../storage" }
 dashboard = { path = "../dashboard" }
 tokio.workspace = true

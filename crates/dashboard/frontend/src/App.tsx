@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { Direction, MessagesResponse, SessionStats, SessionSummary } from "./api";
+import type {
+  Direction,
+  MessagesResponse,
+  SecurityCounts,
+  SecurityEventsResponse,
+  SessionStats,
+  SessionSummary,
+} from "./api";
 import {
   fetchMessages,
+  fetchSecurityCounts,
+  fetchSecurityEvents,
   fetchSessionStats,
   fetchSessions,
 } from "./api";
@@ -11,14 +20,19 @@ import { MessageTable } from "./components/MessageTable";
 import { DetailPanel } from "./components/DetailPanel";
 import { StatsBar } from "./components/StatsBar";
 import { Pagination } from "./components/Pagination";
+import { SecurityView } from "./components/SecurityView";
 
 const PAGE_SIZE = 100;
 const AUTO_REFRESH_MS = 2000;
+
+type View = "messages" | "security";
 
 export function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
+
+  const [view, setView] = useState<View>("messages");
 
   const [direction, setDirection] = useState<Direction | "">("");
   const [method, setMethod] = useState("");
@@ -32,15 +46,23 @@ export function App() {
 
   const [stats, setStats] = useState<SessionStats | null>(null);
 
+  const [securityOffset, setSecurityOffset] = useState(0);
+  const [securityResp, setSecurityResp] = useState<SecurityEventsResponse | null>(null);
+  const [securityError, setSecurityError] = useState<string | null>(null);
+  const [securityCounts, setSecurityCounts] = useState<SecurityCounts | null>(null);
+
   // Monotonic request counters so a slow, stale response (e.g. from a
   // session we've since navigated away from) can't clobber a newer one.
   const messagesSeqRef = useRef(0);
   const statsSeqRef = useRef(0);
+  const securitySeqRef = useRef(0);
+  const securityCountsSeqRef = useRef(0);
 
   // Reset paging/selection when switching sessions or changing filters.
   useEffect(() => {
     setOffset(0);
     setSelectedMessageId(null);
+    setSecurityOffset(0);
   }, [selectedSessionId, direction, method, query]);
 
   const loadSessions = useCallback(() => {
@@ -99,6 +121,43 @@ export function App() {
       });
   }, [selectedSessionId]);
 
+  const loadSecurity = useCallback(() => {
+    if (selectedSessionId === null) {
+      securitySeqRef.current += 1;
+      setSecurityResp(null);
+      return;
+    }
+    const seq = ++securitySeqRef.current;
+    fetchSecurityEvents(selectedSessionId, { limit: PAGE_SIZE, offset: securityOffset })
+      .then((r) => {
+        if (securitySeqRef.current !== seq) return; // superseded by a newer request
+        setSecurityResp(r);
+        setSecurityError(null);
+      })
+      .catch((e: unknown) => {
+        if (securitySeqRef.current !== seq) return;
+        setSecurityError(e instanceof Error ? e.message : String(e));
+      });
+  }, [selectedSessionId, securityOffset]);
+
+  const loadSecurityCounts = useCallback(() => {
+    if (selectedSessionId === null) {
+      securityCountsSeqRef.current += 1;
+      setSecurityCounts(null);
+      return;
+    }
+    const seq = ++securityCountsSeqRef.current;
+    fetchSecurityCounts(selectedSessionId)
+      .then((r) => {
+        if (securityCountsSeqRef.current !== seq) return; // superseded by a newer request
+        setSecurityCounts(r);
+      })
+      .catch(() => {
+        if (securityCountsSeqRef.current !== seq) return;
+        setSecurityCounts(null);
+      });
+  }, [selectedSessionId]);
+
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
@@ -111,8 +170,30 @@ export function App() {
     loadStats();
   }, [loadStats]);
 
-  const autoRefreshRef = useRef({ loadSessions, loadMessages, loadStats });
-  autoRefreshRef.current = { loadSessions, loadMessages, loadStats };
+  useEffect(() => {
+    loadSecurity();
+  }, [loadSecurity]);
+
+  useEffect(() => {
+    loadSecurityCounts();
+  }, [loadSecurityCounts]);
+
+  const autoRefreshRef = useRef({
+    loadSessions,
+    loadMessages,
+    loadStats,
+    loadSecurity,
+    loadSecurityCounts,
+  });
+  autoRefreshRef.current = {
+    loadSessions,
+    loadMessages,
+    loadStats,
+    loadSecurity,
+    loadSecurityCounts,
+  };
+  const viewRef = useRef(view);
+  viewRef.current = view;
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -120,6 +201,11 @@ export function App() {
       autoRefreshRef.current.loadSessions();
       autoRefreshRef.current.loadMessages();
       autoRefreshRef.current.loadStats();
+      // Security events/counts are only polled while that view is visible.
+      if (viewRef.current === "security") {
+        autoRefreshRef.current.loadSecurity();
+        autoRefreshRef.current.loadSecurityCounts();
+      }
     }, AUTO_REFRESH_MS);
     return () => clearInterval(id);
   }, [autoRefresh]);
@@ -144,33 +230,68 @@ export function App() {
         ) : (
           <>
             <StatsBar stats={stats} />
-            <Toolbar
-              direction={direction}
-              onDirectionChange={setDirection}
-              method={method}
-              onMethodChange={setMethod}
-              query={query}
-              onQueryChange={setQuery}
-              autoRefresh={autoRefresh}
-              onAutoRefreshChange={setAutoRefresh}
-            />
-            {messagesError && <div className="banner banner-error">Failed to load messages: {messagesError}</div>}
-            <div className="content-split">
-              <div className="table-pane">
-                <MessageTable
-                  messages={messagesResp?.messages ?? []}
-                  selectedId={selectedMessageId}
-                  onSelect={setSelectedMessageId}
-                />
-                <Pagination
-                  offset={offset}
-                  limit={PAGE_SIZE}
-                  total={messagesResp?.total ?? 0}
-                  onOffsetChange={setOffset}
-                />
-              </div>
-              <DetailPanel messageId={selectedMessageId} />
+            <div className="view-tabs">
+              <button
+                className={"view-tab" + (view === "messages" ? " view-tab-active" : "")}
+                onClick={() => setView("messages")}
+              >
+                Messages
+              </button>
+              <button
+                className={"view-tab" + (view === "security" ? " view-tab-active" : "")}
+                onClick={() => setView("security")}
+              >
+                Security
+                {securityCounts && securityCounts.blocked > 0 && (
+                  <span className="view-tab-alert" title="blocked events present" />
+                )}
+              </button>
             </div>
+            {view === "messages" ? (
+              <>
+                <Toolbar
+                  direction={direction}
+                  onDirectionChange={setDirection}
+                  method={method}
+                  onMethodChange={setMethod}
+                  query={query}
+                  onQueryChange={setQuery}
+                  autoRefresh={autoRefresh}
+                  onAutoRefreshChange={setAutoRefresh}
+                />
+                {messagesError && <div className="banner banner-error">Failed to load messages: {messagesError}</div>}
+                <div className="content-split">
+                  <div className="table-pane">
+                    <MessageTable
+                      messages={messagesResp?.messages ?? []}
+                      selectedId={selectedMessageId}
+                      onSelect={setSelectedMessageId}
+                    />
+                    <Pagination
+                      offset={offset}
+                      limit={PAGE_SIZE}
+                      total={messagesResp?.total ?? 0}
+                      onOffsetChange={setOffset}
+                    />
+                  </div>
+                  <DetailPanel messageId={selectedMessageId} />
+                </div>
+              </>
+            ) : (
+              <>
+                {securityError && (
+                  <div className="banner banner-error">Failed to load security events: {securityError}</div>
+                )}
+                <SecurityView
+                  counts={securityCounts}
+                  events={securityResp?.events ?? []}
+                  total={securityResp?.total ?? 0}
+                  offset={securityOffset}
+                  limit={PAGE_SIZE}
+                  onOffsetChange={setSecurityOffset}
+                />
+              </>
+            )}
           </>
         )}
       </main>
