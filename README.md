@@ -1,4 +1,4 @@
-# mcp-lens
+# mcpglass
 
 **Wireshark + firewall for MCP traffic.** A transparent proxy — a single Rust binary — that sits
 between any AI client (Claude Code, Claude Desktop, Cursor, ...) and your MCP servers, giving you

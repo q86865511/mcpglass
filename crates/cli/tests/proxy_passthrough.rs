@@ -1,4 +1,4 @@
-//! End-to-end check of the transparent proxy: bytes through `mcp-lens wrap` must
+//! End-to-end check of the transparent proxy: bytes through `mcpglass wrap` must
 //! be identical to talking to the server directly, and the tap must land in
 //! SQLite with the right direction and method.
 
@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-const MCP_LENS: &str = env!("CARGO_BIN_EXE_mcp-lens");
+const MCPGLASS: &str = env!("CARGO_BIN_EXE_mcpglass");
 const ECHO_MCP: &str = env!("CARGO_BIN_EXE_echo-mcp");
 
 const REQUEST: &str = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n";
@@ -48,12 +48,12 @@ fn passthrough_is_byte_identical_and_recorded() {
     assert_eq!(direct_code, 0, "direct echo should exit 0");
 
     // Through the proxy, writing the tap to a temp db.
-    let tmp = std::env::temp_dir().join(format!("mcp-lens-it-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("mcpglass-it-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let db: PathBuf = tmp.join("sessions.db");
-    let log: PathBuf = tmp.join("mcp-lens.log");
+    let log: PathBuf = tmp.join("mcpglass.log");
 
-    let mut proxied = Command::new(MCP_LENS);
+    let mut proxied = Command::new(MCPGLASS);
     proxied.args([
         "wrap",
         "--db",

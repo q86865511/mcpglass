@@ -1,4 +1,4 @@
-//! `mcp-lens` — a transparent MCP stdio proxy.
+//! `mcpglass` — a transparent MCP stdio proxy.
 //!
 //! It spawns an MCP server as a child, wires our stdio to the child's stdio
 //! byte-for-byte, and taps each direction into SQLite out of band. The tap is
@@ -27,7 +27,7 @@ const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
 const READ_BUF_BYTES: usize = 64 * 1024;
 
 #[derive(Parser)]
-#[command(name = "mcp-lens", about = "Transparent proxy for MCP stdio traffic")]
+#[command(name = "mcpglass", about = "Transparent proxy for MCP stdio traffic")]
 struct Cli {
     #[command(subcommand)]
     command: SubCmd,
@@ -35,12 +35,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum SubCmd {
-    /// Wrap an MCP server: `mcp-lens wrap [--db P] [--log P] -- <cmd> [args...]`.
+    /// Wrap an MCP server: `mcpglass wrap [--db P] [--log P] -- <cmd> [args...]`.
     Wrap {
-        /// SQLite session file. Defaults to <data_local>/mcp-lens/sessions.db.
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
         #[arg(long)]
         db: Option<PathBuf>,
-        /// Proxy diagnostics log. Defaults to <data_local>/mcp-lens/mcp-lens.log.
+        /// Proxy diagnostics log. Defaults to <data_local>/mcpglass/mcpglass.log.
         /// Never written to stdout/stderr — those are the protocol channels.
         #[arg(long)]
         log: Option<PathBuf>,
@@ -73,10 +73,10 @@ async fn run_wrap(db: Option<PathBuf>, log: Option<PathBuf>, command: Vec<String
     let args: Vec<String> = command[1..].to_vec();
 
     let data_dir = default_data_dir();
-    let log_path = log.or_else(|| data_dir.as_ref().map(|d| d.join("mcp-lens.log")));
+    let log_path = log.or_else(|| data_dir.as_ref().map(|d| d.join("mcpglass.log")));
     let db_path = db
         .or_else(|| data_dir.as_ref().map(|d| d.join("sessions.db")))
-        .unwrap_or_else(|| std::env::temp_dir().join("mcp-lens").join("sessions.db"));
+        .unwrap_or_else(|| std::env::temp_dir().join("mcpglass").join("sessions.db"));
 
     let logger = Logger::open(log_path.as_deref());
     logger.info(format!("wrap start: program={program} args={args:?} db={db_path:?}"));
@@ -265,7 +265,7 @@ async fn spawn_child(program: &str, args: &[String], logger: &Logger) -> anyhow:
 }
 
 fn default_data_dir() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|b| b.data_local_dir().join("mcp-lens"))
+    directories::BaseDirs::new().map(|b| b.data_local_dir().join("mcpglass"))
 }
 
 fn now_ms() -> i64 {

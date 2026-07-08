@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "mcp-lens"
+name = "mcpglass"
 path = "src/main.rs"
 
 # Test fixture: a minimal newline-echo "MCP server" used by the integration

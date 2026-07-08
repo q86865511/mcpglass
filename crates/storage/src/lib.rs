@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn open_and_insert_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("mcp-lens-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mcpglass-test-{}", std::process::id()));
         let db = dir.join("sessions.db");
         let store = Store::open(&db).unwrap();
         store

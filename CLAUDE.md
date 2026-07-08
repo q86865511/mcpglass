@@ -1,4 +1,4 @@
-# mcp-lens — 專案層 CLAUDE.md
+# mcpglass — 專案層 CLAUDE.md
 
 MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 AI client 與 MCP server 之間，
 提供除錯、觀測、稽核與安全防護，資料全留本機。open-core，客群為全球開發者。
