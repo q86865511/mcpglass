@@ -53,7 +53,33 @@ version as best-effort until someone runs it on a POSIX box.
 
 ## 2. Recording a GIF
 
-### Tool options (Windows)
+### Fully automated (how the README GIF is made)
+
+`scripts/record-gif/` regenerates `docs/assets/dashboard-demo.gif` with no manual capture at all —
+headless Edge is driven over the Chrome DevTools Protocol, one PNG per scene, then the frames are
+encoded and patched into a looping GIF:
+
+```powershell
+# 0. Populate the demo database and start the dashboard on it
+powershell -File scripts\demo.ps1
+Start-Process target\debug\mcpglass.exe -ArgumentList 'dashboard','--db',"$env:TEMP\mcpglass-demo\sessions.db",'--port','7411','--no-open'
+
+# 1. Start headless Edge with a CDP port
+& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --headless=new --disable-gpu `
+    --remote-debugging-port=9333 --user-data-dir="$env:TEMP\edge-cdp-profile" about:blank
+
+# 2. Capture one 1440x900 PNG per scene (overview → message detail → Security → Context → Inject → clean session)
+node scripts\record-gif\cdp-capture.mjs 9333 "http://127.0.0.1:7411/" "$env:TEMP\gif-frames"
+
+# 3. Encode + patch into a looping GIF (WPF GifBitmapEncoder emits no loop/delay blocks; patch-gif.mjs adds them)
+powershell -File scripts\record-gif\encode-gif.ps1 -FrameDir "$env:TEMP\gif-frames" -OutFile docs\assets\dashboard-demo.gif -DelayCs 160
+```
+
+Caveats: the click coordinates in `cdp-capture.mjs` assume the 1440×900 viewport it sets and the
+demo database's two sessions — re-check them after dashboard layout changes. `encode-gif.ps1` is
+Windows-only (WPF); on other platforms use ffmpeg's palettegen instead.
+
+### Manual capture — tool options (Windows)
 
 1. **[ScreenToGif](https://www.screentogif.com/)** (recommended) — free, open-source, records
    directly to an editable frame timeline and exports GIF natively; no separate conversion step.

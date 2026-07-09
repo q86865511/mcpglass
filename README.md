@@ -4,7 +4,7 @@
 > between any AI client (Claude Code, Claude Desktop, Cursor, ...) and your MCP servers.
 > Debugging, observability, auditing, and security. All data stays on your machine.
 
-<p align="center"><img src="docs/assets/dashboard-overview.png" alt="The mcpglass dashboard — session timeline with per-message detail, Security / Context / Inject tabs" width="100%"></p>
+<p align="center"><img src="docs/assets/dashboard-demo.gif" alt="The mcpglass dashboard — session timeline, per-message detail, Security / Context / Inject tabs" width="100%"></p>
 
 [![CI](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml/badge.svg)](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.80%2B-dea584?logo=rust&logoColor=white)](Cargo.toml)
