@@ -73,52 +73,29 @@ async fn spawn_gateway(tag: &str, policy_toml: &str, upstreams: &[(&str, String)
     let log = dir.0.join("mcpglass.log");
     let policy = dir.0.join("policy.toml");
     std::fs::write(&policy, policy_toml).unwrap();
-    // free_port() releases its socket before the gateway re-binds the number, so a
-    // concurrently starting test can be handed the same ephemeral port (Linux reuses
-    // them eagerly). The loser exits at bind time while a bare TCP probe happily
-    // connects to the *other* test's gateway — so retry on a fresh port whenever our
-    // child died, and only accept a port once our child is both alive and accepting.
-    let mut launched = None;
-    for _ in 0..5 {
-        let port = free_port();
-        let mut cmd = Command::new(MCPGLASS);
-        cmd.args([
-            "gateway",
-            "--port",
-            &port.to_string(),
-            "--db",
-            db.to_str().unwrap(),
-            "--log",
-            log.to_str().unwrap(),
-            "--policy",
-            policy.to_str().unwrap(),
-        ]);
-        for (name, url) in upstreams {
-            cmd.arg("--upstream").arg(format!("{name}={url}"));
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        let mut child = cmd.spawn().expect("spawn gateway");
-
-        // Wait for the listener to come up (or the child to lose the bind race).
-        let mut up = false;
-        for _ in 0..100 {
-            if child.try_wait().expect("poll gateway child").is_some() {
-                break;
-            }
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-                up = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-        }
-        if up && child.try_wait().expect("poll gateway child").is_none() {
-            launched = Some((child, port));
-            break;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+    // `--port 0` lets the OS pick the port, so concurrent tests can never race
+    // each other for a number pre-picked by a bind-and-release probe. The gateway
+    // prints its banner only after the listener is really bound (`on_ready` gets
+    // the actual local_addr), so parsing the port out of it doubles as the
+    // readiness wait.
+    let mut cmd = Command::new(MCPGLASS);
+    cmd.args([
+        "gateway",
+        "--port",
+        "0",
+        "--db",
+        db.to_str().unwrap(),
+        "--log",
+        log.to_str().unwrap(),
+        "--policy",
+        policy.to_str().unwrap(),
+    ]);
+    for (name, url) in upstreams {
+        cmd.arg("--upstream").arg(format!("{name}={url}"));
     }
-    let (child, port) = launched.expect("gateway did not come up after 5 port attempts");
+    cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn gateway");
+    let port = read_banner_port(&mut child);
 
     Gateway {
         child,
@@ -126,6 +103,23 @@ async fn spawn_gateway(tag: &str, policy_toml: &str, upstreams: &[(&str, String)
         db,
         _dir: dir,
     }
+}
+
+/// Block until the gateway's "Gateway listening on http://127.0.0.1:<port> ..."
+/// banner arrives on the child's piped stdout and return the OS-assigned port.
+fn read_banner_port(child: &mut std::process::Child) -> u16 {
+    use std::io::BufRead;
+    let mut banner = String::new();
+    let out = child.stdout.as_mut().expect("gateway stdout piped");
+    std::io::BufReader::new(out)
+        .read_line(&mut banner)
+        .expect("read gateway banner");
+    banner
+        .split("127.0.0.1:")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|p| p.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected gateway banner: {banner:?}"))
 }
 
 /// Poll `f` until it returns `Some` or the budget runs out.
