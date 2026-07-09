@@ -1,9 +1,15 @@
 [package]
 name = "proxy-core"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "JSON-RPC parsing, framing, SSE splitting, and MCP protocol version constants for the mcpglass proxy."
 
 [dependencies]
 serde_json.workspace = true

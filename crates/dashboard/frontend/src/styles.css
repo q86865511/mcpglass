@@ -346,6 +346,97 @@ body {
   color: var(--red);
 }
 
+/* ---- Inject view ---- */
+
+.inject-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  overflow-y: auto;
+}
+
+.inject-badges {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.count-badge-delay {
+  border-color: var(--yellow);
+  color: var(--yellow);
+}
+
+.count-badge-error {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.count-badge-drop {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+
+.count-badge-truncate {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.inject-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.inject-table th {
+  text-align: left;
+  padding: 6px 10px;
+  color: var(--text-dim);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+}
+
+.inject-row td {
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.inject-detail {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  word-break: break-all;
+}
+
+.badge-fault-delay {
+  background: rgba(227, 179, 65, 0.15);
+  color: var(--yellow);
+}
+
+.badge-fault-error {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--red);
+}
+
+.badge-fault-drop {
+  background: rgba(210, 153, 34, 0.15);
+  color: var(--orange);
+}
+
+.badge-fault-truncate {
+  background: rgba(79, 163, 255, 0.15);
+  color: var(--accent);
+}
+
 /* ---- Toolbar ---- */
 
 .toolbar {

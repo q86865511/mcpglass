@@ -59,7 +59,7 @@ pub enum InjectDirection {
 /// The fault a matched rule injects. Internally tagged on `type` so the TOML reads
 /// `fault = { type = "delay", delay_ms = 200 }`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Fault {
     /// Sleep `delay_ms` before forwarding the frame unchanged.
     Delay { delay_ms: u64 },
@@ -367,6 +367,33 @@ mod tests {
             direction = "c2s"
             probabilty = 0.5
             fault = { type = "drop" }
+        "#;
+        assert!(InjectConfig::from_toml_str(src).is_err());
+    }
+
+    #[test]
+    fn fault_unknown_field_is_rejected() {
+        // Typo inside the fault object itself: `deny_unknown_fields` on the
+        // internally-tagged `Fault` enum catches per-variant typos the same way the
+        // top-level and rule-level checks do.
+        let src = r#"
+            [[rules]]
+            direction = "c2s"
+            fault = { type = "delay", delay_ms = 100, typo_field = 1 }
+        "#;
+        let err = InjectConfig::from_toml_str(src).unwrap_err();
+        assert!(
+            err.to_string().contains("parsing inject TOML")
+                || format!("{err:#}").contains("typo_field"),
+            "error should surface the bad fault config: {err:#}"
+        );
+
+        // A field that belongs to a *different* fault variant is still unknown once
+        // `type` has picked a variant (e.g. `bytes` is valid for `truncate`, not `delay`).
+        let src = r#"
+            [[rules]]
+            direction = "c2s"
+            fault = { type = "delay", delay_ms = 100, bytes = 8 }
         "#;
         assert!(InjectConfig::from_toml_str(src).is_err());
     }

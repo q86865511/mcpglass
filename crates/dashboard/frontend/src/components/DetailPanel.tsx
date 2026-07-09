@@ -99,7 +99,9 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
         <dt>direction</dt>
         <dd className="mono">{detail.direction}</dd>
         <dt>method</dt>
-        <dd className="mono">{detail.method ?? "(notification)"}</dd>
+        <dd className="mono">
+          {detail.method ?? (detail.rpc_id != null ? "(response)" : "(notification)")}
+        </dd>
         <dt>rpc_id</dt>
         <dd className="mono">{detail.rpc_id ?? "—"}</dd>
         <dt>size</dt>

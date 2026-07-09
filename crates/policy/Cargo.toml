@@ -1,9 +1,15 @@
 [package]
 name = "policy"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Pure decision logic for mcpglass request/response policy, fingerprinting, secret detection, and injection rules."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -1,9 +1,16 @@
 # PROGRESS — mcpglass
 
 ## 目前狀態
-Phase 3 完成：下半三功能（context bloat 分析、請求 replay、錯誤注入）皆過雙重審查＋五項修正＋復審,202 Rust 測試＋前端 build 全綠。Phase 3 全部收官,下一步 Phase 4（發佈）。
+Phase 4 發佈準備完成：0.1.0 metadata＋CI＋英文 docs＋demo 素材＋發文草稿＋三項 hardening,雙重審查 10 條全修,207 Rust 測試＋前端 build 全綠。剩人工步驟：push、開 public、發文（草稿在 docs/launch/）。
 
 ## 已完成
+- [2026-07-09] 📦 R7 Phase 4 發佈準備（/pipeline 兩波六任務＋雙重審查＋十項修正）：
+  - **發佈基礎**：全 crate 升 0.1.0（workspace 繼承 metadata,各 crate 英文 description）；GitHub Actions CI（ubuntu＋windows 矩陣,pnpm build 先於 cargo build/test/clippy）；README 徽章/Install/Quickstart/截圖；docs/（cli.md、configuration.md、security-model.md,旗標與欄位逐一對過 clap/serde 定義）；CHANGELOG（0.1.0）/CONTRIBUTING/SECURITY.md。
+  - **hardening**：attach/detach 顯式單一目標遇損毀 JSON 回 exit 1（all 模式跳過仍 0）；inject fault 未知欄位啟動期拒絕（deny_unknown_fields 實測與 internally-tagged enum 相容）；inject_events 儀表板（storage 分頁查詢＋counts、`GET /api/sessions/{id}/inject[/counts]` 掛 loopback middleware 內、前端 Inject tab＋徽章＋dev-mock）。
+  - **demo 素材**：scripts/demo.ps1（實測,兩輪流量:乾淨＋注入,25 訊息＋2 注入事件入庫）＋demo.sh（未實測,已標注）＋demo-assets（自製 MCP client、inject.toml）；docs/demo.md（GIF 工具鏈＋七幕劇本）；docs/assets/dashboard-overview.png（headless Edge 實截）。
+  - **發文草稿**：docs/launch/ Show HN＋r/mcp（各 3 候選標題,DRAFT 標注,平台支援度留一處待補實）。
+  - **審查與修正**：reviewer（Opus）4 條＋Codex 7 條＋主對話截圖自查 1 條,合併 10 條經使用者裁決全修——含 README/草稿「masked in storage」誤述（實為僅稽核視圖遮罩）、allow 清單被誤寫成支援萬用（實為精確比對）、detach 誤寫 from backup、前端把 JSON-RPC 回應標成 (notification)（發佈截圖可見,修為 (response)）、demo client 500ms 就 kill 改為等正常退出＋5s 保底等。
+  - **驗證**：207 Rust 測試全綠、clippy 零警告、前端 build 綠、demo 修後重跑成功、修後截圖重擷確認 (response) 標籤。
 - [2026-07-09] 🔬 R6 Phase 3 下半（/pipeline：storage 地基→A/B/C 三線序列派工→雙重審查→五項修正→復審）：
   - **context bloat 分析**：proxy-core `bloat.rs` 啟發式估算（`chars/4`,一律標 approximate,`estimate_tokens`/`analyze_tools_list_response→BloatReport`,fat tool 門檻 description>100 token）；資料源為 session 最新 tools/list 回應（storage `latest_tools_list_raw`,rpc_id 配對）。CLI `mcpglass bloat [--session --top]` 文字報告；dashboard `GET /api/sessions/{id}/context`＋前端 Context tab（總估算、Top-N 佔比 bar、裁剪建議）。
   - **請求 replay**：CLI `mcpglass replay <message-id>`＋dashboard DetailPanel Replay 按鈕（確認框、`POST /api/messages/{id}/replay`,ReplayFn 注入使 dashboard 不依賴 cli）。stdio session 重 spawn server 走 initialize/initialized 握手後重送；HTTP session 重新 initialize 取新 Mcp-Session-Id 後重送。**完全不落庫**（帶外探針,唯讀開庫、不跨 await 持有）；僅允許 c2s request（守門拒 notification/response/s2c）。
@@ -38,8 +45,8 @@ Phase 3 完成：下半三功能（context bloat 分析、請求 replay、錯誤
 （無）
 
 ## 待辦
-- 審查遺留（低優先）：顯式單一目標的 attach/detach 遇 `Unreadable`（損毀 JSON）仍 exit 0，可評估納入非零 exit（`all` 模式的跳過屬預期，需區分 explicit）；指紋 v3 候選納入 `outputSchema`；真實 streamable HTTP server 的手動 smoke（gateway 端到端已有整合測試，真實 client 對接未跑）；inject_events 的儀表板顯示（目前只落庫＋log,無前端 tab）。
-- Phase 4（發佈）：英文 docs＋demo GIF、GitHub 開源、Show HN / r/mcp 發文、收進 terrychou.com 作品集。
+- 審查遺留（低優先）：指紋 v3 候選納入 `outputSchema`；真實 streamable HTTP server 的手動 smoke（gateway 端到端已有整合測試，真實 client 對接未跑）；帶外工具的 Store::open 改真正 read-only 開庫（現況：不記錄流量但對舊版 DB 會做 additive schema 升級，docs/cli.md 已如實揭露）。
+- Phase 4 收尾（人工步驟）：demo GIF 錄製（工具鏈與劇本見 docs/demo.md）、`git push`＋repo 開 public、Show HN / r/mcp 發文（草稿 docs/launch/，發文前補實平台支援度佔位）、收進 terrychou.com 作品集。
 
 ## 已知問題
 - 本機 SQLite 會存**原始流量全文**（含任何流經的密鑰）——這是「流量 Wireshark」的核心設計，資料不出本機；secret 過濾只在 `security_events.detail` 遮罩並告警/阻擋外流。已在 README 明示。
@@ -49,7 +56,6 @@ Phase 3 完成：下半三功能（context bloat 分析、請求 replay、錯誤
 - gateway 對 >64MB 的 monitor 模式請求 body 採緩衝轉發（上限 256MB，超限 413）而非零拷貝串流；正常 MCP 訊息（<64MB）不受影響。
 - gateway 要求請求帶 loopback Host（防 DNS rebinding）；HTTP/1.0 或 h2c 等不帶 Host 的 client 會被 403——MCP client 實務皆走 HTTP/1.1（hyper 對無 Host 的 1.1 請求本就 400），影響面可忽略。
 - 指紋 v1→v2 改釘在「legacy v1 列時間戳晚於既有 v2 同值列」的理論情境下可撞 UNIQUE——單調時鐘下幾乎不可達，fail-open 僅 log 丟該次 outcome。
-- 錯誤注入的 `fault` 是 serde internally-tagged enum,fault 物件內的未知/拼錯 key 不被拒絕而靜默忽略（頂層與 rule 層有 deny_unknown_fields,唯 fault 內無）；必填欄位仍驗證,屬本機 trusted config 風險,列後續強化。
 - gateway c2s 注入路徑在 wire 動作**之前**先 tap 原始請求（為保 c2s<s2c 指紋配對順序,異於 handle_post 於 send_upstream 後才記錄）；delay 期間程序被殺則 DB 顯示發生過但上游未收——try_send 非阻塞不延遲 wire,屬一致性存疑非危害。
 - gateway 對「無 id 通知」注入 error 會合成 id:null 的 200 錯誤,stdio 對應路徑則不送任何東西——兩 transport 對通知注入 error 的行為不對稱。
 - stdio replay 以引號感知切分還原 `argv.join(" ")` 存下的 command,含嵌入引號/shell 元字元的 command 仍可能失真；根治需 storage 改存 argv 陣列（未來工作）。stdio replay 會重新啟動 server 程序、重送請求可能有副作用（前端確認框與 CLI 說明已標示）。gateway s2c error 注入與 replay 均不注入/處理 SSE 串流（v1 限制）。

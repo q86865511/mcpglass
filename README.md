@@ -1,10 +1,61 @@
 # mcpglass
 
+[![CI](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml/badge.svg)](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+
 **Wireshark + firewall for MCP traffic.** A transparent proxy — a single Rust binary — that sits
 between any AI client (Claude Code, Claude Desktop, Cursor, ...) and your MCP servers, giving you
 debugging, observability, auditing, and security. All data stays on your machine.
 
-> Status: early development (Phase 3 complete — stdio + HTTP interception, config takeover, dashboard, security layer, context analytics, replay, fault injection).
+> Status: early development (v0.1.0 — stdio + HTTP interception, config takeover, dashboard, security layer, context analytics, replay, fault injection).
+
+![The mcpglass dashboard](docs/assets/dashboard-overview.png)
+
+## Install
+
+There is no prebuilt binary yet — install from source. You need a [Rust
+toolchain](https://rustup.rs/) (1.80+) and [pnpm](https://pnpm.io/) (for the dashboard frontend,
+which is embedded into the binary at build time):
+
+```sh
+git clone https://github.com/q86865511/mcpglass
+cd mcpglass
+
+# 1. Build the dashboard frontend first — cargo embeds its output.
+#    Skip this and you get a placeholder dashboard page.
+cd crates/dashboard/frontend && pnpm install && pnpm build && cd ../../..
+
+# 2a. Build the binary into ./target/release/mcpglass
+cargo build --release --workspace
+
+# 2b. ...or install it onto your PATH
+cargo install --path crates/cli
+```
+
+## Quickstart
+
+Point your client's existing stdio MCP servers through the proxy, use the client normally, then
+inspect the traffic:
+
+```sh
+# 1. Rewrite the client config so its servers run through mcpglass (a backup is
+#    written first; `mcpglass detach` restores it). Use --dry-run to preview.
+mcpglass attach claude-code
+
+# 2. Use Claude Code as usual — every request/response is now recorded locally.
+
+# 3. Open the dashboard timeline at http://127.0.0.1:7411
+mcpglass dashboard
+```
+
+For url-type (Streamable HTTP) MCP servers, also run the long-lived gateway that `attach` repoints
+them at: `mcpglass gateway` (see [docs/cli.md](docs/cli.md)).
+
+## Documentation
+
+- [docs/cli.md](docs/cli.md) — every subcommand, its flags, and examples.
+- [docs/configuration.md](docs/configuration.md) — policy and fault-injection TOML reference.
+- [docs/security-model.md](docs/security-model.md) — the fail-open design, monitor/enforce, and threat model.
 
 ## Why
 
@@ -21,7 +72,7 @@ debugging, observability, auditing, and security. All data stays on your machine
 - **Local dashboard** — `mcpglass dashboard` opens a timeline of every request/response/notification: per-session view, filters, payload inspector, per-method latency, and a Security tab.
 - **Security layer** — `mcpglass wrap --policy <file>` enforces a TOML policy:
   - **Tool integrity pinning** — fingerprints each server's tool definitions and flags a change across runs (rug-pull detection).
-  - **Secret-leak filtering** — scans outgoing `tools/call` arguments for API keys/tokens (AWS, GitHub, OpenAI, Anthropic, ...) and flags them (masked in storage).
+  - **Secret-leak filtering** — scans outgoing `tools/call` arguments for API keys/tokens (AWS, GitHub, OpenAI, Anthropic, ...) and flags them (values are masked in the audit view; the raw traffic log still stores payloads verbatim).
   - **Per-tool allow/deny** — allow-lists or deny-lists tools by name.
   - **Append-only audit log** — every decision is recorded, visible in the dashboard's Security tab.
 
@@ -37,16 +88,10 @@ debugging, observability, auditing, and security. All data stays on your machine
 > that flows through it. This is by design (it is a traffic recorder) and the data never leaves
 > your machine; secret filtering masks values only in the security audit view.
 
-## Build
+## Contributing
 
-The dashboard frontend must be built before the Rust workspace embeds it
-(without it you get a placeholder page):
-
-```sh
-cd crates/dashboard/frontend && pnpm install && pnpm build && cd ../../..
-cargo build --workspace
-cargo test --workspace
-```
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the build/test/lint workflow and PR conventions, and
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities.
 
 ## License
 

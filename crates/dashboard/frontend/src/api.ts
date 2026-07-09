@@ -87,6 +87,33 @@ export interface SecurityCounts {
   blocked: number;
 }
 
+export type InjectFault = "delay" | "error" | "drop" | "truncate";
+
+export interface InjectEvent {
+  id: number;
+  ts_ms: number;
+  direction: Direction;
+  rule: string;
+  fault: InjectFault;
+  // Human-readable detail of the fault applied (e.g. delay duration, injected
+  // error payload).
+  detail: string;
+  method: string | null;
+  rpc_id: string | null;
+}
+
+export interface InjectEventsResponse {
+  total: number;
+  events: InjectEvent[];
+}
+
+export interface InjectCounts {
+  delay: number;
+  error: number;
+  drop: number;
+  truncate: number;
+}
+
 export interface HealthResponse {
   version: string;
 }
@@ -204,4 +231,25 @@ export interface ContextReport {
 
 export function fetchContext(sessionId: number): Promise<ContextReport> {
   return getJson<ContextReport>(`/api/sessions/${sessionId}/context`);
+}
+
+export interface InjectEventsFilters {
+  limit: number;
+  offset: number;
+}
+
+export function fetchInjectEvents(
+  sessionId: number,
+  filters: InjectEventsFilters,
+): Promise<InjectEventsResponse> {
+  const params = new URLSearchParams();
+  params.set("limit", String(filters.limit));
+  params.set("offset", String(filters.offset));
+  return getJson<InjectEventsResponse>(
+    `/api/sessions/${sessionId}/inject?${params.toString()}`,
+  );
+}
+
+export function fetchInjectCounts(sessionId: number): Promise<InjectCounts> {
+  return getJson<InjectCounts>(`/api/sessions/${sessionId}/inject/counts`);
 }

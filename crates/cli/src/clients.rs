@@ -141,18 +141,28 @@ fn run(op: Op, target: &str, project: Option<PathBuf>, dry_run: bool, gateway_po
     }
 
     print_report(op, &reports, dry_run);
-    exit_code(&reports)
+    exit_code(&reports, explicit)
 }
 
 /// A write failure must surface in the exit code: the gateway table was already
 /// saved by then, so a client file left unwritten is an inconsistent state the
 /// caller (or a script) has to notice and retry — a printed report alone is
 /// invisible to automation.
-fn exit_code(reports: &[FileReport]) -> i32 {
+///
+/// An unreadable (corrupt) config file is treated the same way, but only when the
+/// caller named that client explicitly: `all` silently skipping a client that
+/// happens to have a damaged config is expected (mirrors the "not installed"
+/// skip), but `mcpglass attach cursor` against a corrupt `mcp.json` did nothing
+/// useful and a script driving it needs to see that in the exit code.
+fn exit_code(reports: &[FileReport], explicit: bool) -> i32 {
     let any_write_failed = reports
         .iter()
         .any(|r| matches!(r.status, FileStatus::WriteError(_)));
-    if any_write_failed {
+    let any_explicit_unreadable = explicit
+        && reports
+            .iter()
+            .any(|r| matches!(r.status, FileStatus::Unreadable(_)));
+    if any_write_failed || any_explicit_unreadable {
         1
     } else {
         0
@@ -781,13 +791,35 @@ mod tests {
             path: PathBuf::from("b.json"),
             status: FileStatus::WriteError("disk full".into()),
         };
-        assert_eq!(exit_code(&[ok]), 0);
-        let ok = FileReport {
-            client: Client::ClaudeCode,
-            path: PathBuf::from("a.json"),
-            status: FileStatus::NoServers,
+        assert_eq!(exit_code(&[ok], false), 0);
+        // A write failure is fatal regardless of `explicit`.
+        let failed = [failed];
+        assert_eq!(exit_code(&failed, true), 1);
+        assert_eq!(exit_code(&failed, false), 1);
+    }
+
+    #[test]
+    fn explicit_unreadable_target_yields_nonzero_exit_code() {
+        let unreadable = FileReport {
+            client: Client::Cursor,
+            path: PathBuf::from("mcp.json"),
+            status: FileStatus::Unreadable("invalid JSON: ...".into()),
         };
-        assert_eq!(exit_code(&[ok, failed]), 1);
+        // `mcpglass attach cursor` against a corrupt file: the user named this
+        // client explicitly, so a script driving it must see a nonzero exit.
+        assert_eq!(exit_code(&[unreadable], true), 1);
+    }
+
+    #[test]
+    fn all_mode_unreadable_target_stays_exit_zero() {
+        let unreadable = FileReport {
+            client: Client::Cursor,
+            path: PathBuf::from("mcp.json"),
+            status: FileStatus::Unreadable("invalid JSON: ...".into()),
+        };
+        // `mcpglass attach all` skipping a client with a damaged config is
+        // expected, same as skipping one that isn't installed at all.
+        assert_eq!(exit_code(&[unreadable], false), 0);
     }
 
     fn stdio_doc() -> Value {

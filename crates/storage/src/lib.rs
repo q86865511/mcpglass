@@ -294,6 +294,14 @@ pub struct InjectEventRow {
     pub rpc_id: Option<String>,
 }
 
+/// Per-fault-kind tallies for a session, for the dashboard's inject alert badge.
+pub struct InjectCounts {
+    pub delay: u64,
+    pub error: u64,
+    pub drop: u64,
+    pub truncate: u64,
+}
+
 /// Classification returned by [`Store::record_fingerprint`]: whether an observed
 /// tool fingerprint is new, already seen, or a change from a prior fingerprint.
 ///
@@ -1038,14 +1046,20 @@ impl Store {
         Ok(())
     }
 
-    /// A paged window of a session's fault-injection events, oldest-first
-    /// (`id ASC`), for the dashboard.
+    /// A paged window of a session's fault-injection events plus the total match
+    /// count (ignoring the window), for the dashboard. Rows come back oldest-first
+    /// (`id ASC`) — mirrors [`Store::security_events`].
     pub fn inject_events(
         &self,
         session_id: i64,
         limit: u32,
         offset: u32,
-    ) -> Result<Vec<InjectEventRow>> {
+    ) -> Result<(u64, Vec<InjectEventRow>)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM inject_events WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )?;
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, ts_ms, direction, rule, fault, detail, method, rpc_id
              FROM inject_events
@@ -1059,7 +1073,30 @@ impl Store {
                 map_inject_event_row,
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        Ok((total as u64, rows))
+    }
+
+    /// Per-fault-kind counts for a session, for the dashboard's inject alert badge.
+    /// Mirrors [`Store::security_event_counts`].
+    pub fn inject_event_counts(&self, session_id: i64) -> Result<InjectCounts> {
+        let counts = self.conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN fault = 'delay' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN fault = 'error' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN fault = 'drop' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN fault = 'truncate' THEN 1 ELSE 0 END), 0)
+             FROM inject_events WHERE session_id = ?1",
+            params![session_id],
+            |r| {
+                Ok(InjectCounts {
+                    delay: r.get::<_, i64>(0)? as u64,
+                    error: r.get::<_, i64>(1)? as u64,
+                    drop: r.get::<_, i64>(2)? as u64,
+                    truncate: r.get::<_, i64>(3)? as u64,
+                })
+            },
+        )?;
+        Ok(counts)
     }
 }
 
@@ -2237,7 +2274,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let rows = store.inject_events(1, 50, 0).unwrap();
+        let (total, rows) = store.inject_events(1, 50, 0).unwrap();
+        assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
 
         // Re-opening the upgraded file is a no-op and still v5.
@@ -2354,7 +2392,8 @@ mod tests {
                 .unwrap();
         }
 
-        let rows = store.inject_events(sid, 2, 1).unwrap();
+        let (total, rows) = store.inject_events(sid, 2, 1).unwrap();
+        assert_eq!(total, 3);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].id < rows[1].id);
         // offset 1 -> the second-oldest event.
@@ -2366,6 +2405,58 @@ mod tests {
         assert_eq!(rows[0].method.as_deref(), Some("tools/call"));
         assert_eq!(rows[0].rpc_id.as_deref(), Some("1"));
 
-        assert!(store.inject_events(999_999, 50, 0).unwrap().is_empty());
+        let (total_missing, rows_missing) = store.inject_events(999_999, 50, 0).unwrap();
+        assert_eq!(total_missing, 0);
+        assert!(rows_missing.is_empty());
+    }
+
+    #[test]
+    fn inject_events_empty_session_returns_zero() {
+        let tmp = TempDir::new("injev-empty");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        let (total, rows) = store.inject_events(sid, 50, 0).unwrap();
+        assert_eq!(total, 0);
+        assert!(rows.is_empty());
+        let counts = store.inject_event_counts(sid).unwrap();
+        assert_eq!(counts.delay, 0);
+        assert_eq!(counts.error, 0);
+        assert_eq!(counts.drop, 0);
+        assert_eq!(counts.truncate, 0);
+    }
+
+    #[test]
+    fn inject_event_counts_by_fault() {
+        let tmp = TempDir::new("injcount");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        for fault in [
+            InjectFault::Delay,
+            InjectFault::Delay,
+            InjectFault::Error,
+            InjectFault::Drop,
+            InjectFault::Truncate,
+        ] {
+            store
+                .insert_inject_event(
+                    sid,
+                    &InjectEvent {
+                        ts_ms: 0,
+                        direction: Direction::C2s,
+                        rule: "r".to_owned(),
+                        fault,
+                        detail: "d".to_owned(),
+                        method: None,
+                        rpc_id: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        let c = store.inject_event_counts(sid).unwrap();
+        assert_eq!(c.delay, 2);
+        assert_eq!(c.error, 1);
+        assert_eq!(c.drop, 1);
+        assert_eq!(c.truncate, 1);
     }
 }

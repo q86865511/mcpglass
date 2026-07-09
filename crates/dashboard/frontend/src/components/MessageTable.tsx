@@ -48,7 +48,11 @@ export function MessageTable({ messages, selectedId, onSelect }: MessageTablePro
             <td>
               <DirectionBadge msg={m} />
             </td>
-            <td className="mono">{m.method ?? <span className="dim">(notification)</span>}</td>
+            <td className="mono">
+              {m.method ?? (
+                <span className="dim">{m.rpc_id != null ? "(response)" : "(notification)"}</span>
+              )}
+            </td>
             <td className="mono">{m.rpc_id ?? <span className="dim">—</span>}</td>
             <td className="mono">{formatSize(m.size)}</td>
           </tr>

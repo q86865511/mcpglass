@@ -1,0 +1,26 @@
+# Fault-injection config for the mcpglass demo (see `mcpglass wrap --inject`).
+#
+# The demo client issues four `tools/call` requests in a row. These two rules
+# are evaluated in order for each c2s `tools/call` frame:
+#   1. The first `tools/call` gets delayed 500ms, then forwarded normally
+#      (the client still gets a real response, just late).
+#   2. The second `tools/call` gets replaced with a synthesized JSON-RPC
+#      error and is never sent to the server.
+# Both rules have `max_triggers = 1`, so once exhausted they stop matching
+# and the third/fourth `tools/call` pass through untouched — giving the
+# dashboard's Inject tab one delay event and one error event to show,
+# without breaking the rest of the scripted conversation.
+
+[[rules]]
+direction = "c2s"
+method = "tools/call"
+probability = 1.0
+max_triggers = 1
+fault = { type = "delay", delay_ms = 500 }
+
+[[rules]]
+direction = "c2s"
+method = "tools/call"
+probability = 1.0
+max_triggers = 1
+fault = { type = "error", code = -32000, message = "mcpglass demo: simulated failure" }

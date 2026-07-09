@@ -3,9 +3,15 @@ resolver = "2"
 members = ["crates/proxy-core", "crates/policy", "crates/storage", "crates/cli", "crates/dashboard"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 rust-version = "1.80"
+repository = "https://github.com/q86865511/mcpglass"
+homepage = "https://github.com/q86865511/mcpglass"
+authors = ["q86865511"]
+keywords = ["mcp", "proxy", "observability", "security", "debugging"]
+categories = ["development-tools::debugging", "command-line-utilities"]
 
 # Shared dependency versions, resolved once for the whole workspace.
 [workspace.dependencies]

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ContextReport,
   Direction,
+  InjectCounts,
+  InjectEventsResponse,
   MessagesResponse,
   SecurityCounts,
   SecurityEventsResponse,
@@ -10,6 +12,8 @@ import type {
 } from "./api";
 import {
   fetchContext,
+  fetchInjectCounts,
+  fetchInjectEvents,
   fetchMessages,
   fetchSecurityCounts,
   fetchSecurityEvents,
@@ -24,11 +28,12 @@ import { StatsBar } from "./components/StatsBar";
 import { Pagination } from "./components/Pagination";
 import { SecurityView } from "./components/SecurityView";
 import { ContextView } from "./components/ContextView";
+import { InjectView } from "./components/InjectView";
 
 const PAGE_SIZE = 100;
 const AUTO_REFRESH_MS = 2000;
 
-type View = "messages" | "security" | "context";
+type View = "messages" | "security" | "context" | "inject";
 
 export function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -57,6 +62,11 @@ export function App() {
   const [contextReport, setContextReport] = useState<ContextReport | null>(null);
   const [contextError, setContextError] = useState<string | null>(null);
 
+  const [injectOffset, setInjectOffset] = useState(0);
+  const [injectResp, setInjectResp] = useState<InjectEventsResponse | null>(null);
+  const [injectError, setInjectError] = useState<string | null>(null);
+  const [injectCounts, setInjectCounts] = useState<InjectCounts | null>(null);
+
   // Monotonic request counters so a slow, stale response (e.g. from a
   // session we've since navigated away from) can't clobber a newer one.
   const messagesSeqRef = useRef(0);
@@ -64,12 +74,15 @@ export function App() {
   const securitySeqRef = useRef(0);
   const securityCountsSeqRef = useRef(0);
   const contextSeqRef = useRef(0);
+  const injectSeqRef = useRef(0);
+  const injectCountsSeqRef = useRef(0);
 
   // Reset paging/selection when switching sessions or changing filters.
   useEffect(() => {
     setOffset(0);
     setSelectedMessageId(null);
     setSecurityOffset(0);
+    setInjectOffset(0);
   }, [selectedSessionId, direction, method, query]);
 
   const loadSessions = useCallback(() => {
@@ -184,6 +197,43 @@ export function App() {
       });
   }, [selectedSessionId]);
 
+  const loadInject = useCallback(() => {
+    if (selectedSessionId === null) {
+      injectSeqRef.current += 1;
+      setInjectResp(null);
+      return;
+    }
+    const seq = ++injectSeqRef.current;
+    fetchInjectEvents(selectedSessionId, { limit: PAGE_SIZE, offset: injectOffset })
+      .then((r) => {
+        if (injectSeqRef.current !== seq) return; // superseded by a newer request
+        setInjectResp(r);
+        setInjectError(null);
+      })
+      .catch((e: unknown) => {
+        if (injectSeqRef.current !== seq) return;
+        setInjectError(e instanceof Error ? e.message : String(e));
+      });
+  }, [selectedSessionId, injectOffset]);
+
+  const loadInjectCounts = useCallback(() => {
+    if (selectedSessionId === null) {
+      injectCountsSeqRef.current += 1;
+      setInjectCounts(null);
+      return;
+    }
+    const seq = ++injectCountsSeqRef.current;
+    fetchInjectCounts(selectedSessionId)
+      .then((r) => {
+        if (injectCountsSeqRef.current !== seq) return; // superseded by a newer request
+        setInjectCounts(r);
+      })
+      .catch(() => {
+        if (injectCountsSeqRef.current !== seq) return;
+        setInjectCounts(null);
+      });
+  }, [selectedSessionId]);
+
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
@@ -208,6 +258,14 @@ export function App() {
     loadContext();
   }, [loadContext]);
 
+  useEffect(() => {
+    loadInject();
+  }, [loadInject]);
+
+  useEffect(() => {
+    loadInjectCounts();
+  }, [loadInjectCounts]);
+
   const autoRefreshRef = useRef({
     loadSessions,
     loadMessages,
@@ -215,6 +273,8 @@ export function App() {
     loadSecurity,
     loadSecurityCounts,
     loadContext,
+    loadInject,
+    loadInjectCounts,
   });
   autoRefreshRef.current = {
     loadSessions,
@@ -223,6 +283,8 @@ export function App() {
     loadSecurity,
     loadSecurityCounts,
     loadContext,
+    loadInject,
+    loadInjectCounts,
   };
   const viewRef = useRef(view);
   viewRef.current = view;
@@ -233,14 +295,18 @@ export function App() {
       autoRefreshRef.current.loadSessions();
       autoRefreshRef.current.loadMessages();
       autoRefreshRef.current.loadStats();
-      // Security events/counts and the context report are only polled while
-      // their own view is visible.
+      // Security events/counts, the context report and inject events are only
+      // polled while their own view is visible.
       if (viewRef.current === "security") {
         autoRefreshRef.current.loadSecurity();
         autoRefreshRef.current.loadSecurityCounts();
       }
       if (viewRef.current === "context") {
         autoRefreshRef.current.loadContext();
+      }
+      if (viewRef.current === "inject") {
+        autoRefreshRef.current.loadInject();
+        autoRefreshRef.current.loadInjectCounts();
       }
     }, AUTO_REFRESH_MS);
     return () => clearInterval(id);
@@ -288,6 +354,16 @@ export function App() {
               >
                 Context
               </button>
+              <button
+                className={"view-tab" + (view === "inject" ? " view-tab-active" : "")}
+                onClick={() => setView("inject")}
+              >
+                Inject
+                {injectCounts &&
+                  injectCounts.delay + injectCounts.error + injectCounts.drop + injectCounts.truncate > 0 && (
+                    <span className="view-tab-alert" title="fault-injection events present" />
+                  )}
+              </button>
             </div>
             {view === "messages" ? (
               <>
@@ -333,12 +409,26 @@ export function App() {
                   onOffsetChange={setSecurityOffset}
                 />
               </>
-            ) : (
+            ) : view === "context" ? (
               <>
                 {contextError && (
                   <div className="banner banner-error">Failed to load context report: {contextError}</div>
                 )}
                 <ContextView report={contextReport} />
+              </>
+            ) : (
+              <>
+                {injectError && (
+                  <div className="banner banner-error">Failed to load inject events: {injectError}</div>
+                )}
+                <InjectView
+                  counts={injectCounts}
+                  events={injectResp?.events ?? []}
+                  total={injectResp?.total ?? 0}
+                  offset={injectOffset}
+                  limit={PAGE_SIZE}
+                  onOffsetChange={setInjectOffset}
+                />
               </>
             )}
           </>

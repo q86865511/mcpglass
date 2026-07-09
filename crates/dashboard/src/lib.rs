@@ -34,8 +34,8 @@ use proxy_core::Direction;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use storage::{
-    MessageDetail, MessageFilter, MessageRow, SecurityCounts, SecurityEventRow, SessionSummary,
-    Stats, Store,
+    InjectCounts, InjectEventRow, MessageDetail, MessageFilter, MessageRow, SecurityCounts,
+    SecurityEventRow, SessionSummary, Stats, Store,
 };
 
 /// The built frontend, baked into the binary so `mcpglass dashboard` needs no
@@ -144,6 +144,11 @@ pub async fn serve(
         .route(
             "/api/sessions/{id}/security/counts",
             get(session_security_counts),
+        )
+        .route("/api/sessions/{id}/inject", get(session_inject))
+        .route(
+            "/api/sessions/{id}/inject/counts",
+            get(session_inject_counts),
         )
         .route("/api/messages/{id}", get(message_detail))
         .route("/api/messages/{id}/replay", post(replay_message))
@@ -620,6 +625,90 @@ async fn session_security_counts(
     let counts =
         run_blocking(state.store.clone(), move |store| store.security_event_counts(id)).await?;
     Ok(Json(SecurityCountsDto::from(counts)))
+}
+
+#[derive(Serialize)]
+struct InjectEventDto {
+    id: i64,
+    ts_ms: i64,
+    direction: String,
+    rule: String,
+    fault: String,
+    detail: String,
+    method: Option<String>,
+    rpc_id: Option<String>,
+}
+
+impl From<InjectEventRow> for InjectEventDto {
+    fn from(e: InjectEventRow) -> Self {
+        Self {
+            id: e.id,
+            ts_ms: e.ts_ms,
+            direction: e.direction.as_str().to_owned(),
+            rule: e.rule,
+            fault: e.fault.as_str().to_owned(),
+            detail: e.detail,
+            method: e.method,
+            rpc_id: e.rpc_id,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct InjectEventsResponse {
+    total: u64,
+    events: Vec<InjectEventDto>,
+}
+
+#[derive(Deserialize)]
+struct InjectEventsQuery {
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn session_inject(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+    Query(q): Query<InjectEventsQuery>,
+) -> Result<Json<InjectEventsResponse>, AppError> {
+    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0);
+    let (total, rows) = run_blocking(state.store.clone(), move |store| {
+        store.inject_events(id, limit, offset)
+    })
+    .await?;
+    Ok(Json(InjectEventsResponse {
+        total,
+        events: rows.into_iter().map(InjectEventDto::from).collect(),
+    }))
+}
+
+#[derive(Serialize)]
+struct InjectCountsDto {
+    delay: u64,
+    error: u64,
+    drop: u64,
+    truncate: u64,
+}
+
+impl From<InjectCounts> for InjectCountsDto {
+    fn from(c: InjectCounts) -> Self {
+        Self {
+            delay: c.delay,
+            error: c.error,
+            drop: c.drop,
+            truncate: c.truncate,
+        }
+    }
+}
+
+async fn session_inject_counts(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<InjectCountsDto>, AppError> {
+    let counts =
+        run_blocking(state.store.clone(), move |store| store.inject_event_counts(id)).await?;
+    Ok(Json(InjectCountsDto::from(counts)))
 }
 
 /// Serve an embedded frontend asset by request path, falling back to

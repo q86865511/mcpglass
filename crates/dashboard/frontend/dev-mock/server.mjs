@@ -189,6 +189,80 @@ function securityCountsPayload(sessionId) {
   return { policy_deny, secret_leak, fingerprint_change, blocked };
 }
 
+// Inject-events fixture: session 2 (the "live" one) gets one of each fault
+// kind so the badge row and table have something interesting to render in
+// dev. Session 1 stays clean (empty state).
+function buildInjectEvents(sessionId, startTs) {
+  const rows = [
+    {
+      direction: "c2s",
+      rule: "slow-tools-call",
+      fault: "delay",
+      detail: "delayed 'tools/call' by 500ms",
+      method: "tools/call",
+      rpc_id: "12",
+    },
+    {
+      direction: "s2c",
+      rule: "flaky-http-fetch",
+      fault: "error",
+      detail: "synthetic error injected for 'http_fetch' response",
+      method: "tools/call",
+      rpc_id: "18",
+    },
+    {
+      direction: "s2c",
+      rule: "drop-notifications",
+      fault: "drop",
+      detail: "dropped a 'notifications/progress' message",
+      method: "notifications/progress",
+      rpc_id: null,
+    },
+    {
+      direction: "s2c",
+      rule: "truncate-large-results",
+      fault: "truncate",
+      detail: "truncated 'resources/read' response to 2048 bytes",
+      method: "resources/read",
+      rpc_id: "29",
+    },
+  ];
+  return rows.map((r, i) => ({
+    id: sessionId * 1000 + i + 1,
+    session_id: sessionId,
+    ts_ms: startTs + i * 1500,
+    ...r,
+  }));
+}
+
+const injectEventsBySession = new Map();
+injectEventsBySession.set(2, buildInjectEvents(2, sessionDefs[0].started_at_ms));
+injectEventsBySession.set(1, []); // clean session -> exercises the empty state
+
+function injectEventsPayload(sessionId, query) {
+  const all = injectEventsBySession.get(sessionId) ?? [];
+  const limit = Math.max(1, Number(query.get("limit")) || 100);
+  const offset = Math.max(0, Number(query.get("offset")) || 0);
+  const total = all.length;
+  const page = all.slice(offset, offset + limit).map(({ session_id, ...rest }) => rest);
+  return { total, events: page };
+}
+
+function injectCountsPayload(sessionId) {
+  const all = injectEventsBySession.get(sessionId) ?? [];
+  let delay = 0;
+  let error = 0;
+  let drop = 0;
+  let truncate = 0;
+  for (const e of all) {
+    if (e.fault === "delay") delay++;
+    if (e.fault === "error") error++;
+    if (e.fault === "drop") drop++;
+    if (e.fault === "truncate") truncate++;
+  }
+  return { delay, error, drop, truncate };
+}
+
 function toSummary(full) {
   const { raw, session_id, ...rest } = full;
   const preview = raw.length > 120 ? raw.slice(0, 120) : raw;
@@ -337,6 +411,24 @@ const server = createServer((req, res) => {
       return;
     }
     send(200, securityCountsPayload(sessionId));
+    return;
+  }
+
+  if (parts.length === 4 && parts[1] === "sessions" && parts[3] === "inject" && req.method === "GET") {
+    // Unlike the security routes, the real backend answers an unknown session
+    // with 200 + empty here, so the mock mirrors that.
+    send(200, injectEventsPayload(Number(parts[2]), url.searchParams));
+    return;
+  }
+
+  if (
+    parts.length === 5 &&
+    parts[1] === "sessions" &&
+    parts[3] === "inject" &&
+    parts[4] === "counts" &&
+    req.method === "GET"
+  ) {
+    send(200, injectCountsPayload(Number(parts[2])));
     return;
   }
 
