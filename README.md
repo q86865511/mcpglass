@@ -4,7 +4,7 @@
 between any AI client (Claude Code, Claude Desktop, Cursor, ...) and your MCP servers, giving you
 debugging, observability, auditing, and security. All data stays on your machine.
 
-> Status: early development (Phase 3 — stdio + HTTP interception, config takeover, dashboard, security layer).
+> Status: early development (Phase 3 complete — stdio + HTTP interception, config takeover, dashboard, security layer, context analytics, replay, fault injection).
 
 ## Why
 
@@ -29,8 +29,9 @@ debugging, observability, auditing, and security. All data stays on your machine
   or `mode = "enforce"`) to actively refuse denied/leaking calls: the proxy returns an in-protocol
   JSON-RPC error to the client instead of forwarding — it never severs the connection, and any
   proxy-internal error always fails open.
-
-Planned (Phase 3+): context bloat analytics, request replay, error injection.
+- **Context bloat analysis** — `mcpglass bloat` (or the dashboard's Context tab) estimates how many tokens each server's tool schemas cost, ranks the fattest tools, and flags over-long descriptions. Token counts are a heuristic approximation (~4 chars/token), not an exact tokenizer.
+- **Request replay** — `mcpglass replay <message-id>` (or the Replay button in the dashboard's message detail) re-sends a recorded client→server request: it re-spawns the stdio server (or re-initializes the HTTP upstream for a fresh session) and shows the response. Replay is an out-of-band probe — nothing it does is recorded. It can trigger real side effects, so the dashboard button asks for confirmation first.
+- **Fault injection** — `mcpglass wrap --inject <file>` / `mcpglass gateway --inject <file>` applies a TOML ruleset that simulates faults on live traffic (delay, synthetic JSON-RPC error, dropped frame, truncation), in either direction, to test server resilience and client fault-tolerance. It is off by default; when enabled it is a deliberate, in-protocol intervention (like enforce), and the injection machinery itself still fails open. HTTP SSE response streams are not injected in this version.
 
 > **Privacy note:** the local SQLite database records **full raw traffic**, including any secret
 > that flows through it. This is by design (it is a traffic recorder) and the data never leaves

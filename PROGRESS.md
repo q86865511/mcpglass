@@ -1,9 +1,15 @@
 # PROGRESS — mcpglass
 
 ## 目前狀態
-Phase 3 上半完成：HTTP（streamable）transport 長駐 gateway 反向代理、安全層增強三項（指紋納入 annotations＋雙雜湊過渡、A→B→A 震盪告警、tools/list 關聯嚴格化）、Phase 2 遺留三項清理，皆過雙重審查＋修正＋二輪復審，146 Rust 測試＋前端 build 全綠。下一步 Phase 3 下半（context bloat 分析、請求 replay、錯誤注入）。
+Phase 3 完成：下半三功能（context bloat 分析、請求 replay、錯誤注入）皆過雙重審查＋五項修正＋復審,202 Rust 測試＋前端 build 全綠。Phase 3 全部收官,下一步 Phase 4（發佈）。
 
 ## 已完成
+- [2026-07-09] 🔬 R6 Phase 3 下半（/pipeline：storage 地基→A/B/C 三線序列派工→雙重審查→五項修正→復審）：
+  - **context bloat 分析**：proxy-core `bloat.rs` 啟發式估算（`chars/4`,一律標 approximate,`estimate_tokens`/`analyze_tools_list_response→BloatReport`,fat tool 門檻 description>100 token）；資料源為 session 最新 tools/list 回應（storage `latest_tools_list_raw`,rpc_id 配對）。CLI `mcpglass bloat [--session --top]` 文字報告；dashboard `GET /api/sessions/{id}/context`＋前端 Context tab（總估算、Top-N 佔比 bar、裁剪建議）。
+  - **請求 replay**：CLI `mcpglass replay <message-id>`＋dashboard DetailPanel Replay 按鈕（確認框、`POST /api/messages/{id}/replay`,ReplayFn 注入使 dashboard 不依賴 cli）。stdio session 重 spawn server 走 initialize/initialized 握手後重送；HTTP session 重新 initialize 取新 Mcp-Session-Id 後重送。**完全不落庫**（帶外探針,唯讀開庫、不跨 await 持有）；僅允許 c2s request（守門拒 notification/response/s2c）。
+  - **錯誤注入**：policy `inject.rs`（獨立 TOML `--inject`,`[[rules]]` direction/method 萬用/probability/max_triggers/fault,自帶 xorshift RNG,`decide` 純函式,載入失敗啟動期中止）；wrap 雙向 pump 與 gateway handle_post/relay_response 接線（policy 先決策,只有 Forward 才注入）；fault=delay/error/drop/truncate；被注入的原始幀照原樣入 messages,另記 `inject_events`（storage schema v5）。注入屬「使用者明確要求的模擬故障」（同 enforce 例外）,注入層自身仍 fail-open。
+  - **審查與修正**：reviewer（Opus）＋Codex 雙審 9 條合併裁決,修 5 條（dashboard 變異端點缺 Origin/Host 防護＝高、replay DELETE 併入 timeout 把成功變 504、HTTP status 未檢查、SSE 讀到 EOF 無界累積、command 引號切分）＋復審通過；其餘 3 條列已知問題。
+  - **驗證**：clippy 零警告、202 Rust 測試全綠（新增 56）、前端 build 綠。
 - [2026-07-09] 🌐 R5 Phase 3 上半（/pipeline 四波派工＋雙重審查＋九項修正＋二輪復審）：
   - **HTTP（streamable）transport**：`mcpglass gateway` 長駐反向代理（axum，`POST|GET|DELETE /u/{name}`，預設埠 7412）——對齊 MCP spec 2025-06-18（版本常數落 proxy-core）；c2s 同步決策重用 `decide_c2s_frame`（Block＋id→200/-32001、Block 無 id→202）；reqwest 透傳剝 hop-by-hop（含 `Connection` 點名標頭）；SSE 以 `Body::from_stream` 逐 chunk 直通＋`SseSplitter` 旁路 tap；非 SSE 回應緩衝上限 256MB、超限直通不 tap；上游連不上→502；Origin＋Host 雙重 loopback 驗證防 DNS rebinding。
   - **attach url 型 entry**：改寫指向本機 gateway，原始 url 記 `gateway.toml`（唯一真相，先存表才寫 client 檔、失敗即中止）；route 名 sanitize＋`~n` 唯一化解同名不同 upstream；detach 由 url 反解 route 還原；client 檔寫入失敗以非零 exit code 回報。
@@ -32,8 +38,7 @@ Phase 3 上半完成：HTTP（streamable）transport 長駐 gateway 反向代理
 （無）
 
 ## 待辦
-- Phase 3 下半：context bloat 分析、請求 replay、錯誤注入。
-- 審查遺留（低優先）：顯式單一目標的 attach/detach 遇 `Unreadable`（損毀 JSON）仍 exit 0，可評估納入非零 exit（`all` 模式的跳過屬預期，需區分 explicit）；指紋 v3 候選納入 `outputSchema`；真實 streamable HTTP server 的手動 smoke（gateway 端到端已有整合測試，真實 client 對接未跑）。
+- 審查遺留（低優先）：顯式單一目標的 attach/detach 遇 `Unreadable`（損毀 JSON）仍 exit 0，可評估納入非零 exit（`all` 模式的跳過屬預期，需區分 explicit）；指紋 v3 候選納入 `outputSchema`；真實 streamable HTTP server 的手動 smoke（gateway 端到端已有整合測試，真實 client 對接未跑）；inject_events 的儀表板顯示（目前只落庫＋log,無前端 tab）。
 - Phase 4（發佈）：英文 docs＋demo GIF、GitHub 開源、Show HN / r/mcp 發文、收進 terrychou.com 作品集。
 
 ## 已知問題
@@ -44,6 +49,10 @@ Phase 3 上半完成：HTTP（streamable）transport 長駐 gateway 反向代理
 - gateway 對 >64MB 的 monitor 模式請求 body 採緩衝轉發（上限 256MB，超限 413）而非零拷貝串流；正常 MCP 訊息（<64MB）不受影響。
 - gateway 要求請求帶 loopback Host（防 DNS rebinding）；HTTP/1.0 或 h2c 等不帶 Host 的 client 會被 403——MCP client 實務皆走 HTTP/1.1（hyper 對無 Host 的 1.1 請求本就 400），影響面可忽略。
 - 指紋 v1→v2 改釘在「legacy v1 列時間戳晚於既有 v2 同值列」的理論情境下可撞 UNIQUE——單調時鐘下幾乎不可達，fail-open 僅 log 丟該次 outcome。
+- 錯誤注入的 `fault` 是 serde internally-tagged enum,fault 物件內的未知/拼錯 key 不被拒絕而靜默忽略（頂層與 rule 層有 deny_unknown_fields,唯 fault 內無）；必填欄位仍驗證,屬本機 trusted config 風險,列後續強化。
+- gateway c2s 注入路徑在 wire 動作**之前**先 tap 原始請求（為保 c2s<s2c 指紋配對順序,異於 handle_post 於 send_upstream 後才記錄）；delay 期間程序被殺則 DB 顯示發生過但上游未收——try_send 非阻塞不延遲 wire,屬一致性存疑非危害。
+- gateway 對「無 id 通知」注入 error 會合成 id:null 的 200 錯誤,stdio 對應路徑則不送任何東西——兩 transport 對通知注入 error 的行為不對稱。
+- stdio replay 以引號感知切分還原 `argv.join(" ")` 存下的 command,含嵌入引號/shell 元字元的 command 仍可能失真；根治需 storage 改存 argv 陣列（未來工作）。stdio replay 會重新啟動 server 程序、重送請求可能有副作用（前端確認框與 CLI 說明已標示）。gateway s2c error 注入與 replay 均不注入/處理 SSE 串流（v1 限制）。
 
 ## 重要決策紀錄
 - [2026-07-08] 選題依據市調：企業級 MCP gateway 紅海、registry 被官方卡死，空窗在「個人開發者本機觀測層」（Inspector 看不到真實流量、競品 2026-07 才出現）；Invariant Labs 被 Snyk 收購證明出口存在。
@@ -55,3 +64,5 @@ Phase 3 上半完成：HTTP（streamable）transport 長駐 gateway 反向代理
 - [2026-07-09] HTTP transport 行程模型（使用者拍板）：**長駐 `mcpglass gateway` 反向代理**（非 stdio 橋接）——attach 把 url 型 entry 改指 `http://127.0.0.1:{port}/u/{route}`，原始 url 存 gateway.toml；OAuth 等標頭由 client 發、gateway 透傳。stdio 橋接因破壞 client 端 OAuth 流程而否決。
 - [2026-07-09] fail-open 鐵律的 HTTP 詮釋（使用者拍板）：上游連不上/逾時**誠實回 502**（純文字，不合成 JSON-RPC、不假冒 server 發言）；鐵律在 HTTP 下定義為「代理自身 tap/解析/policy 故障絕不改變、延遲或中斷已在流動的回應 bytes」。enforce 攔無 id notification 回 202（spec 內合法）。
 - [2026-07-09] 指紋演算法升版策略：**雙雜湊過渡**——v2（含 annotations）與 v1 同時計算，既有 v1 記錄匹配即靜默改釘 v2；否決「首次重釘」（會漏掉恰在升級時發生的 rug-pull）。
+- [2026-07-09] Phase 3 下半三取捨（使用者拍板）：bloat token 估算走**啟發式零依賴**（chars/4,標 approximate,不引 tokenizer）；replay 介面 **CLI＋儀表板按鈕都做**（按鈕確認框、CLI 直接執行）；錯誤注入**雙向 c2s/s2c、獨立 TOML**（與 policy 分離、預設不啟用）。
+- [2026-07-09] replay **完全不落庫**：帶外除錯探針,結果只回 CLI stdout / 儀表板面板；寫回會污染 session 列表且 stdio replay 的 tools/list 會動到同 server_key 指紋基線。注入事件另立 `inject_events` 表（schema v5,避免改 security_events.kind 的 CHECK constraint）；注入純邏輯放 policy crate（複用 TOML/萬用字元機制,proxy-core 保持只依賴 serde_json）。

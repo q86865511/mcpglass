@@ -31,6 +31,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+pub mod inject;
+pub use inject::{Fault, InjectConfig, InjectDirection, InjectHit, Injector};
+
 /// Enforcement posture. `Monitor` observes and emits events but never blocks;
 /// `Enforce` is the only mode that can return [`Action::Block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -556,8 +559,10 @@ fn deny_reason(policy: &Policy, name: Option<&str>) -> Option<DenyReason> {
 }
 
 /// Match a deny rule against a tool name: a trailing `*` is a prefix wildcard,
-/// otherwise the comparison is exact.
-fn matches_rule(pat: &str, name: &str) -> bool {
+/// otherwise the comparison is exact. Shared with the fault-injection layer
+/// ([`inject`]), which reuses the exact same wildcard semantics for its
+/// `method` filter.
+pub(crate) fn matches_rule(pat: &str, name: &str) -> bool {
     match pat.strip_suffix('*') {
         Some(prefix) => name.starts_with(prefix),
         None => name == pat,

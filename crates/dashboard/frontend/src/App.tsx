@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  ContextReport,
   Direction,
   MessagesResponse,
   SecurityCounts,
@@ -8,6 +9,7 @@ import type {
   SessionSummary,
 } from "./api";
 import {
+  fetchContext,
   fetchMessages,
   fetchSecurityCounts,
   fetchSecurityEvents,
@@ -21,11 +23,12 @@ import { DetailPanel } from "./components/DetailPanel";
 import { StatsBar } from "./components/StatsBar";
 import { Pagination } from "./components/Pagination";
 import { SecurityView } from "./components/SecurityView";
+import { ContextView } from "./components/ContextView";
 
 const PAGE_SIZE = 100;
 const AUTO_REFRESH_MS = 2000;
 
-type View = "messages" | "security";
+type View = "messages" | "security" | "context";
 
 export function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
@@ -51,12 +54,16 @@ export function App() {
   const [securityError, setSecurityError] = useState<string | null>(null);
   const [securityCounts, setSecurityCounts] = useState<SecurityCounts | null>(null);
 
+  const [contextReport, setContextReport] = useState<ContextReport | null>(null);
+  const [contextError, setContextError] = useState<string | null>(null);
+
   // Monotonic request counters so a slow, stale response (e.g. from a
   // session we've since navigated away from) can't clobber a newer one.
   const messagesSeqRef = useRef(0);
   const statsSeqRef = useRef(0);
   const securitySeqRef = useRef(0);
   const securityCountsSeqRef = useRef(0);
+  const contextSeqRef = useRef(0);
 
   // Reset paging/selection when switching sessions or changing filters.
   useEffect(() => {
@@ -158,6 +165,25 @@ export function App() {
       });
   }, [selectedSessionId]);
 
+  const loadContext = useCallback(() => {
+    if (selectedSessionId === null) {
+      contextSeqRef.current += 1;
+      setContextReport(null);
+      return;
+    }
+    const seq = ++contextSeqRef.current;
+    fetchContext(selectedSessionId)
+      .then((r) => {
+        if (contextSeqRef.current !== seq) return; // superseded by a newer request
+        setContextReport(r);
+        setContextError(null);
+      })
+      .catch((e: unknown) => {
+        if (contextSeqRef.current !== seq) return;
+        setContextError(e instanceof Error ? e.message : String(e));
+      });
+  }, [selectedSessionId]);
+
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
@@ -178,12 +204,17 @@ export function App() {
     loadSecurityCounts();
   }, [loadSecurityCounts]);
 
+  useEffect(() => {
+    loadContext();
+  }, [loadContext]);
+
   const autoRefreshRef = useRef({
     loadSessions,
     loadMessages,
     loadStats,
     loadSecurity,
     loadSecurityCounts,
+    loadContext,
   });
   autoRefreshRef.current = {
     loadSessions,
@@ -191,6 +222,7 @@ export function App() {
     loadStats,
     loadSecurity,
     loadSecurityCounts,
+    loadContext,
   };
   const viewRef = useRef(view);
   viewRef.current = view;
@@ -201,10 +233,14 @@ export function App() {
       autoRefreshRef.current.loadSessions();
       autoRefreshRef.current.loadMessages();
       autoRefreshRef.current.loadStats();
-      // Security events/counts are only polled while that view is visible.
+      // Security events/counts and the context report are only polled while
+      // their own view is visible.
       if (viewRef.current === "security") {
         autoRefreshRef.current.loadSecurity();
         autoRefreshRef.current.loadSecurityCounts();
+      }
+      if (viewRef.current === "context") {
+        autoRefreshRef.current.loadContext();
       }
     }, AUTO_REFRESH_MS);
     return () => clearInterval(id);
@@ -246,6 +282,12 @@ export function App() {
                   <span className="view-tab-alert" title="blocked events present" />
                 )}
               </button>
+              <button
+                className={"view-tab" + (view === "context" ? " view-tab-active" : "")}
+                onClick={() => setView("context")}
+              >
+                Context
+              </button>
             </div>
             {view === "messages" ? (
               <>
@@ -277,7 +319,7 @@ export function App() {
                   <DetailPanel messageId={selectedMessageId} />
                 </div>
               </>
-            ) : (
+            ) : view === "security" ? (
               <>
                 {securityError && (
                   <div className="banner banner-error">Failed to load security events: {securityError}</div>
@@ -290,6 +332,13 @@ export function App() {
                   limit={PAGE_SIZE}
                   onOffsetChange={setSecurityOffset}
                 />
+              </>
+            ) : (
+              <>
+                {contextError && (
+                  <div className="banner banner-error">Failed to load context report: {contextError}</div>
+                )}
+                <ContextView report={contextReport} />
               </>
             )}
           </>

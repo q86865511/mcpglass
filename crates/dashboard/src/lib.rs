@@ -17,14 +17,18 @@
 //! once up front and, only in that case, reopens a fresh `Store` per request
 //! instead of caching — see [`StoreHandle`].
 
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{header, StatusCode, Uri};
+use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::http::header::{HOST, ORIGIN};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use proxy_core::Direction;
 use rust_embed::RustEmbed;
@@ -60,9 +64,42 @@ enum StoreHandle {
     PerRequest(PathBuf),
 }
 
+/// A successful replay's result, serialized to the dashboard client. Mirrors the
+/// CLI's `replay::ReplayResult`; the binary maps one to the other in the [`ReplayFn`]
+/// it injects (this crate does not depend on `cli`).
+#[derive(Serialize)]
+pub struct ReplayOutcome {
+    pub transport: String,
+    pub response_raw: Option<String>,
+    pub note: String,
+}
+
+/// Why a replay failed, categorised so the handler can pick the right HTTP status.
+pub enum ReplayError {
+    /// The message isn't a replayable client->server request -> 400.
+    NotReplayable(String),
+    /// The exchange exceeded its time budget -> 504.
+    Timeout,
+    /// The reconstructed server couldn't be reached or driven -> 502.
+    Upstream(String),
+    /// A local failure (store, client setup, ...) -> 500.
+    Internal(String),
+}
+
+/// The replay backend, injected by the binary. `dashboard` intentionally does not
+/// depend on `cli`, so the actual `replay::run_replay` is wired in here as a boxed
+/// async closure keyed by message id. `None` disables the endpoint (it answers 501) —
+/// used by tests and any embedding that doesn't provide a replay implementation.
+pub type ReplayFn = Arc<
+    dyn Fn(i64) -> Pin<Box<dyn Future<Output = Result<ReplayOutcome, ReplayError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 struct AppState {
     store: StoreHandle,
+    replay: Option<ReplayFn>,
 }
 
 /// Bind `127.0.0.1:<port>` and serve the dashboard until the process exits.
@@ -77,9 +114,12 @@ struct AppState {
 /// than before calling `serve`, so a bind failure (e.g. the port already in
 /// use) surfaces as an error instead of a browser tab pointed at the wrong
 /// server.
+/// `replay` is the optional replay backend (see [`ReplayFn`]); `None` makes the
+/// `POST /api/messages/{id}/replay` endpoint answer `501 Not Implemented`.
 pub async fn serve(
     db_path: PathBuf,
     port: u16,
+    replay: Option<ReplayFn>,
     on_ready: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
     // Decide before opening anything: once a legacy v0 file is migrated by
@@ -90,20 +130,31 @@ pub async fn serve(
         let store = Store::open(&db_path)?;
         StoreHandle::Cached(Arc::new(Mutex::new(store)))
     };
-    let state = AppState { store: store_handle };
+    let state = AppState {
+        store: store_handle,
+        replay,
+    };
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/sessions/{id}/stats", get(session_stats))
+        .route("/api/sessions/{id}/context", get(session_context))
         .route("/api/sessions/{id}/security", get(session_security))
         .route(
             "/api/sessions/{id}/security/counts",
             get(session_security_counts),
         )
         .route("/api/messages/{id}", get(message_detail))
+        .route("/api/messages/{id}/replay", post(replay_message))
         .fallback(static_asset)
-        .with_state(state);
+        .with_state(state)
+        // DNS-rebinding / CSRF gate over *every* route (API and static alike). The
+        // dashboard only binds loopback, but that alone doesn't stop a malicious web
+        // page from driving side effects (e.g. `POST /api/messages/{id}/replay`) via a
+        // rebound host or a no-preflight CORS request — see [`loopback_guard`]. Applied
+        // as one layer rather than per-handler so any future route is covered by default.
+        .layer(middleware::from_fn(loopback_guard));
 
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     on_ready(listener.local_addr()?);
@@ -324,6 +375,30 @@ async fn message_detail(
     }
 }
 
+/// `POST /api/messages/{id}/replay`: re-send the recorded request to its server via
+/// the injected [`ReplayFn`]. Off-band and never recorded (the backend guarantees
+/// that). Absent backend -> 501; otherwise the [`ReplayError`] category picks the
+/// status (400 unreplayable / 504 timeout / 502 upstream / 500 internal). The plain
+/// error text is returned as the body so the UI can show what went wrong.
+async fn replay_message(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
+    let Some(replay) = state.replay.clone() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "replay is not available in this build",
+        )
+            .into_response();
+    };
+    match replay(id).await {
+        Ok(outcome) => Json(outcome).into_response(),
+        Err(ReplayError::NotReplayable(m)) => (StatusCode::BAD_REQUEST, m).into_response(),
+        Err(ReplayError::Timeout) => {
+            (StatusCode::GATEWAY_TIMEOUT, "replay timed out").into_response()
+        }
+        Err(ReplayError::Upstream(m)) => (StatusCode::BAD_GATEWAY, m).into_response(),
+        Err(ReplayError::Internal(m)) => (StatusCode::INTERNAL_SERVER_ERROR, m).into_response(),
+    }
+}
+
 #[derive(Serialize)]
 struct MethodStatDto {
     method: String,
@@ -373,6 +448,94 @@ async fn session_stats(
 ) -> Result<Json<StatsDto>, AppError> {
     let stats = run_blocking(state.store.clone(), move |store| store.stats(id)).await?;
     Ok(Json(StatsDto::from(stats)))
+}
+
+/// One tool's share of a session's estimated context cost. `pct` is
+/// `est_tokens / est_total_tokens * 100` (0 when the total is 0).
+#[derive(Serialize)]
+struct ToolBloatDto {
+    name: String,
+    total_chars: usize,
+    est_tokens: usize,
+    description_tokens: usize,
+    pct: f64,
+}
+
+/// Context-bloat analysis for a session's most recently captured `tools/list`
+/// response. `approximate` is always `true`: every count here is the
+/// zero-dependency chars/4 heuristic in `proxy_core::bloat`, never a real
+/// tokenizer. A session with no captured `tools/list` (or an unparsable one)
+/// answers with the zeroed empty shape rather than an error.
+#[derive(Serialize)]
+struct ContextResponse {
+    approximate: bool,
+    tool_count: usize,
+    total_chars: usize,
+    est_total_tokens: usize,
+    /// Sorted heaviest-first, mirroring `proxy_core::bloat::BloatReport`.
+    tools: Vec<ToolBloatDto>,
+    fat_tools: Vec<String>,
+}
+
+fn empty_context_response() -> ContextResponse {
+    ContextResponse {
+        approximate: true,
+        tool_count: 0,
+        total_chars: 0,
+        est_total_tokens: 0,
+        tools: Vec::new(),
+        fat_tools: Vec::new(),
+    }
+}
+
+async fn session_context(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<ContextResponse>, AppError> {
+    let raw =
+        run_blocking(state.store.clone(), move |store| store.latest_tools_list_raw(id)).await?;
+    let Some(raw) = raw else {
+        return Ok(Json(empty_context_response()));
+    };
+    // A recorded frame that fails to parse (shouldn't happen for a frame the
+    // tap itself validated as a tools/list round-trip) degrades to the empty
+    // shape rather than a 500 — this endpoint is read-only analysis, not a
+    // integrity check on the store.
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Ok(Json(empty_context_response()));
+    };
+    let Some(report) = proxy_core::bloat::analyze_tools_list_response(&value) else {
+        return Ok(Json(empty_context_response()));
+    };
+
+    let est_total = report.est_total_tokens;
+    let tools = report
+        .tools
+        .into_iter()
+        .map(|t| {
+            let pct = if est_total > 0 {
+                (t.est_tokens as f64 / est_total as f64) * 100.0
+            } else {
+                0.0
+            };
+            ToolBloatDto {
+                name: t.name,
+                total_chars: t.total_chars,
+                est_tokens: t.est_tokens,
+                description_tokens: t.description_tokens,
+                pct,
+            }
+        })
+        .collect();
+
+    Ok(Json(ContextResponse {
+        approximate: true,
+        tool_count: report.tool_count,
+        total_chars: report.total_chars,
+        est_total_tokens: est_total,
+        tools,
+        fat_tools: report.fat_tools,
+    }))
 }
 
 #[derive(Serialize)]
@@ -481,5 +644,118 @@ async fn static_asset(uri: Uri) -> Response {
             "dashboard assets not found (frontend not built)",
         )
             .into_response(),
+    }
+}
+
+/// Middleware: reject a request whose `Origin`/`Host` headers don't look loopback,
+/// answering `403` before it reaches any handler. The dashboard binds `127.0.0.1`
+/// only, but that doesn't stop a DNS-rebinding attack (a page on an attacker domain
+/// that resolves to 127.0.0.1) or a plain no-preflight CORS request from a malicious
+/// site reaching this port and triggering side effects like `replay`. This is the
+/// dashboard's own copy of the gate the `cli` gateway applies to its reverse proxy —
+/// duplicated deliberately, since `dashboard` doesn't depend on `cli`.
+async fn loopback_guard(req: Request, next: Next) -> Response {
+    if request_allowed(req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "forbidden: non-loopback origin/host").into_response()
+    }
+}
+
+/// Both the `Origin` check (for browser clients that send one) and the `Host` check
+/// (which closes the gap for a same-origin request carrying no `Origin`) must pass.
+fn request_allowed(headers: &HeaderMap) -> bool {
+    origin_allowed(headers) && host_allowed(headers)
+}
+
+/// Origin gate against DNS-rebinding. A missing `Origin` (typical of non-browser
+/// clients, and of curl / same-origin navigations) is allowed; otherwise only a
+/// loopback origin passes.
+fn origin_allowed(headers: &HeaderMap) -> bool {
+    match headers.get(ORIGIN) {
+        None => true,
+        Some(v) => v.to_str().map(is_localhost_origin).unwrap_or(false),
+    }
+}
+
+/// Host gate against DNS-rebinding: a browser rebound to an attacker domain resolving
+/// to 127.0.0.1 sends a same-origin request with *no* `Origin` header but a `Host`
+/// naming the attacker's domain, which `origin_allowed`'s pass-when-absent rule can't
+/// catch. `Host` is mandatory on every HTTP/1.1+ request, so a missing or unparsable
+/// one is rejected rather than allowed.
+fn host_allowed(headers: &HeaderMap) -> bool {
+    match headers.get(HOST) {
+        None => false,
+        Some(v) => v.to_str().map(is_localhost_host).unwrap_or(false),
+    }
+}
+
+/// True when an `Origin` value's host is loopback (`localhost`, `127.0.0.1`, `::1`),
+/// ignoring scheme and port. Anything else (including `null`) is rejected.
+fn is_localhost_origin(origin: &str) -> bool {
+    let rest = origin.split_once("://").map(|(_, r)| r).unwrap_or(origin);
+    matches!(extract_host(rest), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// True when a `Host` header's host part is loopback, ignoring port. Same loopback set
+/// as [`is_localhost_origin`], just without a scheme to strip first.
+fn is_localhost_host(host: &str) -> bool {
+    matches!(extract_host(host), "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Pull the bare host out of a `host[:port]` or IPv6-literal `[addr]:port` string (no
+/// scheme prefix). Shared by the `Origin` and `Host` gates, which differ only in that
+/// `Origin` has a `scheme://` prefix to strip before this.
+fn extract_host(rest: &str) -> &str {
+    if let Some(stripped) = rest.strip_prefix('[') {
+        // IPv6 literal: `[::1]:port` -> take up to ']'.
+        stripped.split(']').next().unwrap_or("")
+    } else {
+        rest.split(['/', ':']).next().unwrap_or("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers_with_origin(origin: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(ORIGIN, HeaderValue::from_str(origin).unwrap());
+        // A valid loopback Host so these cases isolate the Origin check.
+        h.insert(HOST, HeaderValue::from_static("127.0.0.1:8080"));
+        h
+    }
+
+    fn headers_with_host(host: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_str(host).unwrap());
+        h
+    }
+
+    #[test]
+    fn missing_origin_is_allowed_but_missing_host_is_not() {
+        // No Origin + loopback Host: the common non-browser / same-origin case.
+        assert!(request_allowed(&headers_with_host("127.0.0.1:8080")));
+        // No headers at all: Host absent -> rejected.
+        assert!(!request_allowed(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn loopback_origins_pass_others_rejected() {
+        for ok in ["http://localhost", "http://127.0.0.1:8080", "http://[::1]:9000"] {
+            assert!(request_allowed(&headers_with_origin(ok)), "{ok} should pass");
+        }
+        for bad in ["http://evil.example", "https://attacker.com:80", "null"] {
+            assert!(!request_allowed(&headers_with_origin(bad)), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn non_loopback_host_rejected() {
+        assert!(request_allowed(&headers_with_host("localhost:1234")));
+        assert!(!request_allowed(&headers_with_host("evil.example")));
+        assert!(!request_allowed(&headers_with_host("evil.example:80")));
     }
 }

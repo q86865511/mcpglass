@@ -31,7 +31,13 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 /// on the most recent observation so an A -> B -> A oscillation is detected, and
 /// `fp_version` marks each row's fingerprint algorithm so a legacy v1 row can be
 /// recognised and silently re-pinned to v2 during the dual-hash migration.
-const SCHEMA_VERSION: i64 = 4;
+///
+/// v4 -> v5 is purely additive: it appends the `inject_events` table (Phase 3
+/// fault injection) via `CREATE TABLE IF NOT EXISTS` in the same batch as every
+/// other table, so unlike the v2/v3/v4 bumps there is no `ALTER TABLE` step —
+/// a brand-new table needs no separate migration function, the batch's
+/// `IF NOT EXISTS` already makes it additive on an upgraded file.
+const SCHEMA_VERSION: i64 = 5;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -223,6 +229,71 @@ pub struct SecurityCounts {
     pub blocked: u64,
 }
 
+/// The kind of fault simulated by an injected event (Phase 3 error injection).
+/// The string tokens match the `inject_events.fault` CHECK constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InjectFault {
+    Delay,
+    Error,
+    Drop,
+    Truncate,
+}
+
+impl InjectFault {
+    /// Stable on-disk token; matches the `inject_events.fault` CHECK values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InjectFault::Delay => "delay",
+            InjectFault::Error => "error",
+            InjectFault::Drop => "drop",
+            InjectFault::Truncate => "truncate",
+        }
+    }
+}
+
+impl std::str::FromStr for InjectFault {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "delay" => Ok(InjectFault::Delay),
+            "error" => Ok(InjectFault::Error),
+            "drop" => Ok(InjectFault::Drop),
+            "truncate" => Ok(InjectFault::Truncate),
+            _ => Err(()),
+        }
+    }
+}
+
+/// One fault-injection event, ready to persist. Append-only, like
+/// [`SecurityEvent`]: there is no update/delete API.
+pub struct InjectEvent {
+    pub ts_ms: i64,
+    pub direction: Direction,
+    /// The rule that triggered the injection.
+    pub rule: String,
+    pub fault: InjectFault,
+    /// Human-readable detail of the fault applied (e.g. delay duration, injected
+    /// error payload).
+    pub detail: String,
+    pub method: Option<String>,
+    /// The request `rpc_id` this event relates to, if any.
+    pub rpc_id: Option<String>,
+}
+
+/// A persisted fault-injection event row, for the dashboard list view.
+pub struct InjectEventRow {
+    pub id: i64,
+    pub session_id: i64,
+    pub ts_ms: i64,
+    pub direction: Direction,
+    pub rule: String,
+    pub fault: InjectFault,
+    pub detail: String,
+    pub method: Option<String>,
+    pub rpc_id: Option<String>,
+}
+
 /// Classification returned by [`Store::record_fingerprint`]: whether an observed
 /// tool fingerprint is new, already seen, or a change from a prior fingerprint.
 ///
@@ -319,14 +390,15 @@ impl Store {
         self.migrate_v3_add_server_key()?;
         self.migrate_v4_add_fp_columns()?;
 
-        // BEGIN/COMMIT makes table creation and the `user_version = 4` stamp one
+        // BEGIN/COMMIT makes table creation and the `user_version = 5` stamp one
         // atomic unit, so a concurrent reader's legacy-v0 probe (see
         // `is_legacy_v0`) can never observe the `messages` table mid-creation
         // with `user_version` still at 0 and misclassify a fresh db as v0.
         //
-        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4 upgrade additive: on an
-        // existing file the sessions/messages tables are left untouched, any missing
-        // tables are appended, and `user_version` is bumped to 4.
+        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4/v5 upgrade additive:
+        // on an existing file the sessions/messages tables are left untouched, any
+        // missing tables (including `inject_events` on a pre-v5 file) are appended,
+        // and `user_version` is bumped to 5.
         self.conn
             .execute_batch(
                 "BEGIN;
@@ -376,10 +448,23 @@ impl Store {
                 );
                 CREATE INDEX IF NOT EXISTS idx_tool_fingerprints_scope
                     ON tool_fingerprints(server_key, tool_name, id);
-                PRAGMA user_version = 4;
+                CREATE TABLE IF NOT EXISTS inject_events (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL REFERENCES sessions(id),
+                    ts_ms      INTEGER NOT NULL,
+                    direction  TEXT    NOT NULL CHECK (direction IN ('c2s','s2c')),
+                    rule       TEXT    NOT NULL,
+                    fault      TEXT    NOT NULL CHECK (fault IN ('delay','error','drop','truncate')),
+                    detail     TEXT    NOT NULL,
+                    method     TEXT,
+                    rpc_id     TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_inject_events_session_id
+                    ON inject_events(session_id, id);
+                PRAGMA user_version = 5;
                 COMMIT;",
             )
-            .context("creating v4 schema")?;
+            .context("creating v5 schema")?;
         Ok(())
     }
 
@@ -530,6 +615,32 @@ impl Store {
         Ok(rows)
     }
 
+    /// A single session by id, with a live message count, or `None` if unknown.
+    /// Same shape as [`Store::list_sessions`]'s rows, for a single-session lookup.
+    pub fn session(&self, id: i64) -> Result<Option<SessionSummary>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT s.id, s.label, s.command, s.started_at_ms, s.ended_at_ms,
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                 FROM sessions s
+                 WHERE s.id = ?1",
+                params![id],
+                |r| {
+                    Ok(SessionSummary {
+                        id: r.get(0)?,
+                        label: r.get(1)?,
+                        command: r.get(2)?,
+                        started_at_ms: r.get(3)?,
+                        ended_at_ms: r.get(4)?,
+                        message_count: r.get::<_, i64>(5)? as u64,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// A filtered, paged window of a session's messages, plus the total match
     /// count (ignoring the page window) so callers can render pagination.
     /// Rows come back in chronological (`id ASC`) order.
@@ -652,6 +763,43 @@ impl Store {
             per_method,
             totals,
         })
+    }
+
+    /// The raw response body of a session's *most recent* `tools/list` round-trip
+    /// (context-bloat analysis reads a server's current tool catalog off this),
+    /// or `None` if the session never sent a `tools/list` request or the matching
+    /// response never arrived.
+    ///
+    /// Finds the latest c2s `tools/list` request (`id DESC`) and pairs it with the
+    /// earliest non-error s2c response sharing its `rpc_id` at or after the
+    /// request's `ts_ms` — the same request/response pairing rule [`Store::stats`]
+    /// uses for latency, but keyed to one specific request instead of aggregated.
+    pub fn latest_tools_list_raw(&self, session_id: i64) -> Result<Option<String>> {
+        let req: Option<(i64, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT ts_ms, rpc_id FROM messages
+                 WHERE session_id = ?1 AND direction = 'c2s' AND method = 'tools/list'
+                 ORDER BY id DESC LIMIT 1",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((req_ts_ms, Some(rpc_id))) = req else {
+            return Ok(None);
+        };
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT raw FROM messages
+                 WHERE session_id = ?1 AND direction = 's2c' AND method IS NULL
+                   AND is_error = 0 AND rpc_id = ?2 AND ts_ms >= ?3
+                 ORDER BY ts_ms ASC, id ASC LIMIT 1",
+                params![session_id, rpc_id, req_ts_ms],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw)
     }
 
     /// Append one security event under `session_id`. Append-only: there is no
@@ -866,6 +1014,53 @@ impl Store {
         )?;
         Ok(counts)
     }
+
+    /// Append one fault-injection event under `session_id`. Append-only, like
+    /// [`Store::insert_security_event`]: no update or delete counterpart.
+    pub fn insert_inject_event(&self, session_id: i64, ev: &InjectEvent) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO inject_events
+                    (session_id, ts_ms, direction, rule, fault, detail, method, rpc_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    session_id,
+                    ev.ts_ms,
+                    ev.direction.as_str(),
+                    ev.rule,
+                    ev.fault.as_str(),
+                    ev.detail,
+                    ev.method,
+                    ev.rpc_id,
+                ],
+            )
+            .context("inserting inject event")?;
+        Ok(())
+    }
+
+    /// A paged window of a session's fault-injection events, oldest-first
+    /// (`id ASC`), for the dashboard.
+    pub fn inject_events(
+        &self,
+        session_id: i64,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<InjectEventRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, ts_ms, direction, rule, fault, detail, method, rpc_id
+             FROM inject_events
+             WHERE session_id = ?1
+             ORDER BY id ASC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![session_id, limit as i64, offset as i64],
+                map_inject_event_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 }
 
 /// Build the shared `WHERE` fragment (using anonymous `?` placeholders) and its
@@ -929,6 +1124,22 @@ fn map_security_event_row(r: &rusqlite::Row) -> rusqlite::Result<SecurityEventRo
         tool_name: r.get(6)?,
         rpc_id: r.get(7)?,
         action_taken: parse_token(&action, 8, "action_taken")?,
+    })
+}
+
+fn map_inject_event_row(r: &rusqlite::Row) -> rusqlite::Result<InjectEventRow> {
+    let dir: String = r.get(3)?;
+    let fault: String = r.get(5)?;
+    Ok(InjectEventRow {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        ts_ms: r.get(2)?,
+        direction: parse_direction(&dir, 3)?,
+        rule: r.get(4)?,
+        fault: parse_token(&fault, 5, "inject fault")?,
+        detail: r.get(6)?,
+        method: r.get(7)?,
+        rpc_id: r.get(8)?,
     })
 }
 
@@ -1443,7 +1654,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_to_v4_additive_upgrade_preserves_data() {
+    fn v1_to_v5_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v1-upgrade");
         let db = tmp.db();
         write_legacy_v1_db(&db);
@@ -1455,7 +1666,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
 
         // ...without disturbing the pre-existing v1 data.
         let sessions = store.list_sessions().unwrap();
@@ -1553,18 +1764,18 @@ mod tests {
     }
 
     #[test]
-    fn v2_to_v4_additive_upgrade_preserves_data() {
+    fn v2_to_v5_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v2-upgrade");
         let db = tmp.db();
         write_legacy_v2_db(&db);
 
-        // Opening a v2 file upgrades it in place to v4 via ALTER TABLE ADD COLUMN...
+        // Opening a v2 file upgrades it in place to v5 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // ...preserving all pre-existing v2 rows (sessions/messages/events).
         let sessions = store.list_sessions().unwrap();
@@ -1589,13 +1800,13 @@ mod tests {
         // New fingerprints record under the v3 server_key scope on the upgraded file.
         assert_eq!(rf(&store, 1, "srv", "t", "fp", 200), FingerprintOutcome::New);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v4.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v5.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 4);
+        assert_eq!(version2, 5);
     }
 
     #[test]
@@ -1844,18 +2055,18 @@ mod tests {
     }
 
     #[test]
-    fn v3_to_v4_additive_upgrade_preserves_and_backfills_fingerprints() {
+    fn v3_to_v5_additive_upgrade_preserves_and_backfills_fingerprints() {
         let tmp = TempDir::new("v3-upgrade");
         let db = tmp.db();
         write_legacy_v3_db(&db, "legacy_v1");
 
-        // Opening a v3 file upgrades it in place to v4 via ALTER TABLE ADD COLUMN...
+        // Opening a v3 file upgrades it in place to v5 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
 
         // ...the legacy fingerprint row survives, backfilled to fp_version=1 with a
         // NULL last_seen_ts_ms (recency then falls back to first_seen_ts_ms).
@@ -1870,13 +2081,13 @@ mod tests {
         assert_eq!(fp_version, 1);
         assert_eq!(last_seen, None);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v4.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v5.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 4);
+        assert_eq!(version2, 5);
     }
 
     #[test]
@@ -1924,5 +2135,237 @@ mod tests {
             store.record_fingerprint(1, "srv", "search", "v1hashB", "v2hashB", 200).unwrap(),
             FingerprintOutcome::Changed
         );
+    }
+
+    /// Hand-build a v4 file: the full v4 schema (sessions/messages/security_events/
+    /// tool_fingerprints with `fp_version`/`last_seen_ts_ms`, no `inject_events`
+    /// table yet) with one row in each, `user_version` stamped 4.
+    fn write_legacy_v4_db(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                command TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL,
+                is_error INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('policy_deny','secret_leak','fingerprint_change')),
+                rule TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                tool_name TEXT,
+                rpc_id TEXT,
+                action_taken TEXT NOT NULL CHECK (action_taken IN ('flagged','blocked'))
+            );
+            CREATE TABLE tool_fingerprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                tool_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                first_seen_ts_ms INTEGER NOT NULL,
+                server_key TEXT NOT NULL DEFAULT '',
+                fp_version INTEGER NOT NULL DEFAULT 1,
+                last_seen_ts_ms INTEGER,
+                UNIQUE (server_key, tool_name, fingerprint)
+            );
+            PRAGMA user_version = 4;
+            COMMIT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label, command, started_at_ms) VALUES ('old', 'srv', 42)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages
+                (session_id, ts_ms, direction, raw, method, rpc_id, is_valid_json, is_error)
+             VALUES (1, 100, 'c2s', '{\"id\":1,\"method\":\"ping\"}', 'ping', '1', 1, 0)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v4_to_v5_additive_upgrade_adds_inject_events() {
+        let tmp = TempDir::new("v4-upgrade");
+        let db = tmp.db();
+        write_legacy_v4_db(&db);
+
+        // Opening a v4 file upgrades it in place to v5 (new inject_events table)...
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+
+        // ...preserving the pre-existing v4 rows...
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].label, "old");
+        assert_eq!(sessions[0].message_count, 1);
+
+        // ...and inject_events is present and usable on the upgraded file.
+        store
+            .insert_inject_event(
+                1,
+                &InjectEvent {
+                    ts_ms: 10,
+                    direction: Direction::C2s,
+                    rule: "slow-tool".to_owned(),
+                    fault: InjectFault::Delay,
+                    detail: "delayed 500ms".to_owned(),
+                    method: Some("tools/call".to_owned()),
+                    rpc_id: Some("1".to_owned()),
+                },
+            )
+            .unwrap();
+        let rows = store.inject_events(1, 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Re-opening the upgraded file is a no-op and still v5.
+        let store2 = Store::open(&db).unwrap();
+        let version2: i64 = store2
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version2, 5);
+    }
+
+    #[test]
+    fn session_returns_row_or_none() {
+        let tmp = TempDir::new("session-lookup");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+        store
+            .insert(sid, &rec(Direction::C2s, 1, r#"{"id":1,"method":"ping"}"#))
+            .unwrap();
+
+        let found = store.session(sid).unwrap().expect("session");
+        assert_eq!(found.id, sid);
+        assert_eq!(found.label, "s");
+        assert_eq!(found.message_count, 1);
+
+        assert!(store.session(999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_tools_list_raw_pairs_the_most_recent_request() {
+        let tmp = TempDir::new("tools-list-latest");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+
+        // First tools/list round-trip (id "1").
+        store
+            .insert(sid, &rec(Direction::C2s, 100, r#"{"id":1,"method":"tools/list"}"#))
+            .unwrap();
+        store
+            .insert(
+                sid,
+                &rec(Direction::S2c, 110, r#"{"id":1,"result":{"tools":["old"]}}"#),
+            )
+            .unwrap();
+        // Second, later tools/list round-trip (id "2") -> this is the "latest".
+        store
+            .insert(sid, &rec(Direction::C2s, 200, r#"{"id":2,"method":"tools/list"}"#))
+            .unwrap();
+        let latest_resp = r#"{"id":2,"result":{"tools":["new"]}}"#;
+        store
+            .insert(sid, &rec(Direction::S2c, 210, latest_resp))
+            .unwrap();
+
+        let raw = store.latest_tools_list_raw(sid).unwrap();
+        assert_eq!(raw.as_deref(), Some(latest_resp));
+    }
+
+    #[test]
+    fn latest_tools_list_raw_skips_error_response() {
+        let tmp = TempDir::new("tools-list-error");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+
+        store
+            .insert(sid, &rec(Direction::C2s, 100, r#"{"id":1,"method":"tools/list"}"#))
+            .unwrap();
+        // An error response must not be treated as the matching result.
+        store
+            .insert(
+                sid,
+                &rec(Direction::S2c, 110, r#"{"id":1,"error":{"code":-1,"message":"no"}}"#),
+            )
+            .unwrap();
+
+        assert!(store.latest_tools_list_raw(sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_tools_list_raw_none_without_request_or_response() {
+        let tmp = TempDir::new("tools-list-none");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+
+        // No tools/list request at all.
+        assert!(store.latest_tools_list_raw(sid).unwrap().is_none());
+
+        // A request with no matching response yet.
+        store
+            .insert(sid, &rec(Direction::C2s, 100, r#"{"id":1,"method":"tools/list"}"#))
+            .unwrap();
+        assert!(store.latest_tools_list_raw(sid).unwrap().is_none());
+    }
+
+    #[test]
+    fn inject_events_insert_and_query_round_trip() {
+        let tmp = TempDir::new("inject-events");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+
+        for i in 0..3 {
+            store
+                .insert_inject_event(
+                    sid,
+                    &InjectEvent {
+                        ts_ms: i,
+                        direction: Direction::S2c,
+                        rule: format!("rule{i}"),
+                        fault: InjectFault::Error,
+                        detail: "synthetic error".to_owned(),
+                        method: Some("tools/call".to_owned()),
+                        rpc_id: Some(i.to_string()),
+                    },
+                )
+                .unwrap();
+        }
+
+        let rows = store.inject_events(sid, 2, 1).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].id < rows[1].id);
+        // offset 1 -> the second-oldest event.
+        assert_eq!(rows[0].rule, "rule1");
+        assert_eq!(rows[0].session_id, sid);
+        assert_eq!(rows[0].direction, Direction::S2c);
+        assert_eq!(rows[0].fault, InjectFault::Error);
+        assert_eq!(rows[0].detail, "synthetic error");
+        assert_eq!(rows[0].method.as_deref(), Some("tools/call"));
+        assert_eq!(rows[0].rpc_id.as_deref(), Some("1"));
+
+        assert!(store.inject_events(999_999, 50, 0).unwrap().is_empty());
     }
 }

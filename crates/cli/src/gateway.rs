@@ -24,6 +24,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use axum::body::{to_bytes, Body, Bytes};
@@ -33,17 +34,18 @@ use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use policy::{Mode, Policy};
+use policy::{Fault, InjectDirection, InjectHit, Mode, Policy};
 use proxy_core::{Direction, SseSplitter};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use storage::{SecurityEvent, Store};
+use storage::{InjectEvent, SecurityEvent, Store};
 
 use crate::gateway_config::{self, GatewayConfig};
 use crate::security::{Decision, FrameAction};
 use crate::tap::{now_ms, storage_loop, Logger, StorageMsg, TapEvent};
-use crate::{log_drop_once, EXIT_POLICY_CONFIG};
+use crate::{fault_kind, inject_decide, log_drop_once, EXIT_POLICY_CONFIG, SharedInjector};
 
 /// Fail-open buffering ceiling, shared by both legs. On the c2s leg, a monitor-mode
 /// POST body up to the frame cap is inspected; a larger one is uninspectable and
@@ -72,16 +74,21 @@ struct GatewayState {
     /// Frame/inspection cap: a POST body at or under this is inspected; above it is
     /// uninspectable (matches the stdio oversized-frame boundary).
     frame_cap: usize,
+    /// Optional fault injector, shared across every route so its counters/RNG
+    /// advance in lock-step (`None` unless `--inject` was given). See [`SharedInjector`].
+    injector: SharedInjector,
 }
 
 /// Resolve configuration and run the gateway until the process is killed. Returns a
 /// process exit code (nonzero only on a startup/bind failure).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     port: u16,
     db: Option<PathBuf>,
     log: Option<PathBuf>,
     policy_path: Option<PathBuf>,
     enforce: bool,
+    inject: Option<PathBuf>,
     upstreams_arg: Vec<(String, String)>,
 ) -> i32 {
     let data_dir = crate::default_data_dir();
@@ -106,6 +113,14 @@ pub async fn run(
     };
     logger.info(format!("gateway policy mode={:?}", policy.mode));
 
+    // Fault injection: opt-in, resolved before binding (a broken config aborts while
+    // it is still safe — no byte forwarded yet). Reuses the `wrap` resolver so the
+    // config format and abort behaviour are identical across transports.
+    let injector = match crate::resolve_injector(inject.as_deref(), &logger) {
+        Ok(i) => i,
+        Err(code) => return code,
+    };
+
     // Upstreams: explicit `--upstream name=url` wins; otherwise read gateway.toml.
     let upstreams: Vec<(String, String)> = if !upstreams_arg.is_empty() {
         upstreams_arg
@@ -125,9 +140,18 @@ pub async fn run(
     }
 
     let frame_cap = crate::max_line_bytes();
-    let result = serve(db_path, port, policy, upstreams, logger.clone(), frame_cap, |addr| {
-        println!("Gateway listening on http://{addr}  (routes: POST|GET|DELETE /u/<name>)");
-    })
+    let result = serve(
+        db_path,
+        port,
+        policy,
+        upstreams,
+        logger.clone(),
+        frame_cap,
+        injector,
+        |addr| {
+            println!("Gateway listening on http://{addr}  (routes: POST|GET|DELETE /u/<name>)");
+        },
+    )
     .await;
 
     match result {
@@ -152,6 +176,7 @@ async fn serve(
     upstreams: Vec<(String, String)>,
     logger: Logger,
     frame_cap: usize,
+    injector: SharedInjector,
     on_ready: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
     // Create the schema once, up front, so the per-upstream writer connections
@@ -200,6 +225,7 @@ async fn serve(
         upstreams: Arc::new(map),
         logger,
         frame_cap,
+        injector,
     };
 
     let app = Router::new()
@@ -275,6 +301,24 @@ async fn handle_post(
 
     match decision.action {
         FrameAction::Forward => {
+            // Injection layer: only policy-cleared (Forward) frames are eligible,
+            // and only when `--inject` is active. A hit hands the whole wire action
+            // (delay / drop / synthesized error / truncate) to `inject_c2s_gateway`.
+            let inj_hit = if state.injector.is_some() {
+                let (method, id_value, rpc_id) = crate::parse_for_injection(&bytes);
+                inject_decide(&state.injector, InjectDirection::C2s, method.as_deref())
+                    .map(|hit| (hit, method, id_value, rpc_id))
+            } else {
+                None
+            };
+            if let Some((hit, method, id_value, rpc_id)) = inj_hit {
+                return inject_c2s_gateway(
+                    &state, up, bytes, url, &headers, hit, method, id_value, rpc_id, ts,
+                    decision.events,
+                )
+                .await;
+            }
+
             match send_upstream(&state, Method::POST, url, &headers, Some(bytes.clone())).await {
                 Ok(resp) => {
                     // Request wire action done. Record the request (and its events)
@@ -411,6 +455,11 @@ async fn relay_response(state: &GatewayState, up: &Upstream, resp: reqwest::Resp
     }
 
     if is_sse {
+        // NOTE: SSE streams are deliberately *not* fault-injected in v1. Injection
+        // operates on a whole buffered frame; an SSE body is an open-ended stream of
+        // events with no single frame to delay/replace/truncate coherently. The
+        // buffered `application/json` branch below is the one that consults the
+        // injector. (Documented as a v1 limitation.)
         let tx = up.tx.clone();
         let logger = state.logger.clone();
         let latch = up.drop_logged.clone();
@@ -489,7 +538,20 @@ async fn relay_response(state: &GatewayState, up: &Upstream, resp: reqwest::Resp
         }
         let bytes = Bytes::from(buf);
         // Tap the whole response body as one s2c frame (best-effort, non-blocking).
+        // Done before any injection so the recording faithfully reflects what the
+        // server emitted; injection only changes what the client is handed.
         tap_frame(up, &state.logger, Direction::S2c, now_ms(), bytes.to_vec());
+
+        // Injection layer for buffered responses (the SSE branch above opts out).
+        if state.injector.is_some() {
+            let (method, id_value, rpc_id) = crate::parse_for_injection(&bytes);
+            if let Some(hit) = inject_decide(&state.injector, InjectDirection::S2c, method.as_deref())
+            {
+                return inject_s2c_gateway(state, up, &bytes, builder, id_value, hit, method, rpc_id)
+                    .await;
+            }
+        }
+
         match builder.body(Body::from(bytes)) {
             Ok(r) => r,
             Err(e) => {
@@ -499,6 +561,182 @@ async fn relay_response(state: &GatewayState, up: &Upstream, resp: reqwest::Resp
                 (StatusCode::BAD_GATEWAY, "bad upstream response").into_response()
             }
         }
+    }
+}
+
+/// Apply an injected fault to a policy-cleared client->server request. Records the
+/// original request frame (it did occur) and its policy events first — preserving
+/// the c2s-before-s2c ordering fingerprint correlation relies on — then performs the
+/// fault's wire action and records the inject event, returning the client response.
+///
+/// Injection here is the user's explicit, in-protocol intervention (like an enforce
+/// block), not a fail-open violation; the fail-open contract still governs the
+/// *machinery* — a dropped inject event never changes what is on the wire.
+#[allow(clippy::too_many_arguments)]
+async fn inject_c2s_gateway(
+    state: &GatewayState,
+    up: &Upstream,
+    bytes: Bytes,
+    url: String,
+    headers: &HeaderMap,
+    hit: InjectHit,
+    method: Option<String>,
+    id_value: Option<Value>,
+    rpc_id: Option<String>,
+    ts: i64,
+    events: Vec<SecurityEvent>,
+) -> Response {
+    tap_frame(up, &state.logger, Direction::C2s, ts, bytes.to_vec());
+    emit_events(up, &state.logger, events);
+
+    let kind = fault_kind(&hit.fault);
+    let (detail, response) = match hit.fault {
+        Fault::Delay { delay_ms } => {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let resp = match send_upstream(state, Method::POST, url, headers, Some(bytes.clone())).await
+            {
+                Ok(r) => relay_response(state, up, r).await,
+                Err(r) => r,
+            };
+            (
+                format!("delayed c2s request by {delay_ms}ms then forwarded upstream"),
+                resp,
+            )
+        }
+        Fault::Drop => {
+            // Upstream never contacted; acknowledge like a silent block (202, no body).
+            (
+                "dropped c2s request (upstream not contacted)".to_owned(),
+                StatusCode::ACCEPTED.into_response(),
+            )
+        }
+        Fault::Error { code, message } => {
+            // Answer in-protocol without contacting the upstream (mirrors the stdio
+            // leg, but HTTP `application/json` carries no framing newline).
+            let id = id_value.unwrap_or(Value::Null);
+            let body = crate::security::synthesize_error_custom(&id, code, &message);
+            let resp = (StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response();
+            (
+                format!("synthesized error code={code} message={message:?} (upstream not contacted)"),
+                resp,
+            )
+        }
+        Fault::Truncate { bytes: n } => {
+            let end = n.min(bytes.len());
+            let truncated = Bytes::copy_from_slice(&bytes[..end]);
+            let resp = match send_upstream(state, Method::POST, url, headers, Some(truncated)).await {
+                Ok(r) => relay_response(state, up, r).await,
+                Err(r) => r,
+            };
+            (
+                format!(
+                    "truncated c2s request body to {end} of {} bytes before forwarding",
+                    bytes.len()
+                ),
+                resp,
+            )
+        }
+    };
+
+    state.logger.info(format!("inject c2s [{}]: {}", kind.as_str(), detail));
+    emit_inject(
+        up,
+        &state.logger,
+        InjectEvent {
+            ts_ms: ts,
+            direction: Direction::C2s,
+            rule: hit.rule_label,
+            fault: kind,
+            detail,
+            method,
+            rpc_id,
+        },
+    );
+    response
+}
+
+/// Apply an injected fault to a buffered server->client response body. The caller
+/// already tapped the original server body, so this only changes what the client
+/// receives. `builder` holds the upstream status + headers, reused for
+/// delay/drop/truncate; an injected `error` replaces the response wholesale with an
+/// `application/json` error (and so does not carry the upstream headers).
+#[allow(clippy::too_many_arguments)]
+async fn inject_s2c_gateway(
+    state: &GatewayState,
+    up: &Upstream,
+    body: &[u8],
+    builder: axum::http::response::Builder,
+    id_value: Option<Value>,
+    hit: InjectHit,
+    method: Option<String>,
+    rpc_id: Option<String>,
+) -> Response {
+    let kind = fault_kind(&hit.fault);
+    let (detail, response) = match hit.fault {
+        Fault::Delay { delay_ms } => {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            (
+                format!("delayed s2c response by {delay_ms}ms"),
+                build_from(state, builder, Body::from(body.to_vec())),
+            )
+        }
+        Fault::Drop => (
+            "dropped s2c response body".to_owned(),
+            build_from(state, builder, Body::empty()),
+        ),
+        Fault::Truncate { bytes: n } => {
+            let end = n.min(body.len());
+            (
+                format!("truncated s2c response to {end} of {} bytes", body.len()),
+                build_from(state, builder, Body::from(body[..end].to_vec())),
+            )
+        }
+        Fault::Error { code, message } => {
+            let id = id_value.unwrap_or(Value::Null);
+            let b = crate::security::synthesize_error_custom(&id, code, &message);
+            let resp = (StatusCode::OK, [(CONTENT_TYPE, "application/json")], b).into_response();
+            (
+                format!("replaced s2c response with error code={code} message={message:?}"),
+                resp,
+            )
+        }
+    };
+    state.logger.info(format!("inject s2c [{}]: {}", kind.as_str(), detail));
+    emit_inject(
+        up,
+        &state.logger,
+        InjectEvent {
+            ts_ms: now_ms(),
+            direction: Direction::S2c,
+            rule: hit.rule_label,
+            fault: kind,
+            detail,
+            method,
+            rpc_id,
+        },
+    );
+    response
+}
+
+/// Finish a response from `builder`, degrading to a logged 502 if the (upstream)
+/// headers can't be re-applied — never a reason to panic the handler.
+fn build_from(state: &GatewayState, builder: axum::http::response::Builder, body: Body) -> Response {
+    builder.body(body).unwrap_or_else(|e| {
+        state
+            .logger
+            .error(format!("gateway: building injected response failed: {e}"));
+        (StatusCode::BAD_GATEWAY, "bad upstream response").into_response()
+    })
+}
+
+/// Persist a fault-injection event (best-effort, non-blocking).
+fn emit_inject(up: &Upstream, logger: &Logger, ev: InjectEvent) {
+    if up.tx.try_send(StorageMsg::Inject(ev)).is_err() {
+        log_drop_once(
+            &up.drop_logged,
+            logger,
+            "gateway: inject event dropped (channel full/closed)",
+        );
     }
 }
 

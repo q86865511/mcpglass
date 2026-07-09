@@ -10,12 +10,13 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
-use policy::{Mode, Policy};
+use policy::{Fault, InjectConfig, InjectDirection, InjectHit, Injector, Mode, Policy};
 use proxy_core::Direction;
-use storage::{ActionTaken, SecurityEvent, SecurityEventKind};
+use serde_json::Value;
+use storage::{ActionTaken, InjectEvent, InjectFault, SecurityEvent, SecurityEventKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -23,10 +24,12 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use security::{Chunk, Decision, FrameAction, FramedStream};
 use tap::{now_ms, storage_loop, Logger, StorageMsg, TapEvent};
 
+mod bloat;
 mod clients;
 mod dash;
 mod gateway;
 mod gateway_config;
+mod replay;
 mod security;
 mod tap;
 
@@ -80,6 +83,12 @@ enum SubCmd {
         /// mode that can block a request). Handy for testing/temporary lockdown.
         #[arg(long)]
         enforce: bool,
+        /// Fault-injection config (TOML). When set, matched frames get simulated
+        /// faults (delay/error/drop/truncate) applied to either direction — a
+        /// resilience-testing tool, off by default. A file that fails to load aborts
+        /// startup (before any byte is forwarded, so aborting is safe).
+        #[arg(long)]
+        inject: Option<PathBuf>,
         /// The server command and its args, after `--`.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
@@ -146,10 +155,47 @@ enum SubCmd {
         /// Force enforce mode regardless of the policy file's `mode`.
         #[arg(long)]
         enforce: bool,
+        /// Fault-injection config (TOML), same format and semantics as `wrap
+        /// --inject`. Off by default; a file that fails to load aborts startup
+        /// (before binding, so no traffic is affected).
+        #[arg(long)]
+        inject: Option<PathBuf>,
         /// Upstream route `name=url` (repeatable). If omitted, routes are read from
         /// `<data_local>/mcpglass/gateway.toml` (written by `attach`).
         #[arg(long = "upstream", value_parser = parse_upstream)]
         upstream: Vec<(String, String)>,
+    },
+    /// Re-send a recorded client->server request back to its server, out of band:
+    /// `mcpglass replay <message-id> [--db P] [--timeout-secs N]`. A debugging probe,
+    /// not a wire path: it reconstructs the server from the recorded session, drives a
+    /// fresh `initialize` handshake, and prints the response. stdio replay restarts
+    /// the server process (side effects possible); the replay is never recorded.
+    Replay {
+        /// The id of the client->server request message to replay (from the dashboard
+        /// or the sessions db). Responses, notifications, and s2c frames are rejected.
+        message_id: i64,
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Overall time budget for the whole replay exchange, in seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+    /// Context-bloat analysis: estimate how many context tokens a session's
+    /// advertised tool catalog costs, and flag tools worth trimming:
+    /// `mcpglass bloat [--db P] [--session N] [--top N]`. A zero-dependency
+    /// heuristic (~4 chars/token); always labelled approximate, never a real
+    /// tokenizer count.
+    Bloat {
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Which session to analyze. Defaults to the most recently started one.
+        #[arg(long)]
+        session: Option<i64>,
+        /// How many of the heaviest tools to list in the report.
+        #[arg(long, default_value_t = 10)]
+        top: usize,
     },
 }
 
@@ -173,9 +219,10 @@ async fn main() {
             name,
             policy,
             enforce,
+            inject,
             command,
         } => {
-            let code = run_wrap(db, log, name, policy, enforce, command).await;
+            let code = run_wrap(db, log, name, policy, enforce, inject, command).await;
             std::process::exit(code);
         }
         SubCmd::Attach {
@@ -203,9 +250,22 @@ async fn main() {
             log,
             policy,
             enforce,
+            inject,
             upstream,
         } => {
-            let code = gateway::run(port, db, log, policy, enforce, upstream).await;
+            let code = gateway::run(port, db, log, policy, enforce, inject, upstream).await;
+            std::process::exit(code);
+        }
+        SubCmd::Replay {
+            message_id,
+            db,
+            timeout_secs,
+        } => {
+            let code = replay::run(db, message_id, timeout_secs).await;
+            std::process::exit(code);
+        }
+        SubCmd::Bloat { db, session, top } => {
+            let code = bloat::run(db, session, top).await;
             std::process::exit(code);
         }
     }
@@ -222,12 +282,21 @@ pub(crate) const EXIT_POLICY_CONFIG: i32 = 78;
 /// in the middle of a real frame.
 type SharedStdout = Arc<AsyncMutex<tokio::io::Stdout>>;
 
+/// Shared fault injector. One [`Injector`] is shared by both pumps behind a plain
+/// `std::sync::Mutex` so its per-rule counters and RNG advance in lock-step across
+/// directions. `None` when `--inject` was not given (the common case): the pumps
+/// then skip injection entirely, parsing not a single extra byte. The mutex is only
+/// ever held for the duration of a pure [`Injector::decide`] call — never across an
+/// `.await` — so it cannot stall the wire.
+type SharedInjector = Option<Arc<Mutex<Injector>>>;
+
 async fn run_wrap(
     db: Option<PathBuf>,
     log: Option<PathBuf>,
     name: Option<String>,
     policy_path: Option<PathBuf>,
     enforce: bool,
+    inject_path: Option<PathBuf>,
     command: Vec<String>,
 ) -> i32 {
     let program = command[0].clone();
@@ -262,6 +331,14 @@ async fn run_wrap(
         }
     };
     logger.info(format!("policy mode={:?}", policy.mode));
+
+    // Fault injection is opt-in. Like the policy file, a broken config must abort
+    // *before* any byte is forwarded — safe here, and the only place aborting is.
+    // With no `--inject` the injector is `None` and the pumps do zero extra work.
+    let injector = match resolve_injector(inject_path.as_deref(), &logger) {
+        Ok(i) => i,
+        Err(code) => return code,
+    };
 
     let mut child = match spawn_child(&program, &args, &logger).await {
         Ok(c) => c,
@@ -299,6 +376,7 @@ async fn run_wrap(
         tx.clone(),
         logger.clone(),
         frame_cap,
+        injector.clone(),
     ));
     // server -> client: frame-atomic passthrough, tapped as s2c (fingerprinting
     // runs on the storage thread, so this leg makes no synchronous decision).
@@ -308,6 +386,7 @@ async fn run_wrap(
         tx.clone(),
         logger.clone(),
         frame_cap,
+        injector.clone(),
     ));
     // server stderr is the server's own diagnostic channel: raw passthrough, no tap.
     let t_err = tokio::spawn(async move {
@@ -368,6 +447,196 @@ pub(crate) fn log_drop_once(flag: &AtomicBool, logger: &Logger, msg: &str) {
     }
 }
 
+/// Resolve the optional fault injector at startup. `None` path -> `Ok(None)` (the
+/// pumps do no injection). A present-but-broken config returns `Err(exit_code)` so
+/// the caller aborts before forwarding — reusing [`EXIT_POLICY_CONFIG`] since it is
+/// the same class of "startup config failed, abort while it is still safe" event.
+pub(crate) fn resolve_injector(
+    inject_path: Option<&Path>,
+    logger: &Logger,
+) -> Result<SharedInjector, i32> {
+    let Some(path) = inject_path else {
+        return Ok(None);
+    };
+    match InjectConfig::load(path) {
+        Ok(cfg) => {
+            logger.info(format!(
+                "inject enabled: {} rule(s) from {}",
+                cfg.rule_count(),
+                path.display()
+            ));
+            Ok(Some(Arc::new(Mutex::new(Injector::new(cfg)))))
+        }
+        Err(e) => {
+            // Pre-forwarding, so stderr is not yet a protocol channel.
+            eprintln!("mcpglass: failed to load inject config {}: {e:#}", path.display());
+            logger.error(format!("inject load failed; aborting before any forward: {e:#}"));
+            Err(EXIT_POLICY_CONFIG)
+        }
+    }
+}
+
+/// Consult the shared injector for one forwarded frame. Fail-open by construction:
+/// a `None` injector, a poisoned lock, or a (pure, but defensively guarded)
+/// `decide` panic all yield `None`, i.e. "inject nothing, forward normally" — the
+/// injection machinery can never itself be a reason to disturb the wire.
+pub(crate) fn inject_decide(
+    injector: &SharedInjector,
+    dir: InjectDirection,
+    method: Option<&str>,
+) -> Option<InjectHit> {
+    let inj = injector.as_ref()?;
+    let mut guard = inj.lock().ok()?; // poisoned -> forward normally
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| guard.decide(dir, method)))
+        .unwrap_or(None)
+}
+
+/// Map a [`Fault`] to its storage token for the `inject_events` row.
+pub(crate) fn fault_kind(fault: &Fault) -> InjectFault {
+    match fault {
+        Fault::Delay { .. } => InjectFault::Delay,
+        Fault::Error { .. } => InjectFault::Error,
+        Fault::Drop => InjectFault::Drop,
+        Fault::Truncate { .. } => InjectFault::Truncate,
+    }
+}
+
+/// Apply an injected fault to a client->server frame that policy already cleared to
+/// forward. Performs the wire action for the fault and returns the [`InjectEvent`]
+/// to record; the original frame is still tapped into `messages` by the caller (it
+/// genuinely was sent by the client). `Err` means a write to the server failed and
+/// the pump should tear down, mirroring the normal forward path.
+#[allow(clippy::too_many_arguments)]
+async fn apply_c2s_injection(
+    server: &mut ChildStdin,
+    stdout: &SharedStdout,
+    frame: &[u8],
+    id_value: Option<Value>,
+    hit: InjectHit,
+    method: Option<String>,
+    rpc_id: Option<String>,
+    ts_ms: i64,
+    logger: &Logger,
+) -> std::io::Result<InjectEvent> {
+    let kind = fault_kind(&hit.fault);
+    let detail = match hit.fault {
+        Fault::Delay { delay_ms } => {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            forward_frame(server, frame).await?;
+            format!("delayed c2s frame by {delay_ms}ms then forwarded")
+        }
+        Fault::Truncate { bytes } => {
+            // Forward only a prefix, then a '\n': a deliberately corrupt frame.
+            let end = bytes.min(frame.len());
+            let mut corrupt = frame[..end].to_vec();
+            corrupt.push(b'\n');
+            write_all_flush(server, &corrupt).await?;
+            format!("truncated c2s frame to {end} of {} bytes then forwarded", frame.len())
+        }
+        Fault::Drop => {
+            // Withheld from the server, and no reply to the client.
+            "dropped c2s frame (not forwarded)".to_owned()
+        }
+        Fault::Error { code, message } => {
+            // Withhold from the server; answer the client in-protocol instead. A
+            // stdout failure here can never affect server traffic (mirrors a policy
+            // block response), so it is logged, not fatal. A frame with no id (a
+            // notification) has nothing legal to synthesize, so nothing is sent.
+            if let Some(id) = id_value.filter(|v| !v.is_null()) {
+                let mut resp = security::synthesize_error_custom(&id, code, &message);
+                resp.push(b'\n');
+                let mut out = stdout.lock().await;
+                if let Err(e) = write_all_flush(&mut *out, &resp).await {
+                    logger.error(format!("c2s: inject error-response write error: {e}"));
+                }
+            }
+            format!("synthesized error code={code} message={message:?} for c2s frame (server not sent)")
+        }
+    };
+    Ok(InjectEvent {
+        ts_ms,
+        direction: Direction::C2s,
+        rule: hit.rule_label,
+        fault: kind,
+        detail,
+        method,
+        rpc_id,
+    })
+}
+
+/// Apply an injected fault to a server->client frame. Like [`apply_c2s_injection`]
+/// but writes to the shared stdout (there is no server stdin on this leg); the
+/// original server frame is still tapped by the caller so the recording faithfully
+/// reflects what the server emitted. An `error` replaces the frame with a
+/// synthesized error carrying the frame's own id.
+#[allow(clippy::too_many_arguments)]
+async fn apply_s2c_injection(
+    stdout: &SharedStdout,
+    frame: &[u8],
+    id_value: Option<Value>,
+    hit: InjectHit,
+    method: Option<String>,
+    rpc_id: Option<String>,
+    ts_ms: i64,
+) -> std::io::Result<InjectEvent> {
+    let kind = fault_kind(&hit.fault);
+    let detail = match hit.fault {
+        Fault::Delay { delay_ms } => {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let mut out = stdout.lock().await;
+            forward_frame(&mut *out, frame).await?;
+            format!("delayed s2c frame by {delay_ms}ms then delivered")
+        }
+        Fault::Truncate { bytes } => {
+            let end = bytes.min(frame.len());
+            let mut corrupt = frame[..end].to_vec();
+            corrupt.push(b'\n');
+            let mut out = stdout.lock().await;
+            write_all_flush(&mut *out, &corrupt).await?;
+            format!("truncated s2c frame to {end} of {} bytes then delivered", frame.len())
+        }
+        Fault::Drop => "dropped s2c frame (not delivered to client)".to_owned(),
+        Fault::Error { code, message } => {
+            // Replace the frame with an error carrying its id. A frame with no id has
+            // no legal response to synthesize, so nothing is delivered.
+            if let Some(id) = id_value.filter(|v| !v.is_null()) {
+                let mut resp = security::synthesize_error_custom(&id, code, &message);
+                resp.push(b'\n');
+                let mut out = stdout.lock().await;
+                write_all_flush(&mut *out, &resp).await?;
+            }
+            format!("replaced s2c frame with error code={code} message={message:?}")
+        }
+    };
+    Ok(InjectEvent {
+        ts_ms,
+        direction: Direction::S2c,
+        rule: hit.rule_label,
+        fault: kind,
+        detail,
+        method,
+        rpc_id,
+    })
+}
+
+/// Parse just enough of a frame for the injection layer: its `method` (for rule
+/// matching), its raw `id` (to echo in a synthesized error), and the normalized
+/// `rpc_id` text (for the event row). Done once per forwarded frame, and only when
+/// an injector is active — so a run without `--inject` never pays for it.
+pub(crate) fn parse_for_injection(
+    frame: &[u8],
+) -> (Option<String>, Option<Value>, Option<String>) {
+    let value = serde_json::from_slice::<Value>(frame).ok();
+    let method = value
+        .as_ref()
+        .and_then(|v| v.get("method"))
+        .and_then(|m| m.as_str())
+        .map(str::to_owned);
+    let id_value = value.as_ref().and_then(|v| v.get("id").cloned());
+    let rpc_id = id_value.as_ref().and_then(security::normalize_id);
+    (method, id_value, rpc_id)
+}
+
 /// client -> server pump. Unlike a raw copy, this frames the stream and makes a
 /// synchronous policy decision per complete message, so a blocked request is
 /// never forwarded to the server.
@@ -384,6 +653,7 @@ pub(crate) fn log_drop_once(flag: &AtomicBool, logger: &Logger, msg: &str) {
 /// 2. A non-JSON or non-`tools/call` frame forwards (see [`security::decide_c2s_frame`]).
 /// 3. Only an explicit policy block withholds a frame from the server; recording
 ///    and event persistence happen *after* the wire action and are best-effort.
+#[allow(clippy::too_many_arguments)]
 async fn pump_c2s<R>(
     mut reader: R,
     mut server: ChildStdin,
@@ -392,6 +662,7 @@ async fn pump_c2s<R>(
     tx: mpsc::Sender<StorageMsg>,
     logger: Logger,
     max_line_bytes: usize,
+    injector: SharedInjector,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -482,9 +753,51 @@ async fn pump_c2s<R>(
                     // gate forwarding.
                     match decision.action {
                         FrameAction::Forward => {
-                            if let Err(e) = forward_frame(&mut server, &frame).await {
-                                logger.error(format!("c2s: write error: {e}"));
-                                break 'outer;
+                            // Injection layer: only policy-cleared (Forward) frames
+                            // are eligible. Enabled solely by `--inject`; otherwise
+                            // this whole block is skipped and the frame is parsed
+                            // exactly zero extra times.
+                            let injection = if injector.is_some() {
+                                let (method, id_value, rpc_id) = parse_for_injection(&frame);
+                                inject_decide(&injector, InjectDirection::C2s, method.as_deref())
+                                    .map(|hit| (hit, method, id_value, rpc_id))
+                            } else {
+                                None
+                            };
+                            match injection {
+                                None => {
+                                    if let Err(e) = forward_frame(&mut server, &frame).await {
+                                        logger.error(format!("c2s: write error: {e}"));
+                                        break 'outer;
+                                    }
+                                }
+                                Some((hit, method, id_value, rpc_id)) => {
+                                    match apply_c2s_injection(
+                                        &mut server, &stdout, &frame, id_value, hit, method,
+                                        rpc_id, ts, &logger,
+                                    )
+                                    .await
+                                    {
+                                        Ok(ev) => {
+                                            logger.info(format!(
+                                                "inject c2s [{}]: {}",
+                                                ev.fault.as_str(),
+                                                ev.detail
+                                            ));
+                                            if tx.try_send(StorageMsg::Inject(ev)).is_err() {
+                                                log_drop_once(
+                                                    &drop_logged,
+                                                    &logger,
+                                                    "c2s: inject event dropped (channel full/closed)",
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            logger.error(format!("c2s: inject write error: {e}"));
+                                            break 'outer;
+                                        }
+                                    }
+                                }
                             }
                         }
                         FrameAction::BlockWithResponse(resp) => {
@@ -548,6 +861,7 @@ async fn pump_s2c<R>(
     tx: mpsc::Sender<StorageMsg>,
     logger: Logger,
     max_line_bytes: usize,
+    injector: SharedInjector,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -579,12 +893,52 @@ async fn pump_s2c<R>(
                     }
                 }
                 Chunk::Frame(frame) => {
-                    // Forward first — the wire is sacred — as one atomic locked write.
-                    {
-                        let mut out = stdout.lock().await;
-                        if let Err(e) = forward_frame(&mut *out, &frame).await {
-                            logger.error(format!("s2c: write error: {e}"));
-                            break 'outer;
+                    let ts = now_ms();
+                    // Injection layer (enabled only by `--inject`). The server frame
+                    // is always tapped below regardless — the recording reflects what
+                    // the server actually emitted; injection only changes what the
+                    // *client* receives.
+                    let injection = if injector.is_some() {
+                        let (method, id_value, rpc_id) = parse_for_injection(&frame);
+                        inject_decide(&injector, InjectDirection::S2c, method.as_deref())
+                            .map(|hit| (hit, method, id_value, rpc_id))
+                    } else {
+                        None
+                    };
+                    match injection {
+                        None => {
+                            // Forward first — the wire is sacred — as one atomic locked write.
+                            let mut out = stdout.lock().await;
+                            if let Err(e) = forward_frame(&mut *out, &frame).await {
+                                logger.error(format!("s2c: write error: {e}"));
+                                break 'outer;
+                            }
+                        }
+                        Some((hit, method, id_value, rpc_id)) => {
+                            match apply_s2c_injection(
+                                &stdout, &frame, id_value, hit, method, rpc_id, ts,
+                            )
+                            .await
+                            {
+                                Ok(ev) => {
+                                    logger.info(format!(
+                                        "inject s2c [{}]: {}",
+                                        ev.fault.as_str(),
+                                        ev.detail
+                                    ));
+                                    if tx.try_send(StorageMsg::Inject(ev)).is_err() {
+                                        log_drop_once(
+                                            &drop_logged,
+                                            &logger,
+                                            "s2c: inject event dropped (channel full/closed)",
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    logger.error(format!("s2c: inject write error: {e}"));
+                                    break 'outer;
+                                }
+                            }
                         }
                     }
                     // Tap second — best effort. tools/list fingerprinting is done
@@ -592,7 +946,7 @@ async fn pump_s2c<R>(
                     if tx
                         .try_send(StorageMsg::Tap(TapEvent {
                             direction: Direction::S2c,
-                            ts_ms: now_ms(),
+                            ts_ms: ts,
                             raw: frame,
                         }))
                         .is_err()
@@ -697,7 +1051,9 @@ fn resolve_windows_executable(
 /// what protects against `&`/`|`/etc. in args being reinterpreted as shell
 /// operators (the class of bug fixed by CVE-2024-24576) — reintroducing a
 /// manual `cmd` invocation here would defeat that.
-async fn spawn_child(program: &str, args: &[String], logger: &Logger) -> anyhow::Result<Child> {
+// `pub(crate)` so the out-of-band `replay` path can reuse the exact same spawn logic
+// (Windows `.cmd`/`.bat` shim resolution included) when it reconstructs a server.
+pub(crate) async fn spawn_child(program: &str, args: &[String], logger: &Logger) -> anyhow::Result<Child> {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .stdin(Stdio::piped())

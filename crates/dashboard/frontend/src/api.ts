@@ -130,6 +130,26 @@ export function fetchMessageDetail(id: number): Promise<MessageDetail> {
   return getJson<MessageDetail>(`/api/messages/${id}`);
 }
 
+export interface ReplayResult {
+  // Which path ran: "stdio" (server re-spawned) or "http" (fresh HTTP handshake).
+  transport: string;
+  // The server's answer to the replayed request, or null if none was isolated.
+  response_raw: string | null;
+  // Caveats: fresh handshake, possible side effects, not recorded.
+  note: string;
+}
+
+// Re-send a recorded c2s request to its server (out of band, never recorded).
+// On a non-2xx the backend returns a plain-text reason, surfaced as the Error.
+export async function postReplay(id: number): Promise<ReplayResult> {
+  const res = await fetch(`/api/messages/${id}/replay`, { method: "POST" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `replay -> HTTP ${res.status}`);
+  }
+  return (await res.json()) as ReplayResult;
+}
+
 export function fetchSessionStats(sessionId: number): Promise<SessionStats> {
   return getJson<SessionStats>(`/api/sessions/${sessionId}/stats`);
 }
@@ -157,4 +177,31 @@ export function fetchSecurityEvents(
 
 export function fetchSecurityCounts(sessionId: number): Promise<SecurityCounts> {
   return getJson<SecurityCounts>(`/api/sessions/${sessionId}/security/counts`);
+}
+
+// Context-bloat analysis: how many context tokens a session's advertised
+// tool catalog costs, estimated via a zero-dependency chars/4 heuristic —
+// `approximate` is always true, this is never a real tokenizer count.
+export interface ToolBloat {
+  name: string;
+  total_chars: number;
+  est_tokens: number;
+  description_tokens: number;
+  // Share of est_total_tokens, 0-100 (0 when the total is 0).
+  pct: number;
+}
+
+export interface ContextReport {
+  approximate: boolean;
+  tool_count: number;
+  total_chars: number;
+  est_total_tokens: number;
+  // Sorted heaviest-first.
+  tools: ToolBloat[];
+  // Names of tools whose description alone estimates over the fat threshold.
+  fat_tools: string[];
+}
+
+export function fetchContext(sessionId: number): Promise<ContextReport> {
+  return getJson<ContextReport>(`/api/sessions/${sessionId}/context`);
 }

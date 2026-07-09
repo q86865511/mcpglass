@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use policy::fingerprints_from_tools_list_versioned;
 use proxy_core::{parse_line, Direction};
 use storage::{
-    ActionTaken, FingerprintOutcome, Record, SecurityEvent, SecurityEventKind, Store,
+    ActionTaken, FingerprintOutcome, InjectEvent, Record, SecurityEvent, SecurityEventKind, Store,
 };
 use tokio::sync::mpsc;
 
@@ -76,6 +76,9 @@ pub(crate) enum StorageMsg {
     Tap(TapEvent),
     /// Persist a security decision into `security_events`.
     Security(SecurityEvent),
+    /// Persist a fault-injection event into `inject_events`. Best-effort like the
+    /// others: a failed write is logged and dropped, never affecting the wire.
+    Inject(InjectEvent),
 }
 
 /// Drain the storage channel into SQLite. Runs on a blocking thread; a DB failure
@@ -191,6 +194,11 @@ pub(crate) fn storage_loop(
             StorageMsg::Security(ev) => {
                 if let Err(e) = store.insert_security_event(session_id, &ev) {
                     logger.error(format!("security event insert failed (dropped): {e:#}"));
+                }
+            }
+            StorageMsg::Inject(ev) => {
+                if let Err(e) = store.insert_inject_event(session_id, &ev) {
+                    logger.error(format!("inject event insert failed (dropped): {e:#}"));
                 }
             }
         }

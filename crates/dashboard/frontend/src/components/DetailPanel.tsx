@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import type { MessageDetail } from "../api";
-import { fetchMessageDetail } from "../api";
+import type { MessageDetail, ReplayResult } from "../api";
+import { fetchMessageDetail, postReplay } from "../api";
 import { formatClock, formatSize, tryPrettyJson } from "../format";
 
 interface DetailPanelProps {
@@ -11,9 +11,16 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [replaying, setReplaying] = useState(false);
+  const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
+  const [replayError, setReplayError] = useState<string | null>(null);
 
   useEffect(() => {
     setCopied(false);
+    // Any pending replay result belongs to the previously selected message.
+    setReplaying(false);
+    setReplayResult(null);
+    setReplayError(null);
     if (messageId === null) {
       setDetail(null);
       setError(null);
@@ -65,6 +72,24 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
     void navigator.clipboard.writeText(detail.raw).then(() => setCopied(true));
   };
 
+  // Only a client->server request (has a method and an id) can be replayed; a
+  // response, a notification, or an s2c frame has nothing to re-send.
+  const canReplay =
+    detail.direction === "c2s" && detail.method !== null && detail.rpc_id !== null;
+
+  const doReplay = () => {
+    if (!window.confirm("Re-send this request to the server? Side effects may occur.")) {
+      return;
+    }
+    setReplaying(true);
+    setReplayResult(null);
+    setReplayError(null);
+    postReplay(detail.id)
+      .then((r) => setReplayResult(r))
+      .catch((e: unknown) => setReplayError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setReplaying(false));
+  };
+
   return (
     <aside className="detail-panel">
       <div className="detail-header">Message #{detail.id}</div>
@@ -93,6 +118,30 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
         </button>
       </div>
       <pre className="detail-raw mono">{pretty}</pre>
+      {canReplay && (
+        <div className="detail-raw-header">
+          <span>replay</span>
+          <button className="copy-btn" onClick={doReplay} disabled={replaying}>
+            {replaying ? "Replaying…" : "Replay"}
+          </button>
+        </div>
+      )}
+      {replayError && (
+        <div className="empty-hint error-text">Replay failed: {replayError}</div>
+      )}
+      {replayResult && (
+        <>
+          <div className="detail-raw-header">
+            <span>replay response · {replayResult.transport}</span>
+          </div>
+          <pre className="detail-raw mono">
+            {replayResult.response_raw === null
+              ? "(no response captured)"
+              : tryPrettyJson(replayResult.response_raw).pretty}
+          </pre>
+          <div className="empty-hint">{replayResult.note}</div>
+        </>
+      )}
     </aside>
   );
 }

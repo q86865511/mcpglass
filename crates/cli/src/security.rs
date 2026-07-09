@@ -259,9 +259,29 @@ fn synthesize_error(id: &Value, rule: &str) -> Vec<u8> {
     bytes
 }
 
+/// The JSON body of a JSON-RPC error with a caller-chosen `code` and `message`,
+/// *without* a trailing newline. This is the fault-injection counterpart of
+/// [`synthesize_error_body`] (which fixes the code/message to a policy block):
+/// error injection lets the user pick both, so the client sees exactly the failure
+/// they configured. The stdio caller appends the framing `\n`; an HTTP
+/// `application/json` body carries none.
+pub fn synthesize_error_custom(id: &Value, code: i64, message: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    });
+    // Constructed from owned data; cannot fail to serialize.
+    serde_json::to_vec(&body).expect("error response serializes")
+}
+
 /// Normalize a JSON-RPC `id` to the text form used in storage (mirrors
 /// `proxy_core::parse_line`): null -> none, string kept, anything else stringified.
-fn normalize_id(id: &Value) -> Option<String> {
+/// Shared with the injection layer, which records the same `rpc_id` text.
+pub(crate) fn normalize_id(id: &Value) -> Option<String> {
     match id {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),

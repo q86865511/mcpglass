@@ -8,6 +8,8 @@
 mod sse;
 pub use sse::SseSplitter;
 
+pub mod bloat;
+
 /// The MCP protocol version this build targets. Centralised here (per the project
 /// convention that protocol constants live in `proxy-core`) so the stdio wrap and
 /// the HTTP gateway agree on one value — e.g. the `MCP-Protocol-Version` header of

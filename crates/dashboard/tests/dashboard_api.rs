@@ -174,7 +174,9 @@ async fn spawn_server(db_path: PathBuf) -> std::net::SocketAddr {
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut tx = Some(tx);
-        dashboard::serve(db_path, 0, move |addr| {
+        // These API-surface tests don't exercise replay; pass no backend (the
+        // replay endpoint then answers 501, covered separately in cli/tests/replay.rs).
+        dashboard::serve(db_path, 0, None, move |addr| {
             let _ = tx.take().unwrap().send(addr);
         })
         .await
@@ -461,6 +463,110 @@ async fn empty_db_yields_empty_lists_not_errors() {
     assert_eq!(counts["secret_leak"].as_u64().unwrap(), 0);
     assert_eq!(counts["fingerprint_change"].as_u64().unwrap(), 0);
     assert_eq!(counts["blocked"].as_u64().unwrap(), 0);
+
+    // --- /api/sessions/{id}/context on a session that doesn't exist: the
+    // zeroed empty shape, not an error ---
+    let context: serde_json::Value = client
+        .get(format!("{base}/api/sessions/9999/context"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(context["approximate"], serde_json::json!(true));
+    assert_eq!(context["tool_count"].as_u64().unwrap(), 0);
+    assert_eq!(context["total_chars"].as_u64().unwrap(), 0);
+    assert_eq!(context["est_total_tokens"].as_u64().unwrap(), 0);
+    assert_eq!(context["tools"].as_array().unwrap().len(), 0);
+    assert_eq!(context["fat_tools"].as_array().unwrap().len(), 0);
+}
+
+/// `GET /api/sessions/{id}/context`: a session with a captured `tools/list`
+/// round-trip returns a bloat report shaped like `proxy_core::bloat::BloatReport`
+/// (approximate, sorted heaviest-first, `pct` derived from the totals).
+#[tokio::test]
+async fn session_context_endpoint_returns_bloat_report() {
+    let tmp = TempDir::new("context");
+    let store = Store::open(&tmp.db()).unwrap();
+    let sid = store.begin_session("ctx-fixture", "echo").unwrap();
+
+    store
+        .insert(sid, &rec(Direction::C2s, 1, r#"{"id":1,"method":"tools/list"}"#))
+        .unwrap();
+    // A "fat" tool (description > 100 est. tokens = 400 chars) and a small one.
+    let fat_description = "x".repeat(500);
+    let resp = format!(
+        r#"{{"id":1,"result":{{"tools":[
+            {{"name":"fat_tool","description":"{fat_description}","inputSchema":{{"type":"object"}}}},
+            {{"name":"tiny_tool","description":"hi"}}
+        ]}}}}"#
+    );
+    store.insert(sid, &rec(Direction::S2c, 2, &resp)).unwrap();
+    store.end_session(sid).unwrap();
+
+    let addr = spawn_server(tmp.db()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    let context: serde_json::Value = client
+        .get(format!("{base}/api/sessions/{sid}/context"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(context["approximate"], serde_json::json!(true));
+    assert_eq!(context["tool_count"].as_u64().unwrap(), 2);
+    assert!(context["total_chars"].as_u64().unwrap() > 0);
+    assert!(context["est_total_tokens"].as_u64().unwrap() > 0);
+
+    let tools = context["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    // Heaviest first: the fat tool's long description dwarfs the tiny one's.
+    assert_eq!(tools[0]["name"], "fat_tool");
+    assert_eq!(tools[1]["name"], "tiny_tool");
+    let pct_sum: f64 = tools.iter().map(|t| t["pct"].as_f64().unwrap()).sum();
+    assert!((pct_sum - 100.0).abs() < 1.0, "pct across tools should sum to ~100: {pct_sum}");
+
+    let fat_tools = context["fat_tools"].as_array().unwrap();
+    assert_eq!(fat_tools.len(), 1);
+    assert_eq!(fat_tools[0], "fat_tool");
+}
+
+/// A session that has never sent a `tools/list` request answers with the
+/// zeroed empty shape (200), not an error.
+#[tokio::test]
+async fn session_context_endpoint_empty_state_without_tools_list() {
+    let tmp = TempDir::new("context-empty");
+    let store = Store::open(&tmp.db()).unwrap();
+    let sid = store.begin_session("no-tools-list", "echo").unwrap();
+    store
+        .insert(sid, &rec(Direction::C2s, 1, r#"{"id":1,"method":"ping"}"#))
+        .unwrap();
+    store.end_session(sid).unwrap();
+
+    let addr = spawn_server(tmp.db()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    let context: serde_json::Value = client
+        .get(format!("{base}/api/sessions/{sid}/context"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(context["approximate"], serde_json::json!(true));
+    assert_eq!(context["tool_count"].as_u64().unwrap(), 0);
+    assert_eq!(context["tools"].as_array().unwrap().len(), 0);
+    assert_eq!(context["fat_tools"].as_array().unwrap().len(), 0);
 }
 
 /// Hand-build a v0 file: the old single-table schema, `user_version` left 0.
@@ -534,6 +640,69 @@ async fn legacy_v0_db_sees_data_after_writer_migrates_it() {
         "dashboard must pick up the writer's migration, not stay pinned to the pre-migration empty store"
     );
     assert_eq!(sessions[0]["id"].as_i64().unwrap(), sid);
+}
+
+/// DNS-rebinding / CSRF gate: the dashboard binds loopback but must still reject
+/// requests whose `Origin`/`Host` don't look loopback, so a rebound browser or a
+/// no-preflight CORS request can't reach a handler (esp. the side-effecting replay
+/// endpoint). Covers a read-only GET and the `POST /replay` route; confirms the
+/// gate never fires for the normal loopback-Host / no-Origin request the existing
+/// tests already rely on.
+#[tokio::test]
+async fn rejects_non_loopback_origin_and_host() {
+    let (tmp, sid) = build_fixture();
+    let addr = spawn_server(tmp.db()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    // Baseline: a normal loopback request (reqwest sends `Host: 127.0.0.1:{port}`,
+    // no `Origin`) passes through to the handler.
+    let ok = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+
+    // A forged `Host` naming an attacker domain (the DNS-rebinding case) -> 403,
+    // on a plain read-only GET.
+    let forged_host_get = client
+        .get(format!("{base}/api/sessions"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged_host_get.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // A non-loopback `Origin` (cross-site fetch) -> 403.
+    let forged_origin = client
+        .get(format!("{base}/api/sessions"))
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged_origin.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // The side-effecting replay endpoint: a forged Host is stopped at the gate
+    // (403) before it can spawn/re-send. A loopback request would instead reach
+    // the handler and get 501 here (no replay backend wired in these tests).
+    let forged_replay = client
+        .post(format!("{base}/api/messages/{sid}/replay"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged_replay.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Same replay path, but loopback: passes the gate, reaches the handler ->
+    // 501 (backend absent), proving the gate isn't blanket-blocking POSTs.
+    let ok_replay = client
+        .post(format!("{base}/api/messages/{sid}/replay"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_replay.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
 }
 
 /// `on_ready` must fire with an address the listener actually bound to a real
