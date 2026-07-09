@@ -73,36 +73,52 @@ async fn spawn_gateway(tag: &str, policy_toml: &str, upstreams: &[(&str, String)
     let log = dir.0.join("mcpglass.log");
     let policy = dir.0.join("policy.toml");
     std::fs::write(&policy, policy_toml).unwrap();
-    let port = free_port();
+    // free_port() releases its socket before the gateway re-binds the number, so a
+    // concurrently starting test can be handed the same ephemeral port (Linux reuses
+    // them eagerly). The loser exits at bind time while a bare TCP probe happily
+    // connects to the *other* test's gateway — so retry on a fresh port whenever our
+    // child died, and only accept a port once our child is both alive and accepting.
+    let mut launched = None;
+    for _ in 0..5 {
+        let port = free_port();
+        let mut cmd = Command::new(MCPGLASS);
+        cmd.args([
+            "gateway",
+            "--port",
+            &port.to_string(),
+            "--db",
+            db.to_str().unwrap(),
+            "--log",
+            log.to_str().unwrap(),
+            "--policy",
+            policy.to_str().unwrap(),
+        ]);
+        for (name, url) in upstreams {
+            cmd.arg("--upstream").arg(format!("{name}={url}"));
+        }
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("spawn gateway");
 
-    let mut cmd = Command::new(MCPGLASS);
-    cmd.args([
-        "gateway",
-        "--port",
-        &port.to_string(),
-        "--db",
-        db.to_str().unwrap(),
-        "--log",
-        log.to_str().unwrap(),
-        "--policy",
-        policy.to_str().unwrap(),
-    ]);
-    for (name, url) in upstreams {
-        cmd.arg("--upstream").arg(format!("{name}={url}"));
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::null());
-    let child = cmd.spawn().expect("spawn gateway");
-
-    // Wait for the listener to come up.
-    let mut up = false;
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            up = true;
+        // Wait for the listener to come up (or the child to lose the bind race).
+        let mut up = false;
+        for _ in 0..100 {
+            if child.try_wait().expect("poll gateway child").is_some() {
+                break;
+            }
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        if up && child.try_wait().expect("poll gateway child").is_none() {
+            launched = Some((child, port));
             break;
         }
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    assert!(up, "gateway did not come up on port {port}");
+    let (child, port) = launched.expect("gateway did not come up after 5 port attempts");
 
     Gateway {
         child,
