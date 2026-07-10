@@ -8,6 +8,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Differential conformance CI** — a new `Conformance` workflow runs the official
+  MCP conformance suite (`@modelcontextprotocol/conformance`) twice against the same
+  reference server (`server-everything`): once connected directly and once through an
+  mcpglass gateway. `scripts/conformance-diff.mjs` asserts the proxied run fails no
+  scenario the direct run passes, so a transparency regression in the gateway turns
+  the build red, while the reference server's own conformance gaps (which fail both
+  runs) are ignored. The job also asserts the gateway recorded a negotiated
+  `protocol_version` for the session, and soft-skips if the third-party reference
+  server can't be fetched or started.
 - **MCP 2025-11-25 support** — the proxy tracks the current MCP spec. The parser and
   tap treat every 2025-11-25 wire addition (tasks, icons, `sampling` tool calls,
   URL-mode elicitation, SSE resumption) as pure pass-through, forwarding and recording
