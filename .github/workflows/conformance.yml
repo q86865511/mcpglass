@@ -1,0 +1,134 @@
+name: Conformance
+
+# Differential MCP conformance gate.
+#
+# The official conformance suite is run twice against the SAME reference server:
+# once connected directly (baseline), once through an mcpglass gateway (proxied).
+# Because the gateway is a transparent tap, the proxied run must not fail any
+# scenario the baseline run passes — `scripts/conformance-diff.mjs` enforces that
+# subset relation. The reference server (`server-everything`) has its own
+# conformance gaps; those failures appear in BOTH runs and are ignored by the gate.
+#
+# The reference server and the conformance suite are third-party npm packages, so a
+# registry/network outage would otherwise turn this into a flaky red. When the
+# reference server can't be started the job exits 0 with a note in the run summary
+# (a soft skip) rather than failing — GitHub Actions has no native "neutral" for a
+# normal job, so this is the pragmatic equivalent.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  # Exact-pinned so a new upstream release can never silently change the gate.
+  CONFORMANCE_PKG: "@modelcontextprotocol/conformance@0.1.16"
+  EVERYTHING_PKG: "@modelcontextprotocol/server-everything@2026.7.4"
+  EVERYTHING_PORT: "3001"
+  GATEWAY_PORT: "7412"
+  GATEWAY_DB: "/tmp/mcpglass-conf.db"
+
+jobs:
+  differential-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The dashboard UI is not exercised here (the gateway never serves it), so we
+      # skip the pnpm frontend build: dashboard/build.rs emits a placeholder page
+      # when no dist/ is present and the proxy hot path is unaffected. Keeps this job
+      # independent of the frontend toolchain.
+      - name: Build gateway
+        run: cargo build -p cli
+
+      - name: Differential conformance
+        run: |
+          set -uo pipefail
+          DIRECT_URL="http://localhost:${EVERYTHING_PORT}/mcp"
+          PROXY_URL="http://127.0.0.1:${GATEWAY_PORT}/u/everything"
+          SPEC_VERSIONS="2025-06-18 2025-11-25"
+          BIN="./target/debug/mcpglass"
+
+          note_skip() {
+            echo "$1"
+            {
+              echo "### Conformance: soft-skipped :warning:"
+              echo ""
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          wait_for_port() {
+            # $1 host, $2 port, $3 timeout seconds
+            for _ in $(seq 1 "$3"); do
+              if (echo > "/dev/tcp/$1/$2") 2>/dev/null; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          # --- Start the reference server (soft-skip if it can't come up) ----------
+          echo "Starting reference server: $EVERYTHING_PKG"
+          npx -y "$EVERYTHING_PKG" streamableHttp > everything.log 2>&1 &
+          EVERYTHING_PID=$!
+          if ! wait_for_port localhost "$EVERYTHING_PORT" 60; then
+            echo "----- server-everything log -----"; cat everything.log || true
+            note_skip "Reference server (\`$EVERYTHING_PKG\`) did not start within 60s (likely an npm/network issue). Skipping the conformance gate."
+          fi
+          echo "Reference server is up on port $EVERYTHING_PORT."
+
+          # --- Start the mcpglass gateway (a real failure here IS a gate failure) --
+          echo "Starting mcpglass gateway on port $GATEWAY_PORT -> $DIRECT_URL"
+          "$BIN" gateway --upstream "everything=${DIRECT_URL}" --port "$GATEWAY_PORT" --db "$GATEWAY_DB" > gateway.log 2>&1 &
+          GATEWAY_PID=$!
+          if ! wait_for_port 127.0.0.1 "$GATEWAY_PORT" 30; then
+            echo "----- gateway log -----"; cat gateway.log || true
+            echo "::error::mcpglass gateway failed to bind port $GATEWAY_PORT"
+            exit 1
+          fi
+          echo "Gateway is up."
+
+          # --- Run the suite twice per spec version, then diff --------------------
+          # Conformance exits non-zero when scenarios fail; that is expected here
+          # (the reference server has known gaps), so the exit code is ignored and
+          # the diff script is the sole source of truth.
+          FAIL=0
+          for V in $SPEC_VERSIONS; do
+            echo "=== spec-version $V: baseline (direct) ==="
+            npx -y "$CONFORMANCE_PKG" server --url "$DIRECT_URL" --spec-version "$V" -o "base-$V" 2>&1 | tail -2 || true
+            echo "=== spec-version $V: proxied (through gateway) ==="
+            npx -y "$CONFORMANCE_PKG" server --url "$PROXY_URL" --spec-version "$V" -o "prox-$V" 2>&1 | tail -2 || true
+            echo "=== spec-version $V: diff ==="
+            if node scripts/conformance-diff.mjs "base-$V" "prox-$V" --label "$V"; then
+              echo "spec-version $V: no proxy-induced failures" >> "$GITHUB_STEP_SUMMARY"
+            else
+              FAIL=1
+              echo ":x: spec-version $V: proxy-induced conformance failure(s) — see job log" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          # --- Observability assertion: the gateway recorded a negotiated version --
+          echo "=== asserting sessions.protocol_version was recorded ==="
+          if ! node --experimental-sqlite scripts/assert-protocol-version.mjs "$GATEWAY_DB"; then
+            echo "::error::gateway did not record any session protocol_version"
+            FAIL=1
+          fi
+
+          # --- Teardown ------------------------------------------------------------
+          kill "$GATEWAY_PID" "$EVERYTHING_PID" 2>/dev/null || true
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::differential conformance gate failed"
+            exit 1
+          fi
+          echo "Differential conformance passed: the gateway introduced no new failures." >> "$GITHUB_STEP_SUMMARY"
