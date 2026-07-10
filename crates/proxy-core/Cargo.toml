@@ -13,3 +13,11 @@ description = "JSON-RPC parsing, framing, SSE splitting, and MCP protocol versio
 
 [dependencies]
 serde_json.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+# Micro-benchmark for the JSON-RPC framing/parse hot path (see docs/benchmarks.md).
+[[bench]]
+name = "parse_line"
+harness = false
