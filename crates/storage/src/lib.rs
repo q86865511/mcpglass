@@ -37,7 +37,16 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 /// other table, so unlike the v2/v3/v4 bumps there is no `ALTER TABLE` step —
 /// a brand-new table needs no separate migration function, the batch's
 /// `IF NOT EXISTS` already makes it additive on an upgraded file.
-const SCHEMA_VERSION: i64 = 5;
+///
+/// v5 -> v6 is additive again: it adds three nullable columns to `sessions` —
+/// `protocol_version` (the version the server selected), `client_protocol_version`
+/// (the version the client proposed), and `protocol_version_source`
+/// (`'initialize'` | `'header'`, how the version was observed) — via
+/// `ALTER TABLE ADD COLUMN`, so existing session rows are preserved with all three
+/// left NULL (a legacy session simply has no recorded protocol version). This lets
+/// replay reconstruct a session with the version it actually negotiated instead of
+/// the build's default constant.
+const SCHEMA_VERSION: i64 = 6;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -60,6 +69,18 @@ pub struct SessionSummary {
     pub started_at_ms: i64,
     pub ended_at_ms: Option<i64>,
     pub message_count: u64,
+    /// The MCP protocol version the server *selected* (from the `initialize`
+    /// response, or an `MCP-Protocol-Version` header). `None` for a session with
+    /// no observed handshake (e.g. a legacy pre-v6 row, or stdio traffic that never
+    /// carried an `initialize`).
+    pub protocol_version: Option<String>,
+    /// The MCP protocol version the client *proposed* (from the `initialize`
+    /// request `params.protocolVersion`). `None` when unobserved.
+    pub client_protocol_version: Option<String>,
+    /// How the protocol version was observed: `"initialize"` (the handshake) or
+    /// `"header"` (an `MCP-Protocol-Version` header on an HTTP request). `None` when
+    /// no version was observed.
+    pub protocol_version_source: Option<String>,
 }
 
 /// Filter + page window for [`Store::messages`]. All fields optional except the
@@ -397,16 +418,19 @@ impl Store {
         // and skips the ALTERs.
         self.migrate_v3_add_server_key()?;
         self.migrate_v4_add_fp_columns()?;
+        self.migrate_v6_add_session_protocol_columns()?;
 
-        // BEGIN/COMMIT makes table creation and the `user_version = 5` stamp one
+        // BEGIN/COMMIT makes table creation and the `user_version = 6` stamp one
         // atomic unit, so a concurrent reader's legacy-v0 probe (see
         // `is_legacy_v0`) can never observe the `messages` table mid-creation
         // with `user_version` still at 0 and misclassify a fresh db as v0.
         //
-        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4/v5 upgrade additive:
-        // on an existing file the sessions/messages tables are left untouched, any
-        // missing tables (including `inject_events` on a pre-v5 file) are appended,
-        // and `user_version` is bumped to 5.
+        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4/v5/v6 upgrade
+        // additive: on an existing file the sessions/messages tables are left
+        // untouched, any missing tables (including `inject_events` on a pre-v5 file)
+        // are appended, and `user_version` is bumped to 6. The `sessions` columns
+        // added at v6 are patched onto an existing table above; a fresh db builds
+        // them from the CREATE here.
         self.conn
             .execute_batch(
                 "BEGIN;
@@ -415,7 +439,10 @@ impl Store {
                     label         TEXT    NOT NULL,
                     command       TEXT    NOT NULL,
                     started_at_ms INTEGER NOT NULL,
-                    ended_at_ms   INTEGER
+                    ended_at_ms   INTEGER,
+                    protocol_version        TEXT,
+                    client_protocol_version TEXT,
+                    protocol_version_source TEXT CHECK (protocol_version_source IN ('initialize','header'))
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -469,10 +496,10 @@ impl Store {
                 );
                 CREATE INDEX IF NOT EXISTS idx_inject_events_session_id
                     ON inject_events(session_id, id);
-                PRAGMA user_version = 5;
+                PRAGMA user_version = 6;
                 COMMIT;",
             )
-            .context("creating v5 schema")?;
+            .context("creating v6 schema")?;
         Ok(())
     }
 
@@ -555,6 +582,54 @@ impl Store {
         Ok(())
     }
 
+    /// Add the `protocol_version`, `client_protocol_version` and
+    /// `protocol_version_source` columns to a pre-v6 `sessions` table so a session
+    /// records the MCP protocol version it negotiated. All three are nullable, so
+    /// existing rows backfill to NULL (a legacy session has no observed version). A
+    /// no-op when the table is absent (fresh db, handled by the CREATE in
+    /// [`Store::init_schema`]) or the columns already exist (a v6 file).
+    ///
+    /// Kept separate from the CREATE batch, and gated on an explicit column probe,
+    /// for the same reason as [`Store::migrate_v3_add_server_key`]: `ALTER TABLE ADD
+    /// COLUMN` is not conditional in SQLite, so running it on an existing column is
+    /// an error. The `protocol_version_source` CHECK constraint added here matches
+    /// the CREATE; a NULL backfill passes it (a CHECK only rejects an explicit
+    /// out-of-set value).
+    fn migrate_v6_add_session_protocol_columns(&self) -> Result<()> {
+        let table_exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !table_exists {
+            return Ok(());
+        }
+        for (col, decl) in [
+            ("protocol_version", "protocol_version TEXT"),
+            ("client_protocol_version", "client_protocol_version TEXT"),
+            (
+                "protocol_version_source",
+                "protocol_version_source TEXT CHECK (protocol_version_source IN ('initialize','header'))",
+            ),
+        ] {
+            let has_col: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                params![col],
+                |r| r.get(0),
+            )?;
+            if has_col == 0 {
+                self.conn
+                    .execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {decl}"))
+                    .with_context(|| format!("adding {col} column (v5 -> v6)"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Open a new session; returns its id. Call once per `wrap` invocation.
     pub fn begin_session(&self, label: &str, command: &str) -> Result<i64> {
         self.conn
@@ -574,6 +649,34 @@ impl Store {
                 params![id, now_ms()],
             )
             .context("ending session")?;
+        Ok(())
+    }
+
+    /// Record the MCP protocol version observed for a session. `negotiated` is the
+    /// version the server selected, `client_proposed` the version the client
+    /// offered, and `source` how it was seen (`"initialize"` for the handshake,
+    /// `"header"` for an `MCP-Protocol-Version` header). Best-effort like the other
+    /// writers: any failure is returned so the caller (a storage thread off the wire
+    /// path) can log-and-continue. The precedence rule (`initialize` wins over
+    /// `header`, `header` writes only once) lives in the caller, not here — this is a
+    /// plain `UPDATE`.
+    pub fn set_session_protocol(
+        &self,
+        session_id: i64,
+        client_proposed: Option<&str>,
+        negotiated: Option<&str>,
+        source: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions
+                    SET protocol_version = ?2,
+                        client_protocol_version = ?3,
+                        protocol_version_source = ?4
+                 WHERE id = ?1",
+                params![session_id, negotiated, client_proposed, source],
+            )
+            .context("recording session protocol version")?;
         Ok(())
     }
 
@@ -604,21 +707,13 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.label, s.command, s.started_at_ms, s.ended_at_ms,
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                    s.protocol_version, s.client_protocol_version, s.protocol_version_source
              FROM sessions s
              ORDER BY s.id DESC",
         )?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(SessionSummary {
-                    id: r.get(0)?,
-                    label: r.get(1)?,
-                    command: r.get(2)?,
-                    started_at_ms: r.get(3)?,
-                    ended_at_ms: r.get(4)?,
-                    message_count: r.get::<_, i64>(5)? as u64,
-                })
-            })?
+            .query_map([], map_session_summary)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -630,20 +725,12 @@ impl Store {
             .conn
             .query_row(
                 "SELECT s.id, s.label, s.command, s.started_at_ms, s.ended_at_ms,
-                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                        s.protocol_version, s.client_protocol_version, s.protocol_version_source
                  FROM sessions s
                  WHERE s.id = ?1",
                 params![id],
-                |r| {
-                    Ok(SessionSummary {
-                        id: r.get(0)?,
-                        label: r.get(1)?,
-                        command: r.get(2)?,
-                        started_at_ms: r.get(3)?,
-                        ended_at_ms: r.get(4)?,
-                        message_count: r.get::<_, i64>(5)? as u64,
-                    })
-                },
+                map_session_summary,
             )
             .optional()?;
         Ok(row)
@@ -834,8 +921,8 @@ impl Store {
         Ok(())
     }
 
-    /// Record an observed tool definition — hashed under both algorithm versions
-    /// (`fp_v1`, `fp_v2`) — under `server_key` and classify it against history:
+    /// Record an observed tool definition — hashed under every algorithm version
+    /// (`fp_v1`, `fp_v2`, `fp_v3`) — under `server_key` and classify it against history:
     ///
     /// - `New`: first fingerprint ever seen for this `(server_key, tool)`.
     /// - `Unchanged`: matches the *most recent* recorded fingerprint.
@@ -851,11 +938,12 @@ impl Store {
     /// server that flips a tool between two definitions is caught each way — a plain
     /// set-membership check would silently accept the flip-back.
     ///
-    /// **Dual-hash migration.** A stored row hashed under v1 is compared on `fp_v1`;
-    /// a v2 row on `fp_v2`. When a v1 row still matches on v1, it is silently
-    /// re-pinned to v2 (its `fingerprint`/`fp_version` are rewritten to the v2 hash)
-    /// and reported `Unchanged` — no false-positive alert for the algorithm bump.
-    /// A v1 *mismatch* is a genuine change and alerts as usual.
+    /// **Dual-hash migration.** A stored row is compared on the hash matching its own
+    /// `fp_version` (`fp_v1` for a v1 row, `fp_v2` for a v2 row, `fp_v3` otherwise).
+    /// When an older row still matches on its version's hash, it is silently re-pinned
+    /// to the current algorithm (its `fingerprint`/`fp_version` are rewritten to
+    /// `fp_v3`) and reported `Unchanged` — no false-positive alert for the algorithm
+    /// bump. An older-version *mismatch* is a genuine change and alerts as usual.
     ///
     /// The comparison scope is `(server_key, tool_name)` and deliberately spans
     /// sessions: the canonical rug-pull is a server approved on one `wrap` that then
@@ -865,6 +953,7 @@ impl Store {
     /// the prior one(s); `Unchanged`/`Reverted` only refresh an existing row's
     /// `last_seen_ts_ms` (and re-pin a v1 row), so a tool's fingerprint history is
     /// preserved.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_fingerprint(
         &self,
         session_id: i64,
@@ -872,6 +961,7 @@ impl Store {
         tool_name: &str,
         fp_v1: &str,
         fp_v2: &str,
+        fp_v3: &str,
         ts_ms: i64,
     ) -> Result<FingerprintOutcome> {
         // Load history for this (server, tool), most recent observation first. A
@@ -888,47 +978,48 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        // First sighting: pin the v2 baseline and stay silent.
+        // First sighting: pin the current (v3) baseline and stay silent.
         if rows.is_empty() {
-            self.insert_fingerprint(session_id, server_key, tool_name, fp_v2, ts_ms)?;
+            self.insert_fingerprint(session_id, server_key, tool_name, fp_v3, ts_ms)?;
             return Ok(FingerprintOutcome::New);
         }
 
-        // Does the observation match a stored row? A v1 row is compared on the v1
-        // hash (dual-hash transition), a v2 row on the v2 hash.
+        // Does the observation match a stored row? Each row is compared on the hash
+        // matching its own algorithm version (dual-hash transition): a v1 row on the
+        // v1 hash, a v2 row on the v2 hash, a v3 (or newer) row on the v3 hash.
         let matches = |fingerprint: &str, fp_version: i64| -> bool {
-            if fp_version <= 1 {
-                fingerprint == fp_v1
-            } else {
-                fingerprint == fp_v2
+            match fp_version {
+                v if v <= 1 => fingerprint == fp_v1,
+                2 => fingerprint == fp_v2,
+                _ => fingerprint == fp_v3,
             }
         };
 
         // Matches the current (most-recent) definition -> Unchanged.
         let (latest_id, latest_fp, latest_ver) = &rows[0];
         if matches(latest_fp, *latest_ver) {
-            self.touch_fingerprint(*latest_id, *latest_ver, fp_v2, ts_ms)?;
+            self.touch_fingerprint(*latest_id, *latest_ver, fp_v3, ts_ms)?;
             return Ok(FingerprintOutcome::Unchanged);
         }
 
         // Matches an older definition -> the tool oscillated back (Reverted).
         if let Some((id, _, ver)) = rows.iter().find(|(_, fp, ver)| matches(fp, *ver)) {
-            self.touch_fingerprint(*id, *ver, fp_v2, ts_ms)?;
+            self.touch_fingerprint(*id, *ver, fp_v3, ts_ms)?;
             return Ok(FingerprintOutcome::Reverted);
         }
 
         // A definition never seen before for this (server, tool) -> Changed.
-        self.insert_fingerprint(session_id, server_key, tool_name, fp_v2, ts_ms)?;
+        self.insert_fingerprint(session_id, server_key, tool_name, fp_v3, ts_ms)?;
         Ok(FingerprintOutcome::Changed)
     }
 
-    /// Insert a fresh v2 fingerprint row (first_seen == last_seen == `ts_ms`).
+    /// Insert a fresh v3 fingerprint row (first_seen == last_seen == `ts_ms`).
     fn insert_fingerprint(
         &self,
         session_id: i64,
         server_key: &str,
         tool_name: &str,
-        fp_v2: &str,
+        fp_v3: &str,
         ts_ms: i64,
     ) -> Result<()> {
         self.conn
@@ -936,30 +1027,31 @@ impl Store {
                 "INSERT INTO tool_fingerprints
                     (session_id, server_key, tool_name, fingerprint,
                      first_seen_ts_ms, last_seen_ts_ms, fp_version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 2)",
-                params![session_id, server_key, tool_name, fp_v2, ts_ms],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 3)",
+                params![session_id, server_key, tool_name, fp_v3, ts_ms],
             )
             .context("recording tool fingerprint")?;
         Ok(())
     }
 
-    /// Refresh a matched row's `last_seen_ts_ms`. A legacy v1 row is additionally
-    /// re-pinned to v2 (its `fingerprint` becomes `fp_v2`, `fp_version` becomes 2),
-    /// folding the current annotations into the baseline without an alert. A v2 row
-    /// keeps its fingerprint (already `fp_v2`), avoiding any UNIQUE churn.
+    /// Refresh a matched row's `last_seen_ts_ms`. A legacy row hashed under an older
+    /// algorithm (`fp_version < 3`) is additionally re-pinned to v3 (its `fingerprint`
+    /// becomes `fp_v3`, `fp_version` becomes 3), folding the fields the newer algorithm
+    /// covers (annotations, outputSchema) into the baseline without an alert. A v3 row
+    /// keeps its fingerprint (already `fp_v3`), avoiding any UNIQUE churn.
     fn touch_fingerprint(
         &self,
         id: i64,
         fp_version: i64,
-        fp_v2: &str,
+        fp_v3: &str,
         ts_ms: i64,
     ) -> Result<()> {
-        if fp_version <= 1 {
+        if fp_version < 3 {
             self.conn.execute(
                 "UPDATE tool_fingerprints
-                    SET last_seen_ts_ms = ?2, fingerprint = ?3, fp_version = 2
+                    SET last_seen_ts_ms = ?2, fingerprint = ?3, fp_version = 3
                  WHERE id = ?1",
-                params![id, ts_ms, fp_v2],
+                params![id, ts_ms, fp_v3],
             )
         } else {
             self.conn.execute(
@@ -1119,6 +1211,23 @@ fn build_where(session_id: i64, f: &MessageFilter) -> (String, Vec<Value>) {
         params.push(Value::Text(q.clone()));
     }
     (clauses.join(" AND "), params)
+}
+
+/// Map a `sessions` row (joined with its live message count and the three v6
+/// protocol columns, in that column order) to a [`SessionSummary`]. Shared by
+/// [`Store::list_sessions`] and [`Store::session`].
+fn map_session_summary(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
+    Ok(SessionSummary {
+        id: r.get(0)?,
+        label: r.get(1)?,
+        command: r.get(2)?,
+        started_at_ms: r.get(3)?,
+        ended_at_ms: r.get(4)?,
+        message_count: r.get::<_, i64>(5)? as u64,
+        protocol_version: r.get(6)?,
+        client_protocol_version: r.get(7)?,
+        protocol_version_source: r.get(8)?,
+    })
 }
 
 fn map_message_row(r: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
@@ -1331,12 +1440,12 @@ mod tests {
         }
     }
 
-    /// Record a fingerprint on a fresh (all-v2) db: `fp` is the v2 hash and the v1
-    /// hash is a distinct derived string. Since fresh-db rows are all v2, matching
-    /// keys on the v2 value, so `fp` alone drives New/Unchanged/Changed/Reverted.
+    /// Record a fingerprint on a fresh (all-v3) db: `fp` is the v3 hash and the v1/v2
+    /// hashes are distinct derived strings. Since fresh-db rows are all v3, matching
+    /// keys on the v3 value, so `fp` alone drives New/Unchanged/Changed/Reverted.
     fn rf(store: &Store, sid: i64, srv: &str, tool: &str, fp: &str, ts: i64) -> FingerprintOutcome {
         store
-            .record_fingerprint(sid, srv, tool, &format!("{fp}-v1"), fp, ts)
+            .record_fingerprint(sid, srv, tool, &format!("{fp}-v1"), &format!("{fp}-v2"), fp, ts)
             .unwrap()
     }
 
@@ -1691,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_to_v5_additive_upgrade_preserves_data() {
+    fn v1_to_v6_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v1-upgrade");
         let db = tmp.db();
         write_legacy_v1_db(&db);
@@ -1703,7 +1812,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
 
         // ...without disturbing the pre-existing v1 data.
         let sessions = store.list_sessions().unwrap();
@@ -1801,18 +1910,18 @@ mod tests {
     }
 
     #[test]
-    fn v2_to_v5_additive_upgrade_preserves_data() {
+    fn v2_to_v6_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v2-upgrade");
         let db = tmp.db();
         write_legacy_v2_db(&db);
 
-        // Opening a v2 file upgrades it in place to v5 via ALTER TABLE ADD COLUMN...
+        // Opening a v2 file upgrades it in place to v6 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         // ...preserving all pre-existing v2 rows (sessions/messages/events).
         let sessions = store.list_sessions().unwrap();
@@ -1837,13 +1946,13 @@ mod tests {
         // New fingerprints record under the v3 server_key scope on the upgraded file.
         assert_eq!(rf(&store, 1, "srv", "t", "fp", 200), FingerprintOutcome::New);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v5.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v6.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 5);
+        assert_eq!(version2, 6);
     }
 
     #[test]
@@ -2092,18 +2201,18 @@ mod tests {
     }
 
     #[test]
-    fn v3_to_v5_additive_upgrade_preserves_and_backfills_fingerprints() {
+    fn v3_to_v6_additive_upgrade_preserves_and_backfills_fingerprints() {
         let tmp = TempDir::new("v3-upgrade");
         let db = tmp.db();
         write_legacy_v3_db(&db, "legacy_v1");
 
-        // Opening a v3 file upgrades it in place to v5 via ALTER TABLE ADD COLUMN...
+        // Opening a v3 file upgrades it in place to v6 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         // ...the legacy fingerprint row survives, backfilled to fp_version=1 with a
         // NULL last_seen_ts_ms (recency then falls back to first_seen_ts_ms).
@@ -2118,18 +2227,18 @@ mod tests {
         assert_eq!(fp_version, 1);
         assert_eq!(last_seen, None);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v5.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v6.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 5);
+        assert_eq!(version2, 6);
     }
 
     #[test]
     fn record_fingerprint_dual_hash_silently_repins_matching_v1_row() {
-        // A legacy v1 row whose v1 hash still matches is re-pinned to v2 with no
+        // A legacy v1 row whose v1 hash still matches is re-pinned to v3 with no
         // alert (Unchanged) — the algorithm bump must not be a false positive.
         let tmp = TempDir::new("fp-dualhash-repin");
         let db = tmp.db();
@@ -2138,7 +2247,7 @@ mod tests {
 
         // v1 matches the stored legacy hash -> Unchanged, and the row is re-pinned.
         assert_eq!(
-            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashA", 200).unwrap(),
+            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashA", "v3hashA", 200).unwrap(),
             FingerprintOutcome::Unchanged
         );
         let (fp_version, fingerprint): (i64, String) = store
@@ -2149,13 +2258,13 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(fp_version, 2, "legacy v1 row should be re-pinned to v2");
-        assert_eq!(fingerprint, "v2hashA");
+        assert_eq!(fp_version, 3, "legacy v1 row should be re-pinned to v3");
+        assert_eq!(fingerprint, "v3hashA");
 
-        // Now that the baseline folds in annotations, a later annotations-only change
-        // (same v1, different v2) IS detected as a change.
+        // Now that the baseline folds in annotations + outputSchema, a later change to
+        // one of those (same v1, different v3) IS detected as a change.
         assert_eq!(
-            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashB", 300).unwrap(),
+            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashA", "v3hashB", 300).unwrap(),
             FingerprintOutcome::Changed
         );
     }
@@ -2169,7 +2278,7 @@ mod tests {
         let store = Store::open(&db).unwrap();
 
         assert_eq!(
-            store.record_fingerprint(1, "srv", "search", "v1hashB", "v2hashB", 200).unwrap(),
+            store.record_fingerprint(1, "srv", "search", "v1hashB", "v2hashB", "v3hashB", 200).unwrap(),
             FingerprintOutcome::Changed
         );
     }
@@ -2240,18 +2349,19 @@ mod tests {
     }
 
     #[test]
-    fn v4_to_v5_additive_upgrade_adds_inject_events() {
+    fn v4_to_v6_additive_upgrade_adds_inject_events() {
         let tmp = TempDir::new("v4-upgrade");
         let db = tmp.db();
         write_legacy_v4_db(&db);
 
-        // Opening a v4 file upgrades it in place to v5 (new inject_events table)...
+        // Opening a v4 file upgrades it in place to v6 (inject_events + session
+        // protocol columns)...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         // ...preserving the pre-existing v4 rows...
         let sessions = store.list_sessions().unwrap();
@@ -2278,13 +2388,192 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
 
-        // Re-opening the upgraded file is a no-op and still v5.
+        // Re-opening the upgraded file is a no-op and still v6.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 5);
+        assert_eq!(version2, 6);
+    }
+
+    /// Hand-build a v5 file: the full v5 schema (sessions *without* the v6 protocol
+    /// columns, plus messages/security_events/tool_fingerprints/inject_events) with a
+    /// session and a message, `user_version` stamped 5.
+    fn write_legacy_v5_db(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                command TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL,
+                is_error INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('policy_deny','secret_leak','fingerprint_change')),
+                rule TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                tool_name TEXT,
+                rpc_id TEXT,
+                action_taken TEXT NOT NULL CHECK (action_taken IN ('flagged','blocked'))
+            );
+            CREATE TABLE tool_fingerprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                tool_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                first_seen_ts_ms INTEGER NOT NULL,
+                server_key TEXT NOT NULL DEFAULT '',
+                fp_version INTEGER NOT NULL DEFAULT 1,
+                last_seen_ts_ms INTEGER,
+                UNIQUE (server_key, tool_name, fingerprint)
+            );
+            CREATE TABLE inject_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                rule TEXT NOT NULL,
+                fault TEXT NOT NULL CHECK (fault IN ('delay','error','drop','truncate')),
+                detail TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT
+            );
+            PRAGMA user_version = 5;
+            COMMIT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label, command, started_at_ms) VALUES ('old', 'srv', 42)",
+            [],
+        )
+        .unwrap();
+        // A pre-existing v2 fingerprint row: the v2 -> v3 dual-hash transition must not
+        // false-positive when this tool is re-observed after the upgrade.
+        conn.execute(
+            "INSERT INTO tool_fingerprints
+                (session_id, server_key, tool_name, fingerprint, first_seen_ts_ms, last_seen_ts_ms, fp_version)
+             VALUES (1, 'srv', 'search', 'v2only', 100, 100, 2)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v5_to_v6_additive_upgrade_adds_session_protocol_columns() {
+        let tmp = TempDir::new("v5-upgrade");
+        let db = tmp.db();
+        write_legacy_v5_db(&db);
+
+        // Opening a v5 file upgrades it in place to v6 (three nullable sessions
+        // columns), leaving the pre-existing row's protocol fields NULL.
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        let row = store.session(1).unwrap().expect("session");
+        assert_eq!(row.label, "old");
+        assert_eq!(row.protocol_version, None);
+        assert_eq!(row.client_protocol_version, None);
+        assert_eq!(row.protocol_version_source, None);
+
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v6.
+        let store2 = Store::open(&db).unwrap();
+        let version2: i64 = store2
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version2, 6);
+    }
+
+    #[test]
+    fn record_fingerprint_v2_to_v3_repin_is_not_a_false_positive() {
+        // A pre-existing v2 fingerprint row (e.g. a tool with no outputSchema, whose
+        // v2 and v3 hashes differ only by the added Null outputSchema key) must be
+        // recognised on its v2 hash and silently re-pinned to v3 — Unchanged, no alert.
+        let tmp = TempDir::new("fp-v2-to-v3");
+        let db = tmp.db();
+        write_legacy_v5_db(&db);
+        let store = Store::open(&db).unwrap();
+
+        assert_eq!(
+            store
+                .record_fingerprint(1, "srv", "search", "v1x", "v2only", "v3new", 200)
+                .unwrap(),
+            FingerprintOutcome::Unchanged
+        );
+        let (fp_version, fingerprint): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT fp_version, fingerprint FROM tool_fingerprints WHERE tool_name = 'search'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(fp_version, 3, "the v2 row should be re-pinned to v3");
+        assert_eq!(fingerprint, "v3new");
+
+        // Now that the baseline is the v3 hash, an outputSchema-only change (same v1/v2,
+        // different v3) IS caught.
+        assert_eq!(
+            store
+                .record_fingerprint(1, "srv", "search", "v1x", "v2only", "v3changed", 300)
+                .unwrap(),
+            FingerprintOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn set_session_protocol_round_trips_through_session_summary() {
+        let tmp = TempDir::new("session-protocol");
+        let store = Store::open(&tmp.db()).unwrap();
+        let sid = store.begin_session("s", "echo").unwrap();
+
+        // A fresh session has no recorded protocol version.
+        let before = store.session(sid).unwrap().expect("session");
+        assert_eq!(before.protocol_version, None);
+        assert_eq!(before.client_protocol_version, None);
+        assert_eq!(before.protocol_version_source, None);
+
+        store
+            .set_session_protocol(sid, Some("2025-06-18"), Some("2025-11-25"), "initialize")
+            .unwrap();
+        let after = store.session(sid).unwrap().expect("session");
+        assert_eq!(after.client_protocol_version.as_deref(), Some("2025-06-18"));
+        assert_eq!(after.protocol_version.as_deref(), Some("2025-11-25"));
+        assert_eq!(after.protocol_version_source.as_deref(), Some("initialize"));
+
+        // The header source path: no client-proposed version, just the negotiated one.
+        store
+            .set_session_protocol(sid, None, Some("2025-11-25"), "header")
+            .unwrap();
+        let hdr = store.session(sid).unwrap().expect("session");
+        assert_eq!(hdr.client_protocol_version, None);
+        assert_eq!(hdr.protocol_version.as_deref(), Some("2025-11-25"));
+        assert_eq!(hdr.protocol_version_source.as_deref(), Some("header"));
+
+        // list_sessions surfaces the same fields.
+        let listed = store.list_sessions().unwrap();
+        assert_eq!(listed[0].protocol_version.as_deref(), Some("2025-11-25"));
     }
 
     #[test]

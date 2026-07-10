@@ -236,6 +236,12 @@ struct SessionSummaryDto {
     started_at_ms: i64,
     ended_at_ms: Option<i64>,
     message_count: u64,
+    /// The MCP protocol version the server selected (or `null` when unobserved).
+    protocol_version: Option<String>,
+    /// The MCP protocol version the client proposed (or `null` when unobserved).
+    client_protocol_version: Option<String>,
+    /// How the version was observed: `"initialize"` | `"header"` | `null`.
+    protocol_version_source: Option<String>,
 }
 
 impl From<SessionSummary> for SessionSummaryDto {
@@ -247,6 +253,9 @@ impl From<SessionSummary> for SessionSummaryDto {
             started_at_ms: s.started_at_ms,
             ended_at_ms: s.ended_at_ms,
             message_count: s.message_count,
+            protocol_version: s.protocol_version,
+            client_protocol_version: s.client_protocol_version,
+            protocol_version_source: s.protocol_version_source,
         }
     }
 }

@@ -62,6 +62,74 @@ impl PendingToolsList {
     }
 }
 
+/// Outstanding `initialize` request ids awaiting their response, so the negotiated
+/// protocol version can be read off the matching response. Modelled exactly on
+/// [`PendingToolsList`] (same strict id-reuse invalidation and [`CAP`](Self::CAP)
+/// eviction): a non-`initialize` request reusing an id retires the stale entry, and
+/// the map is bounded so leaked ids cannot grow it without end. The stored value is
+/// the version the client *proposed* (`params.protocolVersion`), carried through to
+/// pair with the version the server *selects* in the response.
+struct PendingInitialize {
+    /// id -> (request `ts_ms` for eviction, the client-proposed version if any).
+    inner: HashMap<String, (i64, Option<String>)>,
+}
+
+impl PendingInitialize {
+    /// Cap on outstanding tracked ids — comfortably above any realistic count of
+    /// concurrent `initialize` requests (normally one per session).
+    const CAP: usize = 1024;
+
+    fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+
+    /// Note an `initialize` request with the version it proposed. Evicts the oldest
+    /// entry if inserting a new id would exceed [`CAP`](Self::CAP); re-noting refreshes.
+    fn note_request(&mut self, id: String, ts_ms: i64, proposed: Option<String>) {
+        if !self.inner.contains_key(&id) && self.inner.len() >= Self::CAP {
+            if let Some(oldest) = self
+                .inner
+                .iter()
+                .min_by_key(|(_, (ts, _))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.inner.remove(&oldest);
+            }
+        }
+        self.inner.insert(id, (ts_ms, proposed));
+    }
+
+    /// Retire the pending entry for an id reused by a non-`initialize` request.
+    fn invalidate(&mut self, id: &str) {
+        self.inner.remove(id);
+    }
+
+    /// Consume the pending entry for a response id. Returns `Some(proposed)` when this
+    /// response answers an `initialize` request we tracked (the inner value may itself
+    /// be `None` if the request omitted a `protocolVersion`), or `None` otherwise.
+    fn take(&mut self, id: &str) -> Option<Option<String>> {
+        self.inner.remove(id).map(|(_, proposed)| proposed)
+    }
+}
+
+/// How a session's protocol version has been recorded so far, so the precedence rule
+/// can be enforced across the storage loop's lifetime: an `initialize` handshake
+/// always wins, and an `MCP-Protocol-Version` header is recorded only once and only
+/// when nothing has been recorded yet. Session-local: one per [`storage_loop`].
+#[derive(Default, PartialEq, Eq)]
+enum ProtocolSource {
+    /// No protocol version recorded yet.
+    #[default]
+    None,
+    /// Recorded from an `MCP-Protocol-Version` header (a weaker signal that a later
+    /// `initialize` may still override).
+    Header,
+    /// Recorded from an `initialize` handshake (authoritative; never overridden).
+    Initialize,
+}
+
 /// One tapped frame handed to the storage thread. Off the hot path by design.
 pub(crate) struct TapEvent {
     pub(crate) direction: Direction,
@@ -69,7 +137,7 @@ pub(crate) struct TapEvent {
     pub(crate) raw: Vec<u8>,
 }
 
-/// Work items for the storage thread. Both are strictly best-effort and off the
+/// Work items for the storage thread. All are strictly best-effort and off the
 /// forwarding path: a full or closed channel drops them without touching the wire.
 pub(crate) enum StorageMsg {
     /// Record a framed message (either direction) into `messages`.
@@ -79,6 +147,11 @@ pub(crate) enum StorageMsg {
     /// Persist a fault-injection event into `inject_events`. Best-effort like the
     /// others: a failed write is logged and dropped, never affecting the wire.
     Inject(InjectEvent),
+    /// An `MCP-Protocol-Version` header value seen on an inbound HTTP request (the
+    /// gateway path). A passive hint used only when the session has no version from
+    /// an `initialize` handshake yet — recorded once, `initialize` always wins. Sent
+    /// best-effort per request; a full/closed channel just drops it.
+    ProtocolHint { version: String },
 }
 
 /// Drain the storage channel into SQLite. Runs on a blocking thread; a DB failure
@@ -116,6 +189,11 @@ pub(crate) fn storage_loop(
     // precede its request, so the id is present here by the time the matching
     // response is drained.
     let mut pending_tools_list = PendingToolsList::new();
+    // Outstanding initialize requests + how the session's protocol version has been
+    // recorded so far. Both session-local; the observation is a pure side-channel
+    // read off the same tapped frames (plus header hints), never touching the wire.
+    let mut pending_initialize = PendingInitialize::new();
+    let mut protocol_source = ProtocolSource::None;
     while let Some(msg) = rx.blocking_recv() {
         match msg {
             StorageMsg::Tap(ev) => {
@@ -126,8 +204,25 @@ pub(crate) fn storage_loop(
                 // *other* request bearing an id retires that id (JSON-RPC ids are per
                 // request, so reuse means the old tools/list is done).
                 let is_tools_list = parsed.method.as_deref() == Some("tools/list");
+                let is_initialize = parsed.method.as_deref() == Some("initialize");
                 let tools_list_req_id = if direction == Direction::C2s && is_tools_list {
                     parsed.rpc_id.clone()
+                } else {
+                    None
+                };
+                // A c2s initialize request: track its id alongside the version it
+                // proposed (params.protocolVersion), so the response's selected version
+                // can be paired with it. Parsing the full body here is off the hot path.
+                let initialize_req = if direction == Direction::C2s && is_initialize {
+                    let proposed = serde_json::from_slice::<serde_json::Value>(&ev.raw)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("params")
+                                .and_then(|p| p.get("protocolVersion"))
+                                .and_then(|s| s.as_str())
+                                .map(str::to_owned)
+                        });
+                    parsed.rpc_id.clone().map(|id| (id, proposed))
                 } else {
                     None
                 };
@@ -137,6 +232,16 @@ pub(crate) fn storage_loop(
                 // tools/list by coincidence of id.
                 let reused_req_id = if direction == Direction::C2s
                     && !is_tools_list
+                    && parsed.method.is_some()
+                {
+                    parsed.rpc_id.clone()
+                } else {
+                    None
+                };
+                // Likewise for the initialize tracker: any non-initialize request
+                // reusing the id retires a stale pending initialize.
+                let reused_init_id = if direction == Direction::C2s
+                    && !is_initialize
                     && parsed.method.is_some()
                 {
                     parsed.rpc_id.clone()
@@ -173,6 +278,12 @@ pub(crate) fn storage_loop(
                 if let Some(id) = reused_req_id {
                     pending_tools_list.invalidate(&id);
                 }
+                if let Some((id, proposed)) = initialize_req {
+                    pending_initialize.note_request(id, ev.ts_ms, proposed);
+                }
+                if let Some(id) = reused_init_id {
+                    pending_initialize.invalidate(&id);
+                }
                 // Rug-pull detection lives here so the s2c leg stays a pure tap: only
                 // a non-error response that answers a tools/list request we saw has
                 // its per-tool fingerprints recorded and any change flagged. An error
@@ -189,7 +300,26 @@ pub(crate) fn storage_loop(
                             &logger,
                         );
                     }
+                    // The matching initialize response carries the *selected* protocol
+                    // version. An error response consumes the pending entry but records
+                    // no version (the handshake failed). An id is per request, so this
+                    // and the tools/list take above never both fire for one response.
+                    if let Some(proposed) = pending_initialize.take(&id) {
+                        if !is_error {
+                            record_initialize_negotiation(
+                                &store,
+                                session_id,
+                                &mut protocol_source,
+                                proposed,
+                                &ev.raw,
+                                &logger,
+                            );
+                        }
+                    }
                 }
+            }
+            StorageMsg::ProtocolHint { version } => {
+                apply_header_hint(&store, session_id, &mut protocol_source, &version, &logger);
             }
             StorageMsg::Security(ev) => {
                 if let Err(e) = store.insert_security_event(session_id, &ev) {
@@ -234,7 +364,7 @@ pub(crate) fn record_fingerprints(
         return;
     };
     for (tool, fp) in fingerprints_from_tools_list_versioned(&value) {
-        match store.record_fingerprint(session_id, server_key, &tool, &fp.v1, &fp.v2, ts_ms) {
+        match store.record_fingerprint(session_id, server_key, &tool, &fp.v1, &fp.v2, &fp.v3, ts_ms) {
             Ok(outcome @ (FingerprintOutcome::Changed | FingerprintOutcome::Reverted)) => {
                 let detail = match outcome {
                     FingerprintOutcome::Reverted => format!(
@@ -261,6 +391,62 @@ pub(crate) fn record_fingerprints(
             Ok(_) => {}
             Err(e) => logger.error(format!("record_fingerprint failed: {e:#}")),
         }
+    }
+}
+
+/// Record the protocol version negotiated by an `initialize` handshake. `proposed`
+/// is the version the client offered (from the request); `resp_raw` is the matching
+/// server response, from which the *selected* version (`result.protocolVersion`) is
+/// read. A response without a parseable selected version is ignored (nothing
+/// meaningful to record). `initialize` is authoritative: it always wins over a prior
+/// header hint, and is written once. A parse or DB failure is logged only — this is a
+/// pure side-channel that must never affect the wire or the existing record path.
+fn record_initialize_negotiation(
+    store: &Store,
+    session_id: i64,
+    source: &mut ProtocolSource,
+    proposed: Option<String>,
+    resp_raw: &[u8],
+    logger: &Logger,
+) {
+    if *source == ProtocolSource::Initialize {
+        return; // already recorded authoritatively; don't churn on a re-initialize
+    }
+    let negotiated = serde_json::from_slice::<serde_json::Value>(resp_raw)
+        .ok()
+        .and_then(|v| {
+            v.get("result")
+                .and_then(|r| r.get("protocolVersion"))
+                .and_then(|s| s.as_str())
+                .map(str::to_owned)
+        });
+    let Some(negotiated) = negotiated else {
+        return;
+    };
+    match store.set_session_protocol(session_id, proposed.as_deref(), Some(&negotiated), "initialize")
+    {
+        Ok(()) => *source = ProtocolSource::Initialize,
+        Err(e) => logger.error(format!("recording initialize protocol version failed: {e:#}")),
+    }
+}
+
+/// Apply an `MCP-Protocol-Version` header hint. Recorded only when nothing has been
+/// recorded yet (`initialize` always takes precedence, and a header writes once), so
+/// a stream of per-request hints collapses to a single write. Best-effort: a DB
+/// failure is logged and dropped.
+fn apply_header_hint(
+    store: &Store,
+    session_id: i64,
+    source: &mut ProtocolSource,
+    version: &str,
+    logger: &Logger,
+) {
+    if *source != ProtocolSource::None {
+        return;
+    }
+    match store.set_session_protocol(session_id, None, Some(version), "header") {
+        Ok(()) => *source = ProtocolSource::Header,
+        Err(e) => logger.error(format!("recording header protocol hint failed: {e:#}")),
     }
 }
 
@@ -534,6 +720,35 @@ mod tests {
     }
 
     #[test]
+    fn output_schema_only_change_raises_fingerprint_change_event() {
+        // v3 folds `outputSchema` into the fingerprint: a tool whose result contract
+        // is quietly rewritten (same name/description/inputSchema/annotations, only
+        // outputSchema differs) is a rug-pull surface and must be flagged.
+        let tmp = TmpDb::new("fp-v3-outputschema");
+        let db = tmp.db();
+        let req = r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#;
+        let resp = |schema: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":5,"result":{{"tools":[{{"name":"search","description":"d","inputSchema":{{}},"outputSchema":{schema}}}]}}}}"#
+            )
+        };
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, req),
+                tap_ev(Direction::S2c, 2, &resp(r#"{"type":"object"}"#)), // New: no event
+                tap_ev(Direction::C2s, 3, req),
+                tap_ev(Direction::S2c, 4, &resp(r#"{"type":"string"}"#)), // Changed: one event
+            ],
+        );
+        assert_eq!(
+            fingerprint_change_count(&db),
+            1,
+            "an outputSchema-only change must raise exactly one fingerprint_change event"
+        );
+    }
+
+    #[test]
     fn server_initiated_request_does_not_consume_pending_tools_list() {
         let tmp = TmpDb::new("s2c-server-request");
         let db = tmp.db();
@@ -594,5 +809,180 @@ mod tests {
             vec!["search".to_owned()],
             "a c2s response bearing no method must not invalidate the pending tools/list"
         );
+    }
+
+    #[test]
+    fn create_task_result_does_not_disturb_tools_list_correlation() {
+        // An interleaved 2025-11-25 CreateTaskResult (a response with a `result` but a
+        // different id and no `tools`) must neither be fingerprinted nor consume the
+        // pending tools/list — the genuine tools/list response still fingerprints.
+        let tmp = TmpDb::new("create-task-result");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#),
+                // A CreateTaskResult for an unrelated request (id 99): result, no tools.
+                tap_ev(
+                    Direction::S2c,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":99,"result":{"task":{"taskId":"abc","ttl":30000},"_meta":{"io.modelcontextprotocol/related-task":{"taskId":"abc"}}}}"#,
+                ),
+                // The genuine tools/list answer still arrives for id 5.
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[{"name":"search","description":"y"}]}}"#,
+                ),
+            ],
+        );
+        assert_eq!(
+            fingerprinted_tool_names(&db),
+            vec!["search".to_owned()],
+            "a CreateTaskResult must not be fingerprinted nor consume the pending tools/list"
+        );
+    }
+
+    // --- passive protocol-version observation (WF1) -------------------------
+
+    /// Read a session's three protocol columns from the db.
+    fn session_protocol(db: &Path) -> (Option<String>, Option<String>, Option<String>) {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT protocol_version, client_protocol_version, protocol_version_source
+             FROM sessions ORDER BY id LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn hint(version: &str) -> StorageMsg {
+        StorageMsg::ProtocolHint {
+            version: version.to_owned(),
+        }
+    }
+
+    #[test]
+    fn initialize_round_trip_records_negotiated_version() {
+        let tmp = TmpDb::new("proto-init");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(
+                    Direction::C2s,
+                    1,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                ),
+                tap_ev(
+                    Direction::S2c,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}}"#,
+                ),
+            ],
+        );
+        let (negotiated, client, source) = session_protocol(&db);
+        assert_eq!(negotiated.as_deref(), Some("2025-11-25"));
+        assert_eq!(client.as_deref(), Some("2025-06-18"));
+        assert_eq!(source.as_deref(), Some("initialize"));
+    }
+
+    #[test]
+    fn initialize_id_reuse_invalidates_pending_version() {
+        let tmp = TmpDb::new("proto-reuse");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(
+                    Direction::C2s,
+                    1,
+                    r#"{"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                ),
+                // A different request reuses id 7: the pending initialize is retired.
+                tap_ev(
+                    Direction::C2s,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"x"}}"#,
+                ),
+                // A late response for id 7 must not record a version.
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":7,"result":{"protocolVersion":"2025-11-25"}}"#,
+                ),
+            ],
+        );
+        let (negotiated, _, source) = session_protocol(&db);
+        assert_eq!(negotiated, None, "a reused id must invalidate the pending initialize");
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn initialize_error_response_records_no_version() {
+        let tmp = TmpDb::new("proto-err");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                tap_ev(
+                    Direction::C2s,
+                    1,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                ),
+                tap_ev(
+                    Direction::S2c,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"unsupported version"}}"#,
+                ),
+            ],
+        );
+        let (negotiated, _, source) = session_protocol(&db);
+        assert_eq!(negotiated, None, "a failed handshake records no version");
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn header_hint_records_once_when_no_initialize() {
+        let tmp = TmpDb::new("proto-header");
+        let db = tmp.db();
+        drive(&db, vec![hint("2025-11-25"), hint("2025-06-18")]);
+        let (negotiated, client, source) = session_protocol(&db);
+        // Only the first hint is recorded (header writes once); no client-proposed
+        // version (a header carries only the negotiated one).
+        assert_eq!(negotiated.as_deref(), Some("2025-11-25"));
+        assert_eq!(client, None);
+        assert_eq!(source.as_deref(), Some("header"));
+    }
+
+    #[test]
+    fn initialize_overrides_a_prior_header_hint() {
+        let tmp = TmpDb::new("proto-header-then-init");
+        let db = tmp.db();
+        drive(
+            &db,
+            vec![
+                // A header hint arrives first (e.g. a resumed request).
+                hint("2025-06-18"),
+                // Then the real handshake is observed: initialize takes precedence.
+                tap_ev(
+                    Direction::C2s,
+                    2,
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+                ),
+                tap_ev(
+                    Direction::S2c,
+                    3,
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#,
+                ),
+                // A later header hint must NOT clobber the authoritative initialize value.
+                hint("2024-11-05"),
+            ],
+        );
+        let (negotiated, client, source) = session_protocol(&db);
+        assert_eq!(negotiated.as_deref(), Some("2025-11-25"));
+        assert_eq!(client.as_deref(), Some("2025-06-18"));
+        assert_eq!(source.as_deref(), Some("initialize"));
     }
 }

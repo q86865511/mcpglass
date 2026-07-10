@@ -6,6 +6,25 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **MCP 2025-11-25 support** — the proxy tracks the current MCP spec. The parser and
+  tap treat every 2025-11-25 wire addition (tasks, icons, `sampling` tool calls,
+  URL-mode elicitation, SSE resumption) as pure pass-through, forwarding and recording
+  each frame byte-for-byte.
+- **Passive protocol-version observation** — each session now records the protocol
+  version it negotiated: read from the `initialize` handshake (client-proposed and
+  server-selected), or, on the HTTP gateway, from the `MCP-Protocol-Version` header
+  when no handshake is captured. The version is stored per session, shown in the
+  dashboard's session list, and used to faithfully reconstruct the handshake on
+  `replay` (a legacy session with no recorded version falls back to the build
+  default). Observation is a side-channel read only — it never touches the wire.
+- **Tool fingerprint v3** — tool integrity pinning now folds in `outputSchema`, so a
+  server that quietly rewrites the *result contract* a tool promises (a genuine
+  rug-pull surface) is flagged. Existing fingerprints upgrade silently on next
+  sighting with no false-positive alert. `icons` are deliberately excluded (their
+  remote URLs churn benignly) and remain on the watch list.
+
 ### Changed
 
 - **MSRV corrected to Rust 1.86** (was declared 1.80, which no longer compiled the locked

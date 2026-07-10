@@ -278,24 +278,33 @@ fn mask(s: &str) -> String {
 
 /// Current tool-fingerprint algorithm version. v1 hashed `name` + `description` +
 /// `inputSchema`; **v2** additionally folds in `annotations` (missing -> Null), so
-/// a server that quietly rewrites a tool's advertised annotations is now caught.
-/// `outputSchema` is deliberately *not* folded in yet — it is a candidate for a
-/// future v3 once its real-world churn is understood. Storage records new
-/// observations under this version and uses the older hash only to recognise a
-/// pre-existing v1 row during the dual-hash migration.
-pub const FP_VERSION: u32 = 2;
+/// a server that quietly rewrites a tool's advertised annotations is caught;
+/// **v3** additionally folds in `outputSchema` (missing -> Null, the MCP 2025-06-18
+/// field describing a tool's structured result), so a server that quietly rewrites
+/// the *shape of the result* a tool promises — a behavioural contract, and a real
+/// rug-pull surface — is now caught too. Storage records new observations under this
+/// version and uses the older hashes only to recognise a pre-existing v1/v2 row
+/// during the dual-hash migration.
+///
+/// `icons` (the MCP 2025-11-25 field) is deliberately *not* folded in: icon `src`
+/// values are frequently remote URLs that change for benign reasons (CDN rotation,
+/// cache-busting), so fingerprinting them would be a high false-positive rate. It is
+/// on the watch list for a future v4 once its real-world churn is understood.
+pub const FP_VERSION: u32 = 3;
 
 /// A tool definition hashed under every fingerprint algorithm version at once.
 /// Storage needs all versions to compare an observation against history that may
-/// have been recorded under an older algorithm: an existing v1 record that still
-/// matches on `v1` is silently re-pinned to `v2` (no change alert), while a v1
-/// mismatch is a genuine change.
+/// have been recorded under an older algorithm: an existing v1/v2 record that still
+/// matches on its own version's hash is silently re-pinned to `v3` (no change alert),
+/// while a mismatch on that hash is a genuine change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolFingerprints {
     /// v1 hash: `name` + `description` + `inputSchema`.
     pub v1: String,
     /// v2 hash: the v1 fields plus `annotations` (missing -> Null).
     pub v2: String,
+    /// v3 hash: the v2 fields plus `outputSchema` (missing -> Null).
+    pub v3: String,
 }
 
 /// The v1 canonical subset — the fields the v1 algorithm fingerprints over.
@@ -308,11 +317,19 @@ fn fingerprint_subset_v1(tool: &Value) -> Value {
 }
 
 /// The v2 canonical subset — v1 plus `annotations` (missing -> Null).
-/// `outputSchema` is intentionally excluded for now (see [`FP_VERSION`]).
 fn fingerprint_subset_v2(tool: &Value) -> Value {
     let mut subset = fingerprint_subset_v1(tool);
     // `subset` is always a JSON object here, so this inserts the key.
     subset["annotations"] = tool.get("annotations").cloned().unwrap_or(Value::Null);
+    subset
+}
+
+/// The v3 canonical subset — v2 plus `outputSchema` (missing -> Null, the same
+/// convention v2 uses for `annotations`). `icons` is intentionally excluded (see
+/// [`FP_VERSION`]).
+fn fingerprint_subset_v3(tool: &Value) -> Value {
+    let mut subset = fingerprint_subset_v2(tool);
+    subset["outputSchema"] = tool.get("outputSchema").cloned().unwrap_or(Value::Null);
     subset
 }
 
@@ -339,6 +356,7 @@ pub fn fingerprint_tool_versions(tool: &Value) -> ToolFingerprints {
     ToolFingerprints {
         v1: hash_subset(&fingerprint_subset_v1(tool)),
         v2: hash_subset(&fingerprint_subset_v2(tool)),
+        v3: hash_subset(&fingerprint_subset_v3(tool)),
     }
 }
 
@@ -961,6 +979,61 @@ mod tests {
         assert!(fingerprints_from_tools_list_versioned(&json!({"result": {}})).is_empty());
         assert!(
             fingerprints_from_tools_list_versioned(&json!({"result": {"tools": "nope"}})).is_empty()
+        );
+    }
+
+    // --- v3 fingerprinting (outputSchema) -----------------------------------
+
+    #[test]
+    fn fingerprint_v3_folds_in_output_schema_v1_v2_ignore_it() {
+        let base = json!({"name": "read", "description": "reads", "inputSchema": {}});
+        let with_output = json!({
+            "name": "read", "description": "reads", "inputSchema": {},
+            "outputSchema": {"type": "object", "properties": {"content": {"type": "string"}}}
+        });
+        let a = fingerprint_tool_versions(&base);
+        let b = fingerprint_tool_versions(&with_output);
+        // v1 and v2 are blind to outputSchema...
+        assert_eq!(a.v1, b.v1);
+        assert_eq!(a.v2, b.v2);
+        // ...but v3 folds it in, so adding an outputSchema changes it.
+        assert_ne!(a.v3, b.v3);
+    }
+
+    #[test]
+    fn fingerprint_v3_changes_when_output_schema_changes_v2_does_not() {
+        let x = json!({"name": "t", "description": "d", "inputSchema": {}, "outputSchema": {"type": "string"}});
+        let y = json!({"name": "t", "description": "d", "inputSchema": {}, "outputSchema": {"type": "number"}});
+        let fx = fingerprint_tool_versions(&x);
+        let fy = fingerprint_tool_versions(&y);
+        assert_eq!(fx.v2, fy.v2); // v2 does not see the outputSchema edit
+        assert_ne!(fx.v3, fy.v3); // v3 catches it
+    }
+
+    #[test]
+    fn fingerprint_v3_missing_output_schema_is_stable_under_reorder() {
+        // Missing outputSchema hashes as Null, so two outputSchema-less tools with
+        // keys in a different order still agree on v3.
+        let a = json!({"name": "t", "description": "d", "inputSchema": {"type": "object"}, "annotations": {"x": 1}});
+        let b = json!({"annotations": {"x": 1}, "inputSchema": {"type": "object"}, "description": "d", "name": "t"});
+        assert_eq!(
+            fingerprint_tool_versions(&a).v3,
+            fingerprint_tool_versions(&b).v3
+        );
+    }
+
+    #[test]
+    fn fingerprint_v3_ignores_icons() {
+        // `icons` (MCP 2025-11-25) is deliberately excluded from every version, so a
+        // tool that only adds/rotates icons has an unchanged v3 fingerprint.
+        let plain = json!({"name": "t", "description": "d", "inputSchema": {}, "outputSchema": {"type": "object"}});
+        let iconed = json!({
+            "name": "t", "description": "d", "inputSchema": {}, "outputSchema": {"type": "object"},
+            "icons": [{"src": "https://cdn.example/icon-v2.png", "mimeType": "image/png", "sizes": ["48x48"]}]
+        });
+        assert_eq!(
+            fingerprint_tool_versions(&plain).v3,
+            fingerprint_tool_versions(&iconed).v3
         );
     }
 }

@@ -144,6 +144,12 @@ fn build_fixture() -> (TempDir, i64) {
         )
         .unwrap();
 
+    // A recorded protocol negotiation, so the sessions endpoint surfaces the v6
+    // protocol columns.
+    store
+        .set_session_protocol(sid, Some("2025-06-18"), Some("2025-11-25"), "initialize")
+        .unwrap();
+
     store.end_session(sid).unwrap();
 
     (tmp, sid)
@@ -220,6 +226,10 @@ async fn full_api_surface() {
     assert_eq!(list[0]["label"], "fixture");
     assert_eq!(list[0]["message_count"].as_u64().unwrap(), 122);
     assert!(list[0]["ended_at_ms"].is_number());
+    // v6 protocol columns surface on the session summary.
+    assert_eq!(list[0]["protocol_version"], "2025-11-25");
+    assert_eq!(list[0]["client_protocol_version"], "2025-06-18");
+    assert_eq!(list[0]["protocol_version_source"], "initialize");
 
     // --- /api/sessions/{id}/messages: default page ---
     let page1: serde_json::Value = client

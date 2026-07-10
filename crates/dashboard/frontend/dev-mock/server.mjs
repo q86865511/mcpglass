@@ -80,6 +80,9 @@ const sessionDefs = [
     started_at_ms: NOW - 5 * 60_000,
     ended_at_ms: null, // live
     count: 128,
+    protocol_version: "2025-11-25",
+    client_protocol_version: "2025-06-18",
+    protocol_version_source: "initialize",
   },
   {
     id: 1,
@@ -88,6 +91,10 @@ const sessionDefs = [
     started_at_ms: NOW - 60 * 60_000,
     ended_at_ms: NOW - 55 * 60_000,
     count: 42,
+    // A legacy / unobserved session: no protocol version recorded.
+    protocol_version: null,
+    client_protocol_version: null,
+    protocol_version_source: null,
   },
 ];
 
@@ -280,6 +287,9 @@ function sessionsPayload() {
       started_at_ms: def.started_at_ms,
       ended_at_ms: def.ended_at_ms,
       message_count: messagesBySession.get(def.id).length,
+      protocol_version: def.protocol_version,
+      client_protocol_version: def.client_protocol_version,
+      protocol_version_source: def.protocol_version_source,
     }));
   return { sessions };
 }

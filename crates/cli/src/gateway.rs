@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +63,11 @@ struct Upstream {
     url: String,
     tx: mpsc::Sender<StorageMsg>,
     drop_logged: Arc<AtomicBool>,
+    /// One-shot latch: a single delivered `ProtocolHint` is all the storage thread
+    /// can ever use (it records the header source at most once per session), so
+    /// stop enqueueing hints after the first success instead of competing with
+    /// tapped frames for channel capacity on every request.
+    hint_sent: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -208,6 +213,7 @@ async fn serve(
                 url,
                 tx,
                 drop_logged: Arc::new(AtomicBool::new(false)),
+                hint_sent: Arc::new(AtomicBool::new(false)),
             },
         );
     }
@@ -257,6 +263,11 @@ async fn handle_post(
     let Some(up) = state.upstreams.get(&name) else {
         return (StatusCode::NOT_FOUND, "unknown upstream").into_response();
     };
+    // Passive protocol-version observation: after the initialize handshake the client
+    // MUST carry `MCP-Protocol-Version` on every request. Forward it to the storage
+    // thread as a best-effort hint (recorded only when no `initialize` version is
+    // known yet). Never gates the wire — a full/closed channel just drops it.
+    hint_protocol_version(up, &headers);
     let cap = state.frame_cap;
     let enforce = state.policy.mode == Mode::Enforce;
 
@@ -753,6 +764,34 @@ fn emit_events(up: &Upstream, logger: &Logger, events: Vec<SecurityEvent>) {
     }
 }
 
+/// Forward an inbound `MCP-Protocol-Version` header (if present and valid UTF-8) to
+/// the storage thread as a passive hint. Best-effort and non-blocking: a full/closed
+/// channel silently drops it (no `log_drop_once` — this is a low-value hint, not a
+/// tapped frame; a dropped hint simply retries on the next request). One delivered
+/// hint is all the storage thread will ever record, so the `hint_sent` latch stops
+/// further sends from competing with tapped frames for channel capacity. Never
+/// touches the wire.
+fn hint_protocol_version(up: &Upstream, headers: &HeaderMap) {
+    if up.hint_sent.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(version) = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        if up
+            .tx
+            .try_send(StorageMsg::ProtocolHint {
+                version: version.to_owned(),
+            })
+            .is_ok()
+        {
+            up.hint_sent.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Best-effort tap of one framed message. Non-blocking: a full/closed channel just
 /// drops it (logged once) and never touches the wire.
 fn tap_frame(up: &Upstream, logger: &Logger, direction: Direction, ts_ms: i64, raw: Vec<u8>) {
@@ -976,6 +1015,20 @@ mod tests {
 
         // No Origin, foreign Host (the rebinding gap): rejected by the host gate.
         assert!(!request_allowed(&headers_with_host("evil.example")));
+    }
+
+    #[test]
+    fn resumption_and_protocol_headers_pass_through_to_upstream() {
+        // MCP 2025-11-25 resumption (SEP-1699) resumes a stream with a GET carrying
+        // `Last-Event-ID`; the transport also requires `MCP-Protocol-Version` on every
+        // post-handshake request. Both must reach the upstream verbatim (not stripped),
+        // or resumption and version negotiation break.
+        let mut h = HeaderMap::new();
+        h.insert("last-event-id", HeaderValue::from_static("evt-42"));
+        h.insert("mcp-protocol-version", HeaderValue::from_static("2025-11-25"));
+        let out = filter_request_headers(&h);
+        assert_eq!(out.get("last-event-id").unwrap(), "evt-42");
+        assert_eq!(out.get("mcp-protocol-version").unwrap(), "2025-11-25");
     }
 
     #[test]
