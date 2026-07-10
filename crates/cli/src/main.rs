@@ -13,7 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
-use policy::{Fault, InjectConfig, InjectDirection, InjectHit, Injector, Mode, Policy};
+use policy::{
+    Fault, InjectConfig, InjectDirection, InjectHit, Injector, Mode, Policy, ServerIdentity,
+};
 use proxy_core::Direction;
 use serde_json::Value;
 use storage::{ActionTaken, InjectEvent, InjectFault, SecurityEvent, SecurityEventKind};
@@ -305,6 +307,13 @@ async fn run_wrap(
     // A session groups this whole run; label falls back to the program's basename.
     let label = name.unwrap_or_else(|| program_label(&program, &args));
     let command_line = command.join(" ");
+    // The structured stdio identity (schema v7): the full argv, so the same command
+    // under a different project is a distinct fingerprint scope and quoted/backslashed
+    // args are recorded losslessly for replay. `command_line` (argv.join(" ")) remains
+    // the legacy scope key so an existing baseline survives the upgrade.
+    let identity = ServerIdentity::Stdio {
+        argv: command.clone(),
+    };
 
     let data_dir = default_data_dir();
     let log_path = log.or_else(|| data_dir.as_ref().map(|d| d.join("mcpglass.log")));
@@ -358,7 +367,7 @@ async fn run_wrap(
     // Storage owns a sync rusqlite connection on a dedicated blocking thread.
     let storage = tokio::task::spawn_blocking({
         let logger = logger.clone();
-        move || storage_loop(rx, db_path, logger, label, command_line)
+        move || storage_loop(rx, db_path, logger, label, command_line, identity)
     });
 
     // Both write legs share this stdout so their writes stay frame-atomic.
@@ -1219,6 +1228,9 @@ mod tests {
             Logger::open(None),
             "t".to_owned(),
             "echo cmd".to_owned(),
+            ServerIdentity::Stdio {
+                argv: vec!["echo".to_owned(), "cmd".to_owned()],
+            },
         );
         let conn = rusqlite::Connection::open(&db).unwrap();
         let names: Vec<String> = conn
@@ -1273,6 +1285,7 @@ mod tests {
         let dir = temp_dir("cross-session-rugpull");
         let db = dir.join("sessions.db");
         let cmd = "npx some-server".to_owned();
+        let argv = vec!["npx".to_owned(), "some-server".to_owned()];
 
         let run = |raw_resp: &'static str| {
             let (tx, rx) = mpsc::channel::<StorageMsg>(64);
@@ -1284,7 +1297,16 @@ mod tests {
             .unwrap();
             tx.try_send(tap(Direction::S2c, 2, raw_resp)).unwrap();
             drop(tx);
-            storage_loop(rx, db.clone(), Logger::open(None), "run".to_owned(), cmd.clone());
+            // Same structured identity on both runs -> same server_id, so a definition
+            // change is still detected across sessions.
+            storage_loop(
+                rx,
+                db.clone(),
+                Logger::open(None),
+                "run".to_owned(),
+                cmd.clone(),
+                ServerIdentity::Stdio { argv: argv.clone() },
+            );
         };
 
         // First run: tool `search` advertised with description "A" -> New, no event.

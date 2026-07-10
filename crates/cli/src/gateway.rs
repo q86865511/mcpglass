@@ -34,7 +34,7 @@ use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use policy::{Fault, InjectDirection, InjectHit, Mode, Policy};
+use policy::{Fault, InjectDirection, InjectHit, Mode, Policy, ServerIdentity};
 use proxy_core::{Direction, SseSplitter};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -204,8 +204,12 @@ async fn serve(
         let logger = logger.clone();
         let label = name.clone();
         let command_line = url.clone();
+        // The structured HTTP identity (schema v7): the upstream URL verbatim. It is
+        // also the legacy scope key (`command_line`), so an existing fingerprint
+        // baseline survives the upgrade.
+        let identity = ServerIdentity::Http { url: url.clone() };
         tokio::task::spawn_blocking(move || {
-            storage_loop(rx, db_path, logger, label, command_line);
+            storage_loop(rx, db_path, logger, label, command_line, identity);
         });
         map.insert(
             name,

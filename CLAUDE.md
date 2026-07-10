@@ -13,7 +13,7 @@ MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 A
 
 ## 架構約定
 
-- Workspace crates：`proxy-core`（JSON-RPC 解析、轉發、框架化、SSE 切分、MCP 版本常數、bloat 分析）／`storage`（rusqlite，schema v6）／
+- Workspace crates：`proxy-core`（JSON-RPC 解析、轉發、框架化、SSE 切分、MCP 版本常數、bloat 分析）／`storage`（rusqlite，schema v7）／
   `policy`（純邏輯：政策/secret/指紋/決策/inject 規則，無 IO）／`cli`（clap 入口＋stdio 熱路徑＋HTTP gateway＋replay/bloat 子指令）／`dashboard`（axum＋rust-embed）。
 - 兩種 transport 共用同一 tap/storage/指紋管線（`cli/src/tap.rs`）：stdio＝`wrap`（client spawn）；
   HTTP＝`gateway` 長駐反向代理（`/u/{route}`，gateway.toml 記 route→upstream，只綁 127.0.0.1，Origin＋Host 驗 loopback）。
@@ -33,3 +33,4 @@ MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 A
 - MCP spec 對齊官方 schema 版本，版本常數集中在 proxy-core。
 - 注入規則純邏輯在 `policy::inject`（`decide` 純函式,IO 只在 `InjectConfig::load`）；注入事件另立 `inject_events` 表（schema v5 新增,不動 security_events.kind 的 CHECK constraint）。
 - 協定版本為被動觀測：storage_loop 旁路解析 initialize 往返（PendingInitialize）、gateway 以 ProtocolHint 傳 header 備援（initialize 優先、header 只記一次）,存 sessions 三欄（schema v6）；replay 用 session 記錄版本,NULL 回落 proxy-core 常數（legacy fallback）。指紋 FP_VERSION=3（v2＋outputSchema,排除 icons）,舊列 hash 命中靜默重釘。
+- server identity 為結構化（schema v7,sessions 新增 program/argv_json/transport/server_id 四欄＋messages.raw_len 佔位欄）：`policy::ServerIdentity`（Stdio{argv}／Http{url},無 env 欄→env 不可能進 identity）,hash 純函式 `policy::server_identity_hash`＝sha256(canonical JSON)。指紋 scope key 改用 server_id;升級不歸零基線靠 record_fingerprint 的 lazy re-key（server_id 無列但 legacy_key（＝pre-v7 的 argv.join(" ")／url,即 command_line）有列時,同一 `BEGIN IMMEDIATE` 交易內整批重鍵）。replay 優先讀 argv_json 無損還原 argv、transport 欄取代 URL 嗅探,兩者皆有 legacy NULL 回落（split_command 僅適用 v7 以前）。

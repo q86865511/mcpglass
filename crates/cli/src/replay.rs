@@ -139,7 +139,7 @@ pub async fn run_replay(
     timeout: Duration,
 ) -> Result<ReplayResult, ReplayError> {
     // Synchronous lookups first; the Store is dropped at the end of this block.
-    let (command, raw, rpc_id, protocol_version) = {
+    let (command, argv_json, transport, raw, rpc_id, protocol_version) = {
         let store = Store::open(&db_path)
             .map_err(|e| ReplayError::Internal(format!("opening session store: {e:#}")))?;
         let msg = store
@@ -174,18 +174,49 @@ pub async fn run_replay(
                 ))
             })?;
 
-        (session.command, msg.raw, rpc_id, session.protocol_version)
+        (
+            session.command,
+            session.argv_json,
+            session.transport,
+            msg.raw,
+            rpc_id,
+            session.protocol_version,
+        )
     };
 
     // Reconstruct the handshake with the version this session actually negotiated;
     // a legacy session with none recorded falls back to the build's default constant.
     let version = protocol_version.unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
 
-    if is_http_command(&command) {
+    if replay_is_http(&command, transport.as_deref()) {
         replay_http(&command, &raw, &rpc_id, &version, timeout).await
     } else {
-        replay_stdio(&command, &raw, &rpc_id, &version, timeout).await
+        // Prefer the structured argv (v7, lossless); fall back to splitting the joined
+        // command string for a legacy session that recorded no argv.
+        let argv = stdio_argv(&command, argv_json.as_deref());
+        replay_stdio(argv, &raw, &rpc_id, &version, timeout).await
     }
+}
+
+/// Decide whether to replay over HTTP. The session's recorded `transport` column (v7)
+/// is authoritative; a legacy session with none recorded falls back to sniffing the
+/// `command` for an `http(s)://` scheme.
+fn replay_is_http(command: &str, transport: Option<&str>) -> bool {
+    match transport {
+        Some("http") => true,
+        Some("stdio") => false,
+        _ => is_http_command(command),
+    }
+}
+
+/// Resolve the argv to re-spawn for an stdio replay. A v7 session recorded its argv as
+/// a JSON array (`argv_json`), which round-trips losslessly — including whitespace,
+/// quotes, and backslashes that [`split_command`] cannot recover. A legacy session (or
+/// an unparseable value) falls back to splitting the joined `command`.
+fn stdio_argv(command: &str, argv_json: Option<&str>) -> Vec<String> {
+    argv_json
+        .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+        .unwrap_or_else(|| split_command(command))
 }
 
 /// A session `command` targets an HTTP(S) upstream (the gateway path) rather than a
@@ -219,10 +250,15 @@ fn initialize_request(version: &str) -> String {
 /// Split a recorded `command` string into argv, honouring single- and double-quoted
 /// runs so a token that contains whitespace (a quoted `C:\Program Files\...` path, a
 /// `"a b"` flag value) survives whole. This is a best-effort inverse of the
-/// `argv.join(" ")` the recorder stores: quotes group and the quote characters
-/// themselves are dropped; an unterminated quote runs to the end of the string. It is
-/// deliberately minimal (no backslash escaping, no shell expansion) — the lossless fix
-/// is recording argv as an array, which is future work.
+/// `argv.join(" ")` the recorder stored before schema v7: quotes group and the quote
+/// characters themselves are dropped; an unterminated quote runs to the end of the
+/// string. It is deliberately minimal (no backslash escaping, no shell expansion).
+///
+/// **Only applies to pre-v7 sessions.** A v7 session records its argv as a JSON array
+/// (`sessions.argv_json`), which replay uses directly for a lossless reconstruction
+/// (see [`stdio_argv`]); this splitter is the fallback for a legacy row that carries no
+/// structured argv, where a command with embedded quotes or backslashes still cannot be
+/// restored exactly.
 fn split_command(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let mut cur = String::new();
@@ -265,21 +301,18 @@ fn split_command(command: &str) -> Vec<String> {
 /// id comes back. The whole exchange is bounded by `timeout`, and the child is always
 /// killed on the way out.
 ///
-/// The command is reconstructed by [`split_command`], a quote-aware inverse of the
-/// `argv.join(" ")` the recorder stores. It recovers arguments (e.g. a `C:\Program
-/// Files\...` path or a `"a b"` flag value) that were quoted to contain whitespace,
-/// but a command with embedded quotes or shell metacharacters still cannot be restored
-/// losslessly — the lossless fix is recording argv as an array (a future storage
-/// change). This is an accepted v1 limitation (documented in README).
+/// `argv` is the already-resolved server command line (see [`stdio_argv`]): a v7 session
+/// hands over the losslessly recorded argv array, while a legacy session falls back to
+/// [`split_command`], which recovers whitespace-quoted arguments but cannot restore
+/// embedded quotes or backslashes exactly.
 async fn replay_stdio(
-    command: &str,
+    argv: Vec<String>,
     raw: &str,
     rpc_id: &str,
     version: &str,
     timeout: Duration,
 ) -> Result<ReplayResult, ReplayError> {
-    let parts = split_command(command);
-    let Some((program, args)) = parts.split_first() else {
+    let Some((program, args)) = argv.split_first() else {
         return Err(ReplayError::Internal(
             "recorded session command is empty; cannot reconstruct the server".to_owned(),
         ));
@@ -819,5 +852,43 @@ mod tests {
         assert_eq!(split_command(r#"pre"a b"post"#), vec!["prea bpost"]);
         // An empty command yields no argv (the caller reports "empty command").
         assert!(split_command("   ").is_empty());
+    }
+
+    #[test]
+    fn stdio_argv_prefers_lossless_argv_json_over_split_command() {
+        // A v7 argv with whitespace, a double quote, and a backslash — the exact cases
+        // split_command cannot restore — round-trips exactly through argv_json.
+        let argv = vec![
+            r"C:\Program Files\srv\mcp.exe".to_owned(),
+            "--flag".to_owned(),
+            r#"a "b" c\d"#.to_owned(),
+        ];
+        let json = serde_json::to_string(&argv).unwrap();
+        assert_eq!(stdio_argv("ignored display command", Some(&json)), argv);
+
+        // split_command applied to the joined form loses the quotes/backslash, proving
+        // argv_json is strictly better rather than merely equivalent.
+        assert_ne!(
+            split_command(r#"C:\Program Files\srv\mcp.exe --flag a "b" c\d"#),
+            argv
+        );
+
+        // A legacy session (no argv_json) falls back to split_command...
+        assert_eq!(
+            stdio_argv("npx -y @scope/server", None),
+            vec!["npx", "-y", "@scope/server"]
+        );
+        // ...as does an unparseable argv_json.
+        assert_eq!(stdio_argv("npx server", Some("not json")), vec!["npx", "server"]);
+    }
+
+    #[test]
+    fn replay_is_http_prefers_recorded_transport_then_sniffs() {
+        // The recorded transport column is authoritative, even against a sniff.
+        assert!(replay_is_http("npx -y server", Some("http")));
+        assert!(!replay_is_http("http://127.0.0.1/u/x", Some("stdio")));
+        // A legacy row (no transport) falls back to sniffing the command's scheme.
+        assert!(replay_is_http("https://example.test/mcp", None));
+        assert!(!replay_is_http("npx -y server", None));
     }
 }
