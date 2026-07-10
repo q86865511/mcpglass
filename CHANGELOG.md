@@ -4,6 +4,32 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Structured server identity (schema v7)** — a session now records its server's
+  identity as structured data (`program`, the full `argv` as a JSON array, `transport`,
+  and a `server_id` hash) instead of relying on the joined command string. Two runs of
+  the same launcher pointed at *different* projects are now distinct identities, so their
+  tool fingerprints no longer share a baseline and cross-contaminate rug-pull detection.
+  Environment is excluded from identity by construction and can never enter the hash.
+- **Lossless replay reconstruction** — stdio replay now re-spawns the server from the
+  recorded `argv` array, so arguments containing whitespace, quotes, or backslashes are
+  reproduced exactly; `replay` also reads the recorded `transport` instead of sniffing
+  the command. Legacy pre-v7 sessions fall back to the previous quote-aware command
+  splitter.
+
+### Changed
+
+- **Fingerprint baselines survive the v7 upgrade** — tool-fingerprint history is now
+  scoped by the structured `server_id`. On first sighting after upgrade, a baseline
+  recorded under the old joined-command key is re-keyed onto the new `server_id` inside a
+  single transaction, so an established rug-pull baseline is preserved (no false-positive
+  alert and no silent reset). Existing v5/v6 databases upgrade in place; a nullable
+  `raw_len` column is added to `messages` (reserved for a future metadata-only recording
+  mode, unwritten by this release).
+
 ## [0.1.1] - 2026-07-10
 
 ### Added

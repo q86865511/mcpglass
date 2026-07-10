@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use policy::fingerprints_from_tools_list_versioned;
+use policy::{fingerprints_from_tools_list_versioned, server_identity_hash, ServerIdentity};
 use proxy_core::{parse_line, Direction};
 use storage::{
     ActionTaken, FingerprintOutcome, InjectEvent, Record, SecurityEvent, SecurityEventKind, Store,
@@ -162,6 +162,7 @@ pub(crate) fn storage_loop(
     logger: Logger,
     label: String,
     command_line: String,
+    identity: ServerIdentity,
 ) {
     let store = match Store::open_with_log(&db_path, &|m| logger.info(m)) {
         Ok(s) => s,
@@ -172,7 +173,25 @@ pub(crate) fn storage_loop(
             return;
         }
     };
-    let session_id = match store.begin_session(&label, &command_line) {
+    // The structured server identity (schema v7) is the fingerprint scope key across
+    // sessions. `server_id` is its hash; `legacy_key` reproduces the pre-v7 scope key
+    // (stdio: `argv.join(" ")`; http: the url) — which is exactly `command_line` on both
+    // transports — so a baseline recorded before the upgrade is found and re-keyed
+    // rather than reset. The argv/program/transport are persisted on the session row.
+    let server_id = server_identity_hash(&identity);
+    let legacy_key = command_line.clone();
+    let argv_json = match &identity {
+        ServerIdentity::Stdio { argv } => Some(serde_json::to_string(argv).unwrap_or_default()),
+        ServerIdentity::Http { .. } => None,
+    };
+    let session_id = match store.begin_session_with_identity(
+        &label,
+        &command_line,
+        identity.program(),
+        argv_json.as_deref(),
+        identity.transport(),
+        &server_id,
+    ) {
         Ok(id) => id,
         Err(e) => {
             logger.error(format!("begin_session failed ({e:#}); recording disabled"));
@@ -180,10 +199,6 @@ pub(crate) fn storage_loop(
             return;
         }
     };
-    // The server's start command is this server's stable identity, so fingerprint
-    // scoping (rug-pull detection) keys on it across sessions — a later wrap of the
-    // same command compares against what it advertised before.
-    let server_key = command_line.as_str();
     // Outstanding tools/list requests, so only their responses are fingerprinted.
     // Requests are forwarded before their tap is enqueued and a response cannot
     // precede its request, so the id is present here by the time the matching
@@ -294,7 +309,8 @@ pub(crate) fn storage_loop(
                         record_fingerprints(
                             &store,
                             session_id,
-                            server_key,
+                            &server_id,
+                            &legacy_key,
                             &ev.raw,
                             ev.ts_ms,
                             &logger,
@@ -350,12 +366,15 @@ pub(crate) fn storage_loop(
 /// `Reverted` detail notes the oscillation. A single event kind is reused for both
 /// so no CHECK-constraint migration or dashboard change is needed.
 ///
-/// `server_key` scopes the comparison to this server's identity so a change is
-/// detected across sessions (the caller passes the session's start command).
+/// `server_id` scopes the comparison to this server's structured identity so a change
+/// is detected across sessions; `legacy_key` is the pre-v7 scope key (the joined
+/// command / url) so a baseline recorded before the identity upgrade is re-keyed onto
+/// `server_id` rather than reset (see [`Store::record_fingerprint`]).
 pub(crate) fn record_fingerprints(
     store: &Store,
     session_id: i64,
-    server_key: &str,
+    server_id: &str,
+    legacy_key: &str,
     raw: &[u8],
     ts_ms: i64,
     logger: &Logger,
@@ -364,7 +383,9 @@ pub(crate) fn record_fingerprints(
         return;
     };
     for (tool, fp) in fingerprints_from_tools_list_versioned(&value) {
-        match store.record_fingerprint(session_id, server_key, &tool, &fp.v1, &fp.v2, &fp.v3, ts_ms) {
+        match store.record_fingerprint(
+            session_id, server_id, legacy_key, &tool, &fp.v1, &fp.v2, &fp.v3, ts_ms,
+        ) {
             Ok(outcome @ (FingerprintOutcome::Changed | FingerprintOutcome::Reverted)) => {
                 let detail = match outcome {
                     FingerprintOutcome::Reverted => format!(
@@ -582,6 +603,9 @@ mod tests {
             Logger::open(None),
             "t".to_owned(),
             "srv".to_owned(),
+            ServerIdentity::Stdio {
+                argv: vec!["srv".to_owned()],
+            },
         );
     }
 
@@ -841,6 +865,76 @@ mod tests {
             vec!["search".to_owned()],
             "a CreateTaskResult must not be fingerprinted nor consume the pending tools/list"
         );
+    }
+
+    // --- identity re-key on upgrade (WF5) -----------------------------------
+
+    #[test]
+    fn upgrade_baseline_survives_identity_rekey_without_alert() {
+        // A fingerprint recorded pre-v7 under the joined-command `server_key` must be
+        // found and re-keyed onto the structured `server_id` on the first post-upgrade
+        // sighting — Unchanged, no rug-pull alert, no residual legacy-scoped rows. This
+        // is the end-to-end guard that the lazy re-key never silently zeroes a baseline.
+        let tmp = TmpDb::new("lazy-rekey-e2e");
+        let db = tmp.db();
+        let resp = r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[{"name":"search","description":"y"}]}}"#;
+        // The exact v3 hash the tap will compute for this tool.
+        let value: serde_json::Value = serde_json::from_str(resp).unwrap();
+        let fp_v3 = fingerprints_from_tools_list_versioned(&value)[0].1.v3.clone();
+
+        // Seed a pre-v7 baseline under the legacy joined-command key.
+        {
+            let store = Store::open(&db).unwrap();
+            let sid = store.begin_session("legacy", "npx some-server").unwrap();
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO tool_fingerprints
+                    (session_id, server_key, tool_name, fingerprint, first_seen_ts_ms, last_seen_ts_ms, fp_version)
+                 VALUES (?1, 'npx some-server', 'search', ?2, 1, 1, 3)",
+                rusqlite::params![sid, fp_v3],
+            )
+            .unwrap();
+        }
+
+        // A new session for the SAME server (structured identity) re-advertises `search`
+        // with the identical definition.
+        let (tx, rx) = mpsc::channel::<StorageMsg>(64);
+        tx.try_send(tap_ev(Direction::C2s, 1, r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#))
+            .unwrap();
+        tx.try_send(tap_ev(Direction::S2c, 2, resp)).unwrap();
+        drop(tx);
+        storage_loop(
+            rx,
+            db.clone(),
+            Logger::open(None),
+            "run".to_owned(),
+            "npx some-server".to_owned(),
+            ServerIdentity::Stdio {
+                argv: vec!["npx".to_owned(), "some-server".to_owned()],
+            },
+        );
+
+        // No rug-pull alert: the baseline was re-keyed, not reset.
+        assert_eq!(
+            fingerprint_change_count(&db),
+            0,
+            "an identity upgrade must not raise a fingerprint_change event"
+        );
+        // The legacy-scoped row is gone (migrated to the structured server_id), and it
+        // is the only fingerprint row (no duplicate baseline was inserted).
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let legacy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_fingerprints WHERE server_key = 'npx some-server'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0, "the legacy-keyed baseline must be re-keyed away");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_fingerprints", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "exactly one baseline row survives, under the structured id");
     }
 
     // --- passive protocol-version observation (WF1) -------------------------

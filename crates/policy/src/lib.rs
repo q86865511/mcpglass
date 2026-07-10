@@ -402,6 +402,65 @@ pub fn fingerprints_from_tools_list_versioned(
         .collect()
 }
 
+/// A server's stable identity, hashed into the `server_id` that scopes rug-pull
+/// detection across sessions. Structured on purpose: two runs of the *same* program
+/// with *different* argv (e.g. the same launcher pointed at different projects) are
+/// distinct identities, and an argv token that contains whitespace, quotes, or
+/// backslashes survives verbatim (unlike the pre-v7 `argv.join(" ")` heuristic).
+///
+/// There is deliberately **no** `env` field: environment is excluded from identity by
+/// construction, so it can never leak into the hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerIdentity {
+    /// A spawned stdio server, identified by its full argv (`argv[0]` is the program).
+    Stdio { argv: Vec<String> },
+    /// An HTTP (Streamable HTTP) upstream, identified by its URL verbatim.
+    Http { url: String },
+}
+
+impl ServerIdentity {
+    /// The on-disk `transport` token: `"stdio"` or `"http"`.
+    pub fn transport(&self) -> &'static str {
+        match self {
+            ServerIdentity::Stdio { .. } => "stdio",
+            ServerIdentity::Http { .. } => "http",
+        }
+    }
+
+    /// The program (`argv[0]`) for an stdio identity; `None` for HTTP (or an empty argv).
+    pub fn program(&self) -> Option<&str> {
+        match self {
+            ServerIdentity::Stdio { argv } => argv.first().map(String::as_str),
+            ServerIdentity::Http { .. } => None,
+        }
+    }
+}
+
+/// SHA-256 over the canonical JSON of a server's structured identity — the `server_id`
+/// that scopes tool-fingerprint history. Pure and deterministic: the same identity
+/// always hashes to the same value, and the canonical (key-sorted) form makes it
+/// independent of field order.
+///
+/// * stdio → `{"transport":"stdio","program":argv[0],"argv":[...]}` (`program` is Null
+///   when argv is empty).
+/// * http → `{"transport":"http","url":"<url verbatim>"}` — the URL is **not**
+///   normalised: any normalisation rule could change over time and silently re-key an
+///   established baseline, so the raw string is the stable choice.
+pub fn server_identity_hash(identity: &ServerIdentity) -> String {
+    let subset = match identity {
+        ServerIdentity::Stdio { argv } => serde_json::json!({
+            "transport": "stdio",
+            "program": argv.first().cloned().map(Value::String).unwrap_or(Value::Null),
+            "argv": argv,
+        }),
+        ServerIdentity::Http { url } => serde_json::json!({
+            "transport": "http",
+            "url": url,
+        }),
+    };
+    hash_subset(&subset)
+}
+
 /// Canonical JSON writer: objects are emitted with keys sorted recursively so the
 /// fingerprint is stable regardless of the source key order (and independent of
 /// whether serde_json's `preserve_order` feature is enabled anywhere in the
@@ -979,6 +1038,61 @@ mod tests {
         assert!(fingerprints_from_tools_list_versioned(&json!({"result": {}})).is_empty());
         assert!(
             fingerprints_from_tools_list_versioned(&json!({"result": {"tools": "nope"}})).is_empty()
+        );
+    }
+
+    // --- server identity (WF5) ----------------------------------------------
+
+    #[test]
+    fn server_identity_hash_is_deterministic_and_field_sensitive() {
+        // The same identity always hashes to the same value (canonical, order-free).
+        let a = ServerIdentity::Stdio {
+            argv: vec!["npx".to_owned(), "-y".to_owned(), "server".to_owned()],
+        };
+        let b = ServerIdentity::Stdio {
+            argv: vec!["npx".to_owned(), "-y".to_owned(), "server".to_owned()],
+        };
+        assert_eq!(server_identity_hash(&a), server_identity_hash(&b));
+
+        // Same program, different later argv (e.g. a launcher pointed at a different
+        // project) is a DISTINCT identity — the whole argv participates, not just argv[0].
+        let other_project = ServerIdentity::Stdio {
+            argv: vec!["npx".to_owned(), "-y".to_owned(), "server-other".to_owned()],
+        };
+        assert_ne!(server_identity_hash(&a), server_identity_hash(&other_project));
+
+        // The accessors expose the program and transport.
+        assert_eq!(a.program(), Some("npx"));
+        assert_eq!(a.transport(), "stdio");
+    }
+
+    #[test]
+    fn server_identity_hash_http_is_url_stable_and_distinct_from_stdio() {
+        let u1 = ServerIdentity::Http {
+            url: "http://127.0.0.1:9000/u/x".to_owned(),
+        };
+        let u1_again = ServerIdentity::Http {
+            url: "http://127.0.0.1:9000/u/x".to_owned(),
+        };
+        let u2 = ServerIdentity::Http {
+            url: "http://127.0.0.1:9000/u/y".to_owned(),
+        };
+        // Same URL -> same server_id; a different URL -> a different one.
+        assert_eq!(server_identity_hash(&u1), server_identity_hash(&u1_again));
+        assert_ne!(server_identity_hash(&u1), server_identity_hash(&u2));
+        assert_eq!(u1.transport(), "http");
+        assert_eq!(u1.program(), None);
+
+        // A stdio identity whose argv happens to render like the URL is still a
+        // different hash — transport is part of the canonical subset. (This is also a
+        // documentary check that `ServerIdentity` has no `env` variant field, so an
+        // environment value cannot enter the hash: it is unrepresentable by type.)
+        let stdio_lookalike = ServerIdentity::Stdio {
+            argv: vec!["http://127.0.0.1:9000/u/x".to_owned()],
+        };
+        assert_ne!(
+            server_identity_hash(&u1),
+            server_identity_hash(&stdio_lookalike)
         );
     }
 

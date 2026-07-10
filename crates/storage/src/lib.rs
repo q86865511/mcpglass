@@ -46,7 +46,20 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 /// left NULL (a legacy session simply has no recorded protocol version). This lets
 /// replay reconstruct a session with the version it actually negotiated instead of
 /// the build's default constant.
-const SCHEMA_VERSION: i64 = 6;
+///
+/// v6 -> v7 is additive again: it adds four nullable columns to `sessions` —
+/// `program` (stdio: `argv[0]`; http: NULL), `argv_json` (stdio: the full argv as a
+/// JSON array; http: NULL), `transport` (`'stdio'` | `'http'`), and `server_id` (the
+/// sha256 of the structured [`policy::ServerIdentity`], the cross-session
+/// rug-pull-detection scope key) — plus one nullable `raw_len` column to `messages`
+/// (byte length of the raw frame; reserved for a later metadata-only recording mode
+/// and left unwritten by this version). All five are nullable via `ALTER TABLE ADD
+/// COLUMN`, so existing rows are preserved with them NULL (a legacy session has no
+/// structured identity and falls back to the `command` display string). Structured
+/// identity lets fingerprint history be scoped by a real identity — the same argv
+/// under a different project is a distinct server — and lets `replay` reconstruct argv
+/// losslessly instead of re-splitting the joined `command`.
+const SCHEMA_VERSION: i64 = 7;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -81,6 +94,18 @@ pub struct SessionSummary {
     /// `"header"` (an `MCP-Protocol-Version` header on an HTTP request). `None` when
     /// no version was observed.
     pub protocol_version_source: Option<String>,
+    /// The server program: `argv[0]` for a stdio session. `None` for an HTTP session
+    /// or a legacy pre-v7 row.
+    pub program: Option<String>,
+    /// The full stdio argv as a JSON array string, for lossless `replay`
+    /// reconstruction. `None` for an HTTP session or a legacy pre-v7 row.
+    pub argv_json: Option<String>,
+    /// The transport this session used: `"stdio"` or `"http"`. `None` for a legacy
+    /// pre-v7 row (replay then falls back to sniffing the `command`).
+    pub transport: Option<String>,
+    /// The structured server identity hash (`policy::server_identity_hash`) that scopes
+    /// tool-fingerprint history. `None` for a legacy pre-v7 row.
+    pub server_id: Option<String>,
 }
 
 /// Filter + page window for [`Store::messages`]. All fields optional except the
@@ -419,18 +444,19 @@ impl Store {
         self.migrate_v3_add_server_key()?;
         self.migrate_v4_add_fp_columns()?;
         self.migrate_v6_add_session_protocol_columns()?;
+        self.migrate_v7_add_identity_columns()?;
 
-        // BEGIN/COMMIT makes table creation and the `user_version = 6` stamp one
+        // BEGIN/COMMIT makes table creation and the `user_version = 7` stamp one
         // atomic unit, so a concurrent reader's legacy-v0 probe (see
         // `is_legacy_v0`) can never observe the `messages` table mid-creation
         // with `user_version` still at 0 and misclassify a fresh db as v0.
         //
-        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4/v5/v6 upgrade
+        // `CREATE TABLE IF NOT EXISTS` makes the v1 -> v2/v3/v4/v5/v6/v7 upgrade
         // additive: on an existing file the sessions/messages tables are left
         // untouched, any missing tables (including `inject_events` on a pre-v5 file)
-        // are appended, and `user_version` is bumped to 6. The `sessions` columns
-        // added at v6 are patched onto an existing table above; a fresh db builds
-        // them from the CREATE here.
+        // are appended, and `user_version` is bumped to 7. The `sessions` columns
+        // added at v6/v7 (and the `messages.raw_len` column added at v7) are patched
+        // onto an existing table above; a fresh db builds them from the CREATE here.
         self.conn
             .execute_batch(
                 "BEGIN;
@@ -442,7 +468,11 @@ impl Store {
                     ended_at_ms   INTEGER,
                     protocol_version        TEXT,
                     client_protocol_version TEXT,
-                    protocol_version_source TEXT CHECK (protocol_version_source IN ('initialize','header'))
+                    protocol_version_source TEXT CHECK (protocol_version_source IN ('initialize','header')),
+                    program       TEXT,
+                    argv_json     TEXT,
+                    transport     TEXT CHECK (transport IN ('stdio','http')),
+                    server_id     TEXT
                 );
                 CREATE TABLE IF NOT EXISTS messages (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -453,7 +483,8 @@ impl Store {
                     method        TEXT,
                     rpc_id        TEXT,
                     is_valid_json INTEGER NOT NULL,
-                    is_error      INTEGER NOT NULL DEFAULT 0
+                    is_error      INTEGER NOT NULL DEFAULT 0,
+                    raw_len       INTEGER
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_session_id
                     ON messages(session_id, id);
@@ -496,10 +527,10 @@ impl Store {
                 );
                 CREATE INDEX IF NOT EXISTS idx_inject_events_session_id
                     ON inject_events(session_id, id);
-                PRAGMA user_version = 6;
+                PRAGMA user_version = 7;
                 COMMIT;",
             )
-            .context("creating v6 schema")?;
+            .context("creating v7 schema")?;
         Ok(())
     }
 
@@ -630,7 +661,65 @@ impl Store {
         Ok(())
     }
 
-    /// Open a new session; returns its id. Call once per `wrap` invocation.
+    /// Add the four structured-identity columns to a pre-v7 `sessions` table
+    /// (`program`, `argv_json`, `transport`, `server_id`) and the `raw_len` column to a
+    /// pre-v7 `messages` table. All are nullable, so existing rows backfill to NULL (a
+    /// legacy session has no structured identity; a legacy message no recorded raw
+    /// length). A no-op when a table is absent (fresh db, handled by the CREATE in
+    /// [`Store::init_schema`]) or the columns already exist (a v7 file).
+    ///
+    /// Kept separate from the CREATE batch, and gated on an explicit column probe, for
+    /// the same reason as [`Store::migrate_v3_add_server_key`]: `ALTER TABLE ADD COLUMN`
+    /// is not conditional in SQLite. The `transport` CHECK constraint added here matches
+    /// the CREATE; a NULL backfill passes it (a CHECK only rejects an explicit
+    /// out-of-set value).
+    fn migrate_v7_add_identity_columns(&self) -> Result<()> {
+        for (table, columns) in [
+            (
+                "sessions",
+                &[
+                    ("program", "program TEXT"),
+                    ("argv_json", "argv_json TEXT"),
+                    (
+                        "transport",
+                        "transport TEXT CHECK (transport IN ('stdio','http'))",
+                    ),
+                    ("server_id", "server_id TEXT"),
+                ][..],
+            ),
+            ("messages", &[("raw_len", "raw_len INTEGER")][..]),
+        ] {
+            let table_exists = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if !table_exists {
+                continue;
+            }
+            for (col, decl) in columns {
+                let has_col: i64 = self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+                    params![col],
+                    |r| r.get(0),
+                )?;
+                if has_col == 0 {
+                    self.conn
+                        .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl}"))
+                        .with_context(|| format!("adding {col} column (v6 -> v7)"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a new session with no structured identity; returns its id. Used by
+    /// identity-less callers (legacy paths and tests); the four v7 identity columns are
+    /// left NULL. Production callers use [`Store::begin_session_with_identity`].
     pub fn begin_session(&self, label: &str, command: &str) -> Result<i64> {
         self.conn
             .execute(
@@ -638,6 +727,33 @@ impl Store {
                 params![label, command, now_ms()],
             )
             .context("beginning session")?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Open a new session carrying its structured server identity (schema v7); returns
+    /// its id. Call once per `wrap`/gateway upstream. `command` still stores the
+    /// human-readable display string (unchanged), while `program`/`argv_json`/
+    /// `transport`/`server_id` record the structured identity: for stdio, `program` is
+    /// `argv[0]` and `argv_json` the full argv as a JSON array; for HTTP both are `None`.
+    /// `server_id` is `policy::server_identity_hash` — the cross-session
+    /// fingerprint-scope key. Best-effort like [`Store::begin_session`].
+    pub fn begin_session_with_identity(
+        &self,
+        label: &str,
+        command: &str,
+        program: Option<&str>,
+        argv_json: Option<&str>,
+        transport: &str,
+        server_id: &str,
+    ) -> Result<i64> {
+        self.conn
+            .execute(
+                "INSERT INTO sessions
+                    (label, command, started_at_ms, program, argv_json, transport, server_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![label, command, now_ms(), program, argv_json, transport, server_id],
+            )
+            .context("beginning session with identity")?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -708,7 +824,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT s.id, s.label, s.command, s.started_at_ms, s.ended_at_ms,
                     (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                    s.protocol_version, s.client_protocol_version, s.protocol_version_source
+                    s.protocol_version, s.client_protocol_version, s.protocol_version_source,
+                    s.program, s.argv_json, s.transport, s.server_id
              FROM sessions s
              ORDER BY s.id DESC",
         )?;
@@ -726,7 +843,8 @@ impl Store {
             .query_row(
                 "SELECT s.id, s.label, s.command, s.started_at_ms, s.ended_at_ms,
                         (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
-                        s.protocol_version, s.client_protocol_version, s.protocol_version_source
+                        s.protocol_version, s.client_protocol_version, s.protocol_version_source,
+                        s.program, s.argv_json, s.transport, s.server_id
                  FROM sessions s
                  WHERE s.id = ?1",
                 params![id],
@@ -949,6 +1067,21 @@ impl Store {
     /// sessions: the canonical rug-pull is a server approved on one `wrap` that then
     /// mutates a tool on a *later* one. `session_id` is stored for traceability.
     ///
+    /// **Lazy re-key (v7).** The scope key is now the structured `server_id`
+    /// (`policy::server_identity_hash`), but rows recorded before v7 are keyed on the
+    /// old `legacy_key` (stdio: `argv.join(" ")`; http: the URL). To avoid resetting an
+    /// established baseline on upgrade, when `server_id` has no history for this
+    /// `(server, tool)` but `legacy_key` does, the server's whole fingerprint history is
+    /// re-keyed from `legacy_key` to `server_id` **inside the same transaction** as the
+    /// comparison and insert. The re-key is safe against the `UNIQUE (server_key,
+    /// tool_name, fingerprint)` index: it only runs while `server_id` holds no rows for
+    /// this tool, and a fresh `server_id` (a sha256 never used pre-v7) only gains rows
+    /// via this re-key or via first-sighting inserts of tools that have no legacy
+    /// baseline either — the migrated tools and the freshly-inserted ones never share a
+    /// `tool_name`, so no `(tool, fingerprint)` can collide. `server_id ==
+    /// legacy_key` (identity-less callers passing the same value for both) skips the
+    /// re-key and behaves exactly as before.
+    ///
     /// Append-only for distinct fingerprints: `Changed` inserts a new row and keeps
     /// the prior one(s); `Unchanged`/`Reverted` only refresh an existing row's
     /// `last_seen_ts_ms` (and re-pin a v1 row), so a tool's fingerprint history is
@@ -957,30 +1090,131 @@ impl Store {
     pub fn record_fingerprint(
         &self,
         session_id: i64,
-        server_key: &str,
+        server_id: &str,
+        legacy_key: &str,
         tool_name: &str,
         fp_v1: &str,
         fp_v2: &str,
         fp_v3: &str,
         ts_ms: i64,
     ) -> Result<FingerprintOutcome> {
-        // Load history for this (server, tool), most recent observation first. A
-        // NULL last_seen (legacy pre-v4 row) falls back to first_seen for ordering.
+        // Re-key + compare + insert are one atomic unit: an upgrade must not leave a
+        // half-migrated scope, and (in the gateway's multi-connection layout) the write
+        // must be serialised. Use `BEGIN IMMEDIATE` so the write lock is taken up front:
+        // a DEFERRED transaction would read first and only promote to a writer on the
+        // UPDATE/INSERT, and two connections promoting at once is the one deadlock
+        // `busy_timeout` cannot resolve (the same hazard `init_schema` avoids). On any
+        // error the transaction is rolled back before the error propagates.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .context("beginning fingerprint transaction")?;
+        match self.record_fingerprint_txn(
+            session_id, server_id, legacy_key, tool_name, fp_v1, fp_v2, fp_v3, ts_ms,
+        ) {
+            Ok(outcome) => {
+                // A failed COMMIT must not leak an open transaction: the connection
+                // lives for the whole session, and every later `BEGIN IMMEDIATE` on it
+                // would fail ("transaction within a transaction"), silently disabling
+                // fingerprinting until restart. Roll back best-effort, then propagate.
+                if let Err(e) = self
+                    .conn
+                    .execute_batch("COMMIT")
+                    .context("committing fingerprint transaction")
+                {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                // Best-effort rollback; the original error is what matters to the caller.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`Store::record_fingerprint`], run inside the caller's
+    /// `BEGIN IMMEDIATE` transaction: load the structured-`server_id` history, lazily
+    /// re-key a pre-v7 `legacy_key` baseline onto it, then classify and record.
+    #[allow(clippy::too_many_arguments)]
+    fn record_fingerprint_txn(
+        &self,
+        session_id: i64,
+        server_id: &str,
+        legacy_key: &str,
+        tool_name: &str,
+        fp_v1: &str,
+        fp_v2: &str,
+        fp_v3: &str,
+        ts_ms: i64,
+    ) -> Result<FingerprintOutcome> {
+        // Load history for the structured server_id first. If it has none for this
+        // (server, tool) but the pre-v7 legacy_key does, migrate the whole server's
+        // history to server_id once (idempotent: after the batch UPDATE, legacy_key holds
+        // no rows, so this never fires twice).
+        let mut rows = self.fingerprint_history(server_id, tool_name)?;
+        if rows.is_empty() && server_id != legacy_key {
+            let legacy = self.fingerprint_history(legacy_key, tool_name)?;
+            if !legacy.is_empty() {
+                self.conn
+                    .execute(
+                        "UPDATE tool_fingerprints SET server_key = ?1 WHERE server_key = ?2",
+                        params![server_id, legacy_key],
+                    )
+                    .context("re-keying fingerprints to the structured server_id")?;
+                rows = self.fingerprint_history(server_id, tool_name)?;
+            }
+        }
+
+        self.classify_fingerprint(
+            &rows, session_id, server_id, tool_name, fp_v1, fp_v2, fp_v3, ts_ms,
+        )
+    }
+
+    /// History for one `(server_key, tool)`, most recent observation first. A NULL
+    /// `last_seen` (legacy pre-v4 row) falls back to `first_seen` for ordering. Returns
+    /// owned rows so the borrowed statement is dropped before any write in the same
+    /// transaction.
+    fn fingerprint_history(
+        &self,
+        server_key: &str,
+        tool_name: &str,
+    ) -> Result<Vec<(i64, String, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, fingerprint, fp_version
              FROM tool_fingerprints
              WHERE server_key = ?1 AND tool_name = ?2
              ORDER BY COALESCE(last_seen_ts_ms, first_seen_ts_ms) DESC, id DESC",
         )?;
-        let rows: Vec<(i64, String, i64)> = stmt
+        let rows = stmt
             .query_map(params![server_key, tool_name], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
 
+    /// Classify an observation against `rows` (already scoped to `server_id`/tool, most
+    /// recent first) and record it: insert a fresh baseline, touch a matched row, or
+    /// insert a changed one. The New/Unchanged/Reverted/Changed decision and the
+    /// dual-hash matching rule (a stored row is compared on the hash matching its own
+    /// `fp_version`).
+    #[allow(clippy::too_many_arguments)]
+    fn classify_fingerprint(
+        &self,
+        rows: &[(i64, String, i64)],
+        session_id: i64,
+        server_id: &str,
+        tool_name: &str,
+        fp_v1: &str,
+        fp_v2: &str,
+        fp_v3: &str,
+        ts_ms: i64,
+    ) -> Result<FingerprintOutcome> {
         // First sighting: pin the current (v3) baseline and stay silent.
         if rows.is_empty() {
-            self.insert_fingerprint(session_id, server_key, tool_name, fp_v3, ts_ms)?;
+            self.insert_fingerprint(session_id, server_id, tool_name, fp_v3, ts_ms)?;
             return Ok(FingerprintOutcome::New);
         }
 
@@ -1009,7 +1243,7 @@ impl Store {
         }
 
         // A definition never seen before for this (server, tool) -> Changed.
-        self.insert_fingerprint(session_id, server_key, tool_name, fp_v3, ts_ms)?;
+        self.insert_fingerprint(session_id, server_id, tool_name, fp_v3, ts_ms)?;
         Ok(FingerprintOutcome::Changed)
     }
 
@@ -1213,9 +1447,9 @@ fn build_where(session_id: i64, f: &MessageFilter) -> (String, Vec<Value>) {
     (clauses.join(" AND "), params)
 }
 
-/// Map a `sessions` row (joined with its live message count and the three v6
-/// protocol columns, in that column order) to a [`SessionSummary`]. Shared by
-/// [`Store::list_sessions`] and [`Store::session`].
+/// Map a `sessions` row (joined with its live message count, the three v6 protocol
+/// columns, and the four v7 identity columns, in that column order) to a
+/// [`SessionSummary`]. Shared by [`Store::list_sessions`] and [`Store::session`].
 fn map_session_summary(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
     Ok(SessionSummary {
         id: r.get(0)?,
@@ -1227,6 +1461,10 @@ fn map_session_summary(r: &rusqlite::Row) -> rusqlite::Result<SessionSummary> {
         protocol_version: r.get(6)?,
         client_protocol_version: r.get(7)?,
         protocol_version_source: r.get(8)?,
+        program: r.get(9)?,
+        argv_json: r.get(10)?,
+        transport: r.get(11)?,
+        server_id: r.get(12)?,
     })
 }
 
@@ -1444,8 +1682,10 @@ mod tests {
     /// hashes are distinct derived strings. Since fresh-db rows are all v3, matching
     /// keys on the v3 value, so `fp` alone drives New/Unchanged/Changed/Reverted.
     fn rf(store: &Store, sid: i64, srv: &str, tool: &str, fp: &str, ts: i64) -> FingerprintOutcome {
+        // Pass `srv` as both server_id and legacy_key: identical keys skip the lazy
+        // re-key, so this exercises the classification logic exactly as pre-v7.
         store
-            .record_fingerprint(sid, srv, tool, &format!("{fp}-v1"), &format!("{fp}-v2"), fp, ts)
+            .record_fingerprint(sid, srv, srv, tool, &format!("{fp}-v1"), &format!("{fp}-v2"), fp, ts)
             .unwrap()
     }
 
@@ -1800,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_to_v6_additive_upgrade_preserves_data() {
+    fn v1_to_v7_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v1-upgrade");
         let db = tmp.db();
         write_legacy_v1_db(&db);
@@ -1812,7 +2052,7 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
 
         // ...without disturbing the pre-existing v1 data.
         let sessions = store.list_sessions().unwrap();
@@ -1910,18 +2150,18 @@ mod tests {
     }
 
     #[test]
-    fn v2_to_v6_additive_upgrade_preserves_data() {
+    fn v2_to_v7_additive_upgrade_preserves_data() {
         let tmp = TempDir::new("v2-upgrade");
         let db = tmp.db();
         write_legacy_v2_db(&db);
 
-        // Opening a v2 file upgrades it in place to v6 via ALTER TABLE ADD COLUMN...
+        // Opening a v2 file upgrades it in place to v7 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         // ...preserving all pre-existing v2 rows (sessions/messages/events).
         let sessions = store.list_sessions().unwrap();
@@ -1946,13 +2186,13 @@ mod tests {
         // New fingerprints record under the v3 server_key scope on the upgraded file.
         assert_eq!(rf(&store, 1, "srv", "t", "fp", 200), FingerprintOutcome::New);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v6.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v7.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 6);
+        assert_eq!(version2, 7);
     }
 
     #[test]
@@ -2201,18 +2441,18 @@ mod tests {
     }
 
     #[test]
-    fn v3_to_v6_additive_upgrade_preserves_and_backfills_fingerprints() {
+    fn v3_to_v7_additive_upgrade_preserves_and_backfills_fingerprints() {
         let tmp = TempDir::new("v3-upgrade");
         let db = tmp.db();
         write_legacy_v3_db(&db, "legacy_v1");
 
-        // Opening a v3 file upgrades it in place to v6 via ALTER TABLE ADD COLUMN...
+        // Opening a v3 file upgrades it in place to v7 via ALTER TABLE ADD COLUMN...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         // ...the legacy fingerprint row survives, backfilled to fp_version=1 with a
         // NULL last_seen_ts_ms (recency then falls back to first_seen_ts_ms).
@@ -2227,13 +2467,13 @@ mod tests {
         assert_eq!(fp_version, 1);
         assert_eq!(last_seen, None);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v6.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v7.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 6);
+        assert_eq!(version2, 7);
     }
 
     #[test]
@@ -2247,7 +2487,7 @@ mod tests {
 
         // v1 matches the stored legacy hash -> Unchanged, and the row is re-pinned.
         assert_eq!(
-            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashA", "v3hashA", 200).unwrap(),
+            store.record_fingerprint(1, "srv", "srv", "search", "v1hashA", "v2hashA", "v3hashA", 200).unwrap(),
             FingerprintOutcome::Unchanged
         );
         let (fp_version, fingerprint): (i64, String) = store
@@ -2264,7 +2504,7 @@ mod tests {
         // Now that the baseline folds in annotations + outputSchema, a later change to
         // one of those (same v1, different v3) IS detected as a change.
         assert_eq!(
-            store.record_fingerprint(1, "srv", "search", "v1hashA", "v2hashA", "v3hashB", 300).unwrap(),
+            store.record_fingerprint(1, "srv", "srv", "search", "v1hashA", "v2hashA", "v3hashB", 300).unwrap(),
             FingerprintOutcome::Changed
         );
     }
@@ -2278,7 +2518,7 @@ mod tests {
         let store = Store::open(&db).unwrap();
 
         assert_eq!(
-            store.record_fingerprint(1, "srv", "search", "v1hashB", "v2hashB", "v3hashB", 200).unwrap(),
+            store.record_fingerprint(1, "srv", "srv", "search", "v1hashB", "v2hashB", "v3hashB", 200).unwrap(),
             FingerprintOutcome::Changed
         );
     }
@@ -2349,19 +2589,19 @@ mod tests {
     }
 
     #[test]
-    fn v4_to_v6_additive_upgrade_adds_inject_events() {
+    fn v4_to_v7_additive_upgrade_adds_inject_events() {
         let tmp = TempDir::new("v4-upgrade");
         let db = tmp.db();
         write_legacy_v4_db(&db);
 
-        // Opening a v4 file upgrades it in place to v6 (inject_events + session
-        // protocol columns)...
+        // Opening a v4 file upgrades it in place to v7 (inject_events + session
+        // protocol columns + v7 identity columns)...
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         // ...preserving the pre-existing v4 rows...
         let sessions = store.list_sessions().unwrap();
@@ -2388,13 +2628,13 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(rows.len(), 1);
 
-        // Re-opening the upgraded file is a no-op and still v6.
+        // Re-opening the upgraded file is a no-op and still v7.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 6);
+        assert_eq!(version2, 7);
     }
 
     /// Hand-build a v5 file: the full v5 schema (sessions *without* the v6 protocol
@@ -2476,33 +2716,265 @@ mod tests {
     }
 
     #[test]
-    fn v5_to_v6_additive_upgrade_adds_session_protocol_columns() {
+    fn v5_to_v7_additive_upgrade_adds_session_protocol_columns() {
         let tmp = TempDir::new("v5-upgrade");
         let db = tmp.db();
         write_legacy_v5_db(&db);
 
-        // Opening a v5 file upgrades it in place to v6 (three nullable sessions
-        // columns), leaving the pre-existing row's protocol fields NULL.
+        // Opening a v5 file upgrades it in place to v7 (the three nullable v6 protocol
+        // columns plus the four v7 identity columns), leaving the pre-existing row's
+        // protocol and identity fields NULL.
         let store = Store::open(&db).unwrap();
         let version: i64 = store
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let row = store.session(1).unwrap().expect("session");
         assert_eq!(row.label, "old");
         assert_eq!(row.protocol_version, None);
         assert_eq!(row.client_protocol_version, None);
         assert_eq!(row.protocol_version_source, None);
+        // The v7 identity columns backfill to NULL on a legacy row.
+        assert_eq!(row.program, None);
+        assert_eq!(row.argv_json, None);
+        assert_eq!(row.transport, None);
+        assert_eq!(row.server_id, None);
 
-        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v6.
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v7.
         let store2 = Store::open(&db).unwrap();
         let version2: i64 = store2
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version2, 6);
+        assert_eq!(version2, 7);
+    }
+
+    /// Hand-build a v6 file: the full v6 schema (sessions *with* the three protocol
+    /// columns but *without* the v7 identity columns; messages *without* `raw_len`; plus
+    /// security_events/tool_fingerprints/inject_events) with a session, `user_version`
+    /// stamped 6.
+    fn write_legacy_v6_db(db: &Path) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "BEGIN;
+            CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                command TEXT NOT NULL,
+                started_at_ms INTEGER NOT NULL,
+                ended_at_ms INTEGER,
+                protocol_version TEXT,
+                client_protocol_version TEXT,
+                protocol_version_source TEXT CHECK (protocol_version_source IN ('initialize','header'))
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                raw TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT,
+                is_valid_json INTEGER NOT NULL,
+                is_error INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE security_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('policy_deny','secret_leak','fingerprint_change')),
+                rule TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                tool_name TEXT,
+                rpc_id TEXT,
+                action_taken TEXT NOT NULL CHECK (action_taken IN ('flagged','blocked'))
+            );
+            CREATE TABLE tool_fingerprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                tool_name TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                first_seen_ts_ms INTEGER NOT NULL,
+                server_key TEXT NOT NULL DEFAULT '',
+                fp_version INTEGER NOT NULL DEFAULT 1,
+                last_seen_ts_ms INTEGER,
+                UNIQUE (server_key, tool_name, fingerprint)
+            );
+            CREATE TABLE inject_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES sessions(id),
+                ts_ms INTEGER NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('c2s','s2c')),
+                rule TEXT NOT NULL,
+                fault TEXT NOT NULL CHECK (fault IN ('delay','error','drop','truncate')),
+                detail TEXT NOT NULL,
+                method TEXT,
+                rpc_id TEXT
+            );
+            PRAGMA user_version = 6;
+            COMMIT;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (label, command, started_at_ms) VALUES ('old', 'npx some-server', 42)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v6_to_v7_additive_upgrade_adds_identity_columns() {
+        let tmp = TempDir::new("v6-upgrade");
+        let db = tmp.db();
+        write_legacy_v6_db(&db);
+
+        // Opening a v6 file upgrades it in place to v7 (four sessions identity columns +
+        // messages.raw_len), leaving the pre-existing row's identity fields NULL.
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+
+        let row = store.session(1).unwrap().expect("session");
+        assert_eq!(row.command, "npx some-server");
+        assert_eq!(row.program, None);
+        assert_eq!(row.argv_json, None);
+        assert_eq!(row.transport, None);
+        assert_eq!(row.server_id, None);
+
+        // The new messages.raw_len column exists and is usable.
+        let has_raw_len: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'raw_len'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_raw_len, 1);
+
+        // Re-opening the upgraded file is a no-op (ALTERs not re-run) and still v7.
+        let store2 = Store::open(&db).unwrap();
+        let version2: i64 = store2
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version2, 7);
+    }
+
+    #[test]
+    fn record_fingerprint_lazy_rekeys_legacy_scope_without_alert() {
+        // The rug-pull baseline must survive the v7 identity upgrade: a fingerprint
+        // recorded pre-v7 under the joined-command `server_key` must be found and
+        // re-keyed to the structured `server_id` on first sighting — Unchanged, no
+        // reset, and no residual rows under the legacy key. This is the sole guard
+        // against the lazy re-key silently zeroing the baseline.
+        let tmp = TempDir::new("fp-lazy-rekey");
+        let db = tmp.db();
+        write_legacy_v6_db(&db);
+        // Seed a pre-v7 baseline for `search` under the legacy (joined-command) key.
+        {
+            let conn = Connection::open(&db).unwrap();
+            conn.execute(
+                "INSERT INTO tool_fingerprints
+                    (session_id, server_key, tool_name, fingerprint, first_seen_ts_ms, last_seen_ts_ms, fp_version)
+                 VALUES (1, 'npx some-server', 'search', 'v3base', 100, 100, 3)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap(); // upgrades to v7
+
+        let server_id = "structured-server-id"; // stands in for server_identity_hash(...)
+        let legacy_key = "npx some-server";
+        // First sighting under the structured id, same definition -> Unchanged (re-key).
+        assert_eq!(
+            store
+                .record_fingerprint(1, server_id, legacy_key, "search", "v1x", "v2x", "v3base", 200)
+                .unwrap(),
+            FingerprintOutcome::Unchanged
+        );
+
+        // The whole baseline moved to server_id: none left under the legacy key.
+        let legacy_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_fingerprints WHERE server_key = 'npx some-server'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_rows, 0, "legacy-scoped rows must be re-keyed, not left behind");
+        let new_rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_fingerprints WHERE server_key = ?1",
+                params![server_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_rows, 1, "the baseline is now scoped to the structured server_id");
+
+        // A genuine post-upgrade change is still caught under the structured id.
+        assert_eq!(
+            store
+                .record_fingerprint(1, server_id, legacy_key, "search", "v1y", "v2y", "v3changed", 300)
+                .unwrap(),
+            FingerprintOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn begin_session_with_identity_round_trips_and_argv_json_is_lossless() {
+        let tmp = TempDir::new("session-identity");
+        let store = Store::open(&tmp.db()).unwrap();
+
+        // A JSON argv array whose tokens carry whitespace, an (escaped) double quote,
+        // and a backslash — exactly the cases the pre-v7 `argv.join(" ")` +
+        // `split_command` round-trip could not preserve. The storage layer must persist
+        // and return it byte-for-byte (the serde round-trip itself is proven losslessly
+        // in `replay.rs`, whose crate has serde_json). The `program` is `argv[0]`.
+        let program = r"C:\Program Files\srv\mcp.exe";
+        let argv_json = r#"["C:\\Program Files\\srv\\mcp.exe","--flag","a \"b\" c\\d"]"#;
+        let sid = store
+            .begin_session_with_identity(
+                "srv",
+                "display command",
+                Some(program),
+                Some(argv_json),
+                "stdio",
+                "server-id-hash",
+            )
+            .unwrap();
+
+        let row = store.session(sid).unwrap().expect("session");
+        assert_eq!(row.command, "display command");
+        assert_eq!(row.program.as_deref(), Some(program));
+        assert_eq!(row.transport.as_deref(), Some("stdio"));
+        assert_eq!(row.server_id.as_deref(), Some("server-id-hash"));
+        // The argv_json column is returned verbatim, including the backslashes and the
+        // escaped quote that a joined-string representation would have mangled.
+        assert_eq!(row.argv_json.as_deref(), Some(argv_json));
+
+        // An HTTP identity leaves program/argv_json NULL.
+        let hid = store
+            .begin_session_with_identity(
+                "up",
+                "http://127.0.0.1:9000/u/x",
+                None,
+                None,
+                "http",
+                "http-id-hash",
+            )
+            .unwrap();
+        let hrow = store.session(hid).unwrap().expect("session");
+        assert_eq!(hrow.program, None);
+        assert_eq!(hrow.argv_json, None);
+        assert_eq!(hrow.transport.as_deref(), Some("http"));
     }
 
     #[test]
@@ -2517,7 +2989,7 @@ mod tests {
 
         assert_eq!(
             store
-                .record_fingerprint(1, "srv", "search", "v1x", "v2only", "v3new", 200)
+                .record_fingerprint(1, "srv", "srv", "search", "v1x", "v2only", "v3new", 200)
                 .unwrap(),
             FingerprintOutcome::Unchanged
         );
@@ -2536,7 +3008,7 @@ mod tests {
         // different v3) IS caught.
         assert_eq!(
             store
-                .record_fingerprint(1, "srv", "search", "v1x", "v2only", "v3changed", 300)
+                .record_fingerprint(1, "srv", "srv", "search", "v1x", "v2only", "v3changed", 300)
                 .unwrap(),
             FingerprintOutcome::Changed
         );
