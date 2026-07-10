@@ -132,6 +132,38 @@ body {
   margin-top: 5px;
 }
 
+/* A session row wraps the item button and its (hover-revealed) delete button. */
+.session-row {
+  position: relative;
+}
+
+.session-delete {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.session-row:hover .session-delete,
+.session-delete:focus-visible {
+  opacity: 1;
+}
+
+.session-delete:hover {
+  background: var(--danger, #b4231f);
+  color: #fff;
+}
+
 .badge-proto {
   background: rgba(63, 185, 80, 0.15);
   color: var(--green);

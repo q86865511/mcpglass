@@ -45,6 +45,10 @@ export interface MessagesResponse {
 export interface MessageDetail extends MessageSummary {
   raw: string;
   session_id: number;
+  // Original byte length when the frame was recorded metadata-only (raw is then
+  // ""); null for a full recording. Lets the UI distinguish "empty body" from
+  // "body deliberately not recorded".
+  raw_len: number | null;
 }
 
 export interface MethodStat {
@@ -135,6 +139,17 @@ async function getJson<T>(path: string): Promise<T> {
 
 export function fetchSessions(): Promise<SessionsResponse> {
   return getJson<SessionsResponse>("/api/sessions");
+}
+
+// Delete a session and all its recorded messages / security / inject events (its
+// tool fingerprints are kept). On a non-2xx the backend returns a plain-text
+// reason, surfaced as the Error.
+export async function deleteSession(id: number): Promise<void> {
+  const res = await fetch(`/api/sessions/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `delete session -> HTTP ${res.status}`);
+  }
 }
 
 export interface MessageFilters {

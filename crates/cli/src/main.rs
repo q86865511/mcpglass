@@ -24,13 +24,15 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
 use security::{Chunk, Decision, FrameAction, FramedStream};
-use tap::{now_ms, storage_loop, Logger, StorageMsg, TapEvent};
+use tap::{now_ms, storage_loop, Logger, RecordMode, StorageMsg, TapEvent};
 
 mod bloat;
 mod clients;
 mod dash;
+mod export;
 mod gateway;
 mod gateway_config;
+mod prune;
 mod replay;
 mod security;
 mod tap;
@@ -91,6 +93,12 @@ enum SubCmd {
         /// startup (before any byte is forwarded, so aborting is safe).
         #[arg(long)]
         inject: Option<PathBuf>,
+        /// How much of each frame to record: `full` (default), `metadata` (drop the raw
+        /// body but keep method/ids/direction/timing/size), or `off` (record nothing to
+        /// `messages`). Security and inject events are always recorded regardless — the
+        /// security promise is independent of recording. Set at startup only.
+        #[arg(long, value_enum, default_value_t = RecordMode::Full)]
+        record: RecordMode,
         /// The server command and its args, after `--`.
         #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
         command: Vec<String>,
@@ -166,6 +174,56 @@ enum SubCmd {
         /// `<data_local>/mcpglass/gateway.toml` (written by `attach`).
         #[arg(long = "upstream", value_parser = parse_upstream)]
         upstream: Vec<(String, String)>,
+        /// How much of each frame to record: `full` (default), `metadata`, or `off`.
+        /// Same semantics as `wrap --record`. Set at startup only.
+        #[arg(long, value_enum, default_value_t = RecordMode::Full)]
+        record: RecordMode,
+    },
+    /// Delete recorded sessions to reclaim space or drop stale data:
+    /// `mcpglass prune [--older-than <dur>] [--max-size <bytes>] [--dry-run]
+    /// [--vacuum] [--db P]`. At least one of `--older-than` / `--max-size` is required.
+    /// Tool fingerprints are never pruned (they are the cross-session rug-pull baseline).
+    Prune {
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Delete sessions started longer ago than this duration, e.g. `7d`, `24h`,
+        /// `30m`, `90s` (units: `d`/`h`/`m`/`s`; a bare number is seconds).
+        #[arg(long)]
+        older_than: Option<String>,
+        /// Delete oldest sessions until the database is at or under this size, e.g.
+        /// `500M`, `1G`, `250K` (units: `K`/`M`/`G` = 1024-based; a bare number is
+        /// bytes). Reaching the target vacuums the file to realise the space.
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Print what would be deleted (session/message counts, estimated space) without
+        /// touching the database.
+        #[arg(long)]
+        dry_run: bool,
+        /// After deleting, run VACUUM to return freed pages to the OS. Implied by
+        /// `--max-size`; use this to force it when only `--older-than` is given.
+        #[arg(long)]
+        vacuum: bool,
+    },
+    /// Export a single session to a self-contained JSON bundle with secrets masked:
+    /// `mcpglass export --session <id> --out bundle.json [--db P]`. A read-only
+    /// diagnostic tool — it opens the db read-only, records nothing, and always masks
+    /// (share the raw db file if you need un-masked data).
+    Export {
+        /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// The session id to export (from the dashboard or `mcpglass` output).
+        #[arg(long)]
+        session: i64,
+        /// Destination path for the JSON bundle.
+        #[arg(long)]
+        out: PathBuf,
+        /// Security policy file whose `custom_secret_patterns` are masked in addition
+        /// to the built-in ones. Pass the same file the proxy ran with, so the export
+        /// hides exactly what the live secret scan would flag.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     /// Re-send a recorded client->server request back to its server, out of band:
     /// `mcpglass replay <message-id> [--db P] [--timeout-secs N]`. A debugging probe,
@@ -222,9 +280,10 @@ async fn main() {
             policy,
             enforce,
             inject,
+            record,
             command,
         } => {
-            let code = run_wrap(db, log, name, policy, enforce, inject, command).await;
+            let code = run_wrap(db, log, name, policy, enforce, inject, record, command).await;
             std::process::exit(code);
         }
         SubCmd::Attach {
@@ -254,8 +313,28 @@ async fn main() {
             enforce,
             inject,
             upstream,
+            record,
         } => {
-            let code = gateway::run(port, db, log, policy, enforce, inject, upstream).await;
+            let code = gateway::run(port, db, log, policy, enforce, inject, upstream, record).await;
+            std::process::exit(code);
+        }
+        SubCmd::Prune {
+            db,
+            older_than,
+            max_size,
+            dry_run,
+            vacuum,
+        } => {
+            let code = prune::run(db, older_than, max_size, dry_run, vacuum).await;
+            std::process::exit(code);
+        }
+        SubCmd::Export {
+            db,
+            session,
+            out,
+            policy,
+        } => {
+            let code = export::run(db, session, out, policy).await;
             std::process::exit(code);
         }
         SubCmd::Replay {
@@ -292,6 +371,7 @@ type SharedStdout = Arc<AsyncMutex<tokio::io::Stdout>>;
 /// `.await` — so it cannot stall the wire.
 type SharedInjector = Option<Arc<Mutex<Injector>>>;
 
+#[allow(clippy::too_many_arguments)]
 async fn run_wrap(
     db: Option<PathBuf>,
     log: Option<PathBuf>,
@@ -299,6 +379,7 @@ async fn run_wrap(
     policy_path: Option<PathBuf>,
     enforce: bool,
     inject_path: Option<PathBuf>,
+    record: RecordMode,
     command: Vec<String>,
 ) -> i32 {
     let program = command[0].clone();
@@ -367,7 +448,7 @@ async fn run_wrap(
     // Storage owns a sync rusqlite connection on a dedicated blocking thread.
     let storage = tokio::task::spawn_blocking({
         let logger = logger.clone();
-        move || storage_loop(rx, db_path, logger, label, command_line, identity)
+        move || storage_loop(rx, db_path, logger, label, command_line, identity, record)
     });
 
     // Both write legs share this stdout so their writes stay frame-atomic.
@@ -386,6 +467,7 @@ async fn run_wrap(
         logger.clone(),
         frame_cap,
         injector.clone(),
+        record,
     ));
     // server -> client: frame-atomic passthrough, tapped as s2c (fingerprinting
     // runs on the storage thread, so this leg makes no synchronous decision).
@@ -396,6 +478,7 @@ async fn run_wrap(
         logger.clone(),
         frame_cap,
         injector.clone(),
+        record,
     ));
     // server stderr is the server's own diagnostic channel: raw passthrough, no tap.
     let t_err = tokio::spawn(async move {
@@ -672,6 +755,7 @@ async fn pump_c2s<R>(
     logger: Logger,
     max_line_bytes: usize,
     injector: SharedInjector,
+    record: RecordMode,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -822,14 +906,17 @@ async fn pump_c2s<R>(
                     }
                     // Record the message (even when blocked: it did occur) + persist
                     // every event. Best-effort; a full/closed channel just drops them
-                    // (logged once, to avoid per-frame synchronous IO on a stall).
-                    if tx
-                        .try_send(StorageMsg::Tap(TapEvent {
-                            direction: Direction::C2s,
-                            ts_ms: ts,
-                            raw: frame,
-                        }))
-                        .is_err()
+                    // (logged once, to avoid per-frame synchronous IO on a stall). In
+                    // `--record off` the tap is skipped entirely — the frame never even
+                    // reaches the channel — while security events below still flow.
+                    if record != RecordMode::Off
+                        && tx
+                            .try_send(StorageMsg::Tap(TapEvent {
+                                direction: Direction::C2s,
+                                ts_ms: ts,
+                                raw: frame,
+                            }))
+                            .is_err()
                     {
                         log_drop_once(
                             &drop_logged,
@@ -871,6 +958,7 @@ async fn pump_s2c<R>(
     logger: Logger,
     max_line_bytes: usize,
     injector: SharedInjector,
+    record: RecordMode,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -951,14 +1039,16 @@ async fn pump_s2c<R>(
                         }
                     }
                     // Tap second — best effort. tools/list fingerprinting is done
-                    // on the storage thread from this same raw frame.
-                    if tx
-                        .try_send(StorageMsg::Tap(TapEvent {
-                            direction: Direction::S2c,
-                            ts_ms: ts,
-                            raw: frame,
-                        }))
-                        .is_err()
+                    // on the storage thread from this same raw frame. In `--record off`
+                    // the tap is skipped entirely (the frame is already on the wire).
+                    if record != RecordMode::Off
+                        && tx
+                            .try_send(StorageMsg::Tap(TapEvent {
+                                direction: Direction::S2c,
+                                ts_ms: ts,
+                                raw: frame,
+                            }))
+                            .is_err()
                     {
                         log_drop_once(
                             &drop_logged,
@@ -1231,6 +1321,7 @@ mod tests {
             ServerIdentity::Stdio {
                 argv: vec!["echo".to_owned(), "cmd".to_owned()],
             },
+            RecordMode::Full,
         );
         let conn = rusqlite::Connection::open(&db).unwrap();
         let names: Vec<String> = conn
@@ -1306,6 +1397,7 @@ mod tests {
                 "run".to_owned(),
                 cmd.clone(),
                 ServerIdentity::Stdio { argv: argv.clone() },
+                RecordMode::Full,
             );
         };
 

@@ -229,6 +229,44 @@ pub fn scan_secrets(text: &str, custom: &[Regex]) -> Vec<SecretHit> {
     hits
 }
 
+/// Mask every built-in secret occurrence in `text`, replacing each match in place with
+/// its masked preview (the same head/tail masking [`scan_secrets`] uses for security
+/// events). Pure and self-contained — it compiles no regex on the call path and needs
+/// no policy — so a diagnostics exporter can mask a whole recorded frame (or an argv
+/// token) before it leaves the machine. Only the built-in patterns are applied; to also
+/// honor a policy's `custom_secret_patterns`, use [`Policy::mask_secrets`]. Applying the
+/// patterns in sequence is safe: a masked span contains `*`, which no built-in shape
+/// re-matches, so passes never compound.
+pub fn mask_secrets(text: &str) -> String {
+    mask_secrets_impl(text, &[])
+}
+
+fn mask_secrets_impl(text: &str, custom: &[Regex]) -> String {
+    let mut out = text.to_owned();
+    for (_, re) in builtin_patterns() {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| mask(&caps[0]))
+            .into_owned();
+    }
+    // Custom patterns run after the built-ins. A user regex could in principle match
+    // an already-masked span, which only masks harder — it can never un-mask.
+    for re in custom {
+        out = re
+            .replace_all(&out, |caps: &regex::Captures| mask(&caps[0]))
+            .into_owned();
+    }
+    out
+}
+
+impl Policy {
+    /// [`mask_secrets`], but also applying this policy's compiled
+    /// `custom_secret_patterns` — so an export masked under the same policy the proxy
+    /// ran with hides exactly what the live secret scan would have flagged.
+    pub fn mask_secrets(&self, text: &str) -> String {
+        mask_secrets_impl(text, &self.custom_compiled)
+    }
+}
+
 /// Scan only the `params.arguments` of a request, recursing into every string
 /// value it contains. Deliberately narrow: it never inspects the method name or
 /// a tool's advertised schema, which keeps a tool literally named like a token,
@@ -868,6 +906,25 @@ mod tests {
         assert!(preview.starts_with("AKIA"));
         assert!(preview.ends_with("LE"));
         assert!(!preview.contains("IOSFODNN"));
+    }
+
+    #[test]
+    fn mask_secrets_masks_builtins_in_place_and_leaves_plain_text() {
+        // An AWS key embedded in free text is masked (head/tail kept, middle starred),
+        // and the surrounding text is preserved.
+        let masked = mask_secrets("here is AKIAIOSFODNN7EXAMPLE in the log");
+        assert!(masked.starts_with("here is AKIA"));
+        assert!(masked.ends_with("in the log"));
+        assert!(!masked.contains("AKIAIOSFODNN7EXAMPLE"), "raw key must not survive: {masked}");
+        assert!(masked.contains('*'));
+
+        // Multiple different secrets in one string are all masked.
+        let both = mask_secrets(&format!("k1 sk-{} k2 ghp_{}", "d".repeat(24), "a".repeat(36)));
+        assert!(!both.contains(&"d".repeat(24)));
+        assert!(!both.contains(&"a".repeat(36)));
+
+        // Plain text with no secret is returned unchanged.
+        assert_eq!(mask_secrets("nothing secret here"), "nothing secret here");
     }
 
     #[test]

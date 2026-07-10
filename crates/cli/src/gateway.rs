@@ -44,7 +44,7 @@ use storage::{InjectEvent, SecurityEvent, Store};
 
 use crate::gateway_config::{self, GatewayConfig};
 use crate::security::{Decision, FrameAction};
-use crate::tap::{now_ms, storage_loop, Logger, StorageMsg, TapEvent};
+use crate::tap::{now_ms, storage_loop, Logger, RecordMode, StorageMsg, TapEvent};
 use crate::{fault_kind, inject_decide, log_drop_once, EXIT_POLICY_CONFIG, SharedInjector};
 
 /// Fail-open buffering ceiling, shared by both legs. On the c2s leg, a monitor-mode
@@ -82,6 +82,9 @@ struct GatewayState {
     /// Optional fault injector, shared across every route so its counters/RNG
     /// advance in lock-step (`None` unless `--inject` was given). See [`SharedInjector`].
     injector: SharedInjector,
+    /// How much of each frame to record (`--record`). `Off` skips every tap; the
+    /// per-upstream `storage_loop` applies the `Metadata`/`Full` body difference.
+    record: RecordMode,
 }
 
 /// Resolve configuration and run the gateway until the process is killed. Returns a
@@ -95,6 +98,7 @@ pub async fn run(
     enforce: bool,
     inject: Option<PathBuf>,
     upstreams_arg: Vec<(String, String)>,
+    record: RecordMode,
 ) -> i32 {
     let data_dir = crate::default_data_dir();
     let log_path = log.or_else(|| data_dir.as_ref().map(|d| d.join("mcpglass.log")));
@@ -153,6 +157,7 @@ pub async fn run(
         logger.clone(),
         frame_cap,
         injector,
+        record,
         |addr| {
             println!("Gateway listening on http://{addr}  (routes: POST|GET|DELETE /u/<name>)");
         },
@@ -182,6 +187,7 @@ async fn serve(
     logger: Logger,
     frame_cap: usize,
     injector: SharedInjector,
+    record: RecordMode,
     on_ready: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
     // Create the schema once, up front, so the per-upstream writer connections
@@ -209,7 +215,7 @@ async fn serve(
         // baseline survives the upgrade.
         let identity = ServerIdentity::Http { url: url.clone() };
         tokio::task::spawn_blocking(move || {
-            storage_loop(rx, db_path, logger, label, command_line, identity);
+            storage_loop(rx, db_path, logger, label, command_line, identity, record);
         });
         map.insert(
             name,
@@ -236,6 +242,7 @@ async fn serve(
         logger,
         frame_cap,
         injector,
+        record,
     };
 
     let app = Router::new()
@@ -342,13 +349,13 @@ async fn handle_post(
                     // tools/list request seen first, even when the response is a
                     // single buffered `application/json` body. `try_send` never
                     // gates the wire, so this ordering stays fail-open.
-                    tap_frame(up, &state.logger, Direction::C2s, ts, bytes.to_vec());
+                    tap_frame(up, &state.logger, state.record, Direction::C2s, ts, bytes.to_vec());
                     emit_events(up, &state.logger, decision.events);
                     relay_response(&state, up, resp).await
                 }
                 Err(resp) => {
                     // Upstream unreachable (502): still record the attempted request.
-                    tap_frame(up, &state.logger, Direction::C2s, ts, bytes.to_vec());
+                    tap_frame(up, &state.logger, state.record, Direction::C2s, ts, bytes.to_vec());
                     emit_events(up, &state.logger, decision.events);
                     resp
                 }
@@ -359,7 +366,7 @@ async fn handle_post(
             // appends a framing '\n'; an application/json HTTP body carries none.
             let body = resp.strip_suffix(b"\n").unwrap_or(&resp).to_vec();
             let response = (StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response();
-            tap_frame(up, &state.logger, Direction::C2s, ts, bytes.to_vec());
+            tap_frame(up, &state.logger, state.record, Direction::C2s, ts, bytes.to_vec());
             emit_events(up, &state.logger, decision.events);
             response
         }
@@ -367,7 +374,7 @@ async fn handle_post(
             // A blocked notification / id-less request: the Streamable HTTP transport
             // acknowledges a non-request with 202 Accepted and no body.
             let response = StatusCode::ACCEPTED.into_response();
-            tap_frame(up, &state.logger, Direction::C2s, ts, bytes.to_vec());
+            tap_frame(up, &state.logger, state.record, Direction::C2s, ts, bytes.to_vec());
             emit_events(up, &state.logger, decision.events);
             response
         }
@@ -478,26 +485,30 @@ async fn relay_response(state: &GatewayState, up: &Upstream, resp: reqwest::Resp
         let tx = up.tx.clone();
         let logger = state.logger.clone();
         let latch = up.drop_logged.clone();
+        // `--record off` streams the SSE response straight through with no tap at all.
+        let recording = state.record != RecordMode::Off;
         let mut splitter = SseSplitter::new(state.frame_cap);
         // Stream every upstream chunk straight to the client; a copy is fed to the
         // splitter and each completed event is tapped. The chunk is returned
         // unchanged, so a tap failure can never alter or stall the stream.
         let stream = resp.bytes_stream().map(move |item| {
-            if let Ok(chunk) = &item {
-                for event in splitter.push(chunk) {
-                    if tx
-                        .try_send(StorageMsg::Tap(TapEvent {
-                            direction: Direction::S2c,
-                            ts_ms: now_ms(),
-                            raw: event,
-                        }))
-                        .is_err()
-                    {
-                        log_drop_once(
-                            &latch,
-                            &logger,
-                            "gateway: s2c SSE tap dropped (channel full/closed)",
-                        );
+            if recording {
+                if let Ok(chunk) = &item {
+                    for event in splitter.push(chunk) {
+                        if tx
+                            .try_send(StorageMsg::Tap(TapEvent {
+                                direction: Direction::S2c,
+                                ts_ms: now_ms(),
+                                raw: event,
+                            }))
+                            .is_err()
+                        {
+                            log_drop_once(
+                                &latch,
+                                &logger,
+                                "gateway: s2c SSE tap dropped (channel full/closed)",
+                            );
+                        }
                     }
                 }
             }
@@ -555,7 +566,7 @@ async fn relay_response(state: &GatewayState, up: &Upstream, resp: reqwest::Resp
         // Tap the whole response body as one s2c frame (best-effort, non-blocking).
         // Done before any injection so the recording faithfully reflects what the
         // server emitted; injection only changes what the client is handed.
-        tap_frame(up, &state.logger, Direction::S2c, now_ms(), bytes.to_vec());
+        tap_frame(up, &state.logger, state.record, Direction::S2c, now_ms(), bytes.to_vec());
 
         // Injection layer for buffered responses (the SSE branch above opts out).
         if state.injector.is_some() {
@@ -601,7 +612,7 @@ async fn inject_c2s_gateway(
     ts: i64,
     events: Vec<SecurityEvent>,
 ) -> Response {
-    tap_frame(up, &state.logger, Direction::C2s, ts, bytes.to_vec());
+    tap_frame(up, &state.logger, state.record, Direction::C2s, ts, bytes.to_vec());
     emit_events(up, &state.logger, events);
 
     let kind = fault_kind(&hit.fault);
@@ -797,8 +808,20 @@ fn hint_protocol_version(up: &Upstream, headers: &HeaderMap) {
 }
 
 /// Best-effort tap of one framed message. Non-blocking: a full/closed channel just
-/// drops it (logged once) and never touches the wire.
-fn tap_frame(up: &Upstream, logger: &Logger, direction: Direction, ts_ms: i64, raw: Vec<u8>) {
+/// drops it (logged once) and never touches the wire. In `--record off` (`record` ==
+/// [`RecordMode::Off`]) the frame is not enqueued at all — the wire action has already
+/// happened, so there is simply nothing to record.
+fn tap_frame(
+    up: &Upstream,
+    logger: &Logger,
+    record: RecordMode,
+    direction: Direction,
+    ts_ms: i64,
+    raw: Vec<u8>,
+) {
+    if record == RecordMode::Off {
+        return;
+    }
     if up
         .tx
         .try_send(StorageMsg::Tap(TapEvent {

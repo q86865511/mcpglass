@@ -130,6 +130,23 @@ enum ProtocolSource {
     Initialize,
 }
 
+/// How much of each tapped frame to persist. Set once at startup (`--record`), never
+/// switched mid-run. `Off` means the pumps never enqueue a `Tap` at all (zero
+/// side-channel cost); `Metadata`/`Full` both enqueue, and the difference — whether the
+/// raw body is stored — is applied here in [`storage_loop`], *after* every parse that
+/// needs the body (fingerprinting, protocol observation) has run on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub(crate) enum RecordMode {
+    /// Record everything: the full raw frame plus all metadata (the default).
+    Full,
+    /// Record metadata only — method, ids, direction, timing, validity, plus the
+    /// original body length in `raw_len` — but not the raw body itself.
+    Metadata,
+    /// Record nothing to `messages`: security and inject events are still persisted
+    /// (the security promise is independent of recording), and the session still opens.
+    Off,
+}
+
 /// One tapped frame handed to the storage thread. Off the hot path by design.
 pub(crate) struct TapEvent {
     pub(crate) direction: Direction,
@@ -163,6 +180,7 @@ pub(crate) fn storage_loop(
     label: String,
     command_line: String,
     identity: ServerIdentity,
+    record: RecordMode,
 ) {
     let store = match Store::open_with_log(&db_path, &|m| logger.info(m)) {
         Ok(s) => s,
@@ -273,16 +291,34 @@ pub(crate) fn storage_loop(
                 } else {
                     None
                 };
+                // In metadata mode the raw body is dropped: store an empty `raw` and
+                // put the original byte length in `raw_len`. All body-dependent
+                // observation (fingerprinting below, protocol negotiation) still runs on
+                // the full `ev.raw`, so only the persisted body is affected.
+                //
+                // `Off` never reaches here — every pump gates the Tap enqueue — but if a
+                // future tap path forgets that gate, degrading to the metadata shape
+                // keeps "off" from silently persisting full bodies (defense in depth).
+                let raw = match record {
+                    RecordMode::Metadata | RecordMode::Off => String::new(),
+                    RecordMode::Full => String::from_utf8_lossy(&ev.raw).into_owned(),
+                };
                 let rec = Record {
                     ts_ms: ev.ts_ms,
                     direction,
-                    raw: String::from_utf8_lossy(&ev.raw).into_owned(),
+                    raw,
                     method: parsed.method,
                     rpc_id: parsed.rpc_id,
                     is_valid_json: parsed.is_valid_json,
                     is_error: parsed.is_error,
                 };
-                if let Err(e) = store.insert(session_id, &rec) {
+                let insert_result = match record {
+                    RecordMode::Metadata | RecordMode::Off => {
+                        store.insert_with_raw_len(session_id, &rec, Some(ev.raw.len() as i64))
+                    }
+                    RecordMode::Full => store.insert(session_id, &rec),
+                };
+                if let Err(e) = insert_result {
                     logger.error(format!("insert failed (record dropped): {e:#}"));
                 }
                 // Track outstanding tools/list requests; retire ids reused by other
@@ -494,11 +530,24 @@ impl Logger {
                     let _ = std::fs::create_dir_all(parent);
                 }
             }
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
+            // The proxy log can echo request/response detail, so keep it owner-only at
+            // rest (0600) on Unix, like the sessions db: set the mode on creation, and
+            // reset an existing file best-effort. Windows relies on the default
+            // %LOCALAPPDATA% ACL. Best-effort — a permission failure never stops logging.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).append(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let file = opts.open(p).ok();
+            #[cfg(unix)]
+            if file.is_some() {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+            }
+            file
         });
         Self {
             inner: Arc::new(Mutex::new(file)),
@@ -606,6 +655,7 @@ mod tests {
             ServerIdentity::Stdio {
                 argv: vec!["srv".to_owned()],
             },
+            RecordMode::Full,
         );
     }
 
@@ -630,6 +680,70 @@ mod tests {
             |r| r.get(0),
         )
         .unwrap()
+    }
+
+    /// Drive `storage_loop` in [`RecordMode::Metadata`] over a prefilled channel.
+    fn drive_metadata(db: &Path, msgs: Vec<StorageMsg>) {
+        let (tx, rx) = mpsc::channel::<StorageMsg>(256);
+        for m in msgs {
+            tx.try_send(m).expect("prefill channel");
+        }
+        drop(tx);
+        storage_loop(
+            rx,
+            db.to_path_buf(),
+            Logger::open(None),
+            "t".to_owned(),
+            "srv".to_owned(),
+            ServerIdentity::Stdio {
+                argv: vec!["srv".to_owned()],
+            },
+            RecordMode::Metadata,
+        );
+    }
+
+    #[test]
+    fn metadata_mode_drops_body_keeps_metadata_and_fingerprints() {
+        // In metadata mode the raw body is not persisted (raw = '', raw_len set), but the
+        // observation that needs the body — tools/list fingerprinting — still runs on the
+        // full frame before it is dropped, and method/rpc_id/direction survive.
+        let tmp = TmpDb::new("metadata-mode");
+        let db = tmp.db();
+        let req = r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#;
+        let resp = r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[{"name":"search","description":"y"}]}}"#;
+        drive_metadata(
+            &db,
+            vec![
+                tap_ev(Direction::C2s, 1, req),
+                tap_ev(Direction::S2c, 2, resp),
+            ],
+        );
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // Every recorded body is empty, but each row carries the original byte length and
+        // its method/direction metadata.
+        let rows: Vec<(String, Option<i64>, Option<String>, String)> = conn
+            .prepare("SELECT raw, raw_len, method, direction FROM messages ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "", "metadata mode stores no raw body");
+        assert_eq!(rows[0].1, Some(req.len() as i64), "raw_len is the original byte length");
+        assert_eq!(rows[0].2.as_deref(), Some("tools/list"));
+        assert_eq!(rows[0].3, "c2s");
+        assert_eq!(rows[1].0, "");
+        assert_eq!(rows[1].1, Some(resp.len() as i64));
+
+        // Fingerprinting still ran despite the body being dropped from storage.
+        let fps: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tool_fingerprints WHERE tool_name = 'search'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fps, 1, "tools/list fingerprint must be recorded before the body is dropped");
     }
 
     #[test]
@@ -912,6 +1026,7 @@ mod tests {
             ServerIdentity::Stdio {
                 argv: vec!["npx".to_owned(), "some-server".to_owned()],
             },
+            RecordMode::Full,
         );
 
         // No rug-pull alert: the baseline was re-keyed, not reset.

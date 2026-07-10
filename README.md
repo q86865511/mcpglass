@@ -94,6 +94,10 @@ connection) and fault injection you configure yourself.
   client/server resilience; injected events get their own dashboard tab.
 - **Honest storage** — the SQLite file records full raw traffic *verbatim* (that is the point of a
   traffic recorder), disclosed loudly rather than hidden; secret masking applies to the audit view.
+- **Data lifecycle control** — record less (`--record metadata|off`), prune later
+  (`mcpglass prune --older-than 7d` / `--max-size 500M`, or delete a session from the dashboard), and
+  share safely (`mcpglass export` writes a secret-masked JSON bundle). Deleting keeps tool
+  fingerprints; on Unix the db and log are `0600` at rest.
 
 ## 🏗️ Architecture
 
@@ -214,6 +218,8 @@ reproducible demo lives in [`scripts/demo.ps1`](scripts/demo.ps1) (see [docs/dem
 | `mcpglass dashboard` | Serve the local web dashboard (default port 7411, loopback-only) |
 | `mcpglass replay <message-id>` | Re-send a recorded request out-of-band and print the response |
 | `mcpglass bloat` | Context-cost report of every server's tool schemas (fattest tools, trim hints) |
+| `mcpglass prune` | Delete recorded sessions by age (`--older-than`) or size cap (`--max-size`); keeps fingerprints |
+| `mcpglass export --session <id> --out <path>` | Export one session to a secret-masked JSON bundle |
 
 Every flag and example: [docs/cli.md](docs/cli.md). Policy and fault-injection TOML reference:
 [docs/configuration.md](docs/configuration.md).

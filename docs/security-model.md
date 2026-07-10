@@ -99,6 +99,31 @@ would defeat the debugging purpose. Secret filtering masks values only in the *s
 the underlying message payloads are stored verbatim. Treat the sessions database as sensitive: it
 can contain API keys, tokens, and any private data your tool calls carried.
 
+### Data at rest
+
+The sessions database and the proxy log are treated as sensitive on disk:
+
+- **Unix:** both files are created (and, if they already exist, reset) to owner-only `0600`
+  permissions. Because SQLite matches the mode of its `-wal`/`-shm` sidecars to the main database
+  file, restricting the main file also restricts them. This is best-effort — a permission failure
+  never blocks opening the file (fail-open).
+- **Windows:** the default `%LOCALAPPDATA%` ACL already limits these files to the current user, so no
+  additional ACL work is done.
+
+### Managing recorded data
+
+You are not stuck recording everything forever:
+
+- **Record less up front.** `wrap`/`gateway` take `--record metadata` (keep method/ids/timing/size
+  but drop the raw bodies) or `--record off` (record nothing to `messages`). Security and inject
+  events are always recorded regardless — the security promise is independent of recording.
+- **Delete after the fact.** `mcpglass prune` drops sessions by age (`--older-than`) or to a size cap
+  (`--max-size`); the dashboard has a per-session delete button. Both keep tool fingerprints (the
+  cross-session rug-pull baseline).
+- **Share safely.** `mcpglass export` writes a single session to a JSON bundle with every body and
+  argv token run through the secret masker — there is no un-masked export (share the db file itself
+  if you truly need raw data).
+
 ## Network hardening (DNS rebinding / CSRF-to-localhost)
 
 Both the gateway and the dashboard bind to `127.0.0.1` only. Because both expose mutating endpoints

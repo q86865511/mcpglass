@@ -59,7 +59,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 /// identity lets fingerprint history be scoped by a real identity — the same argv
 /// under a different project is a distinct server — and lets `replay` reconstruct argv
 /// losslessly instead of re-splitting the joined `command`.
-const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// One captured JSON-RPC frame, ready to persist.
 pub struct Record {
@@ -148,6 +148,10 @@ pub struct MessageDetail {
     pub size: u64,
     pub preview: String,
     pub raw: String,
+    /// Original byte length when the frame was recorded metadata-only (`raw` is then
+    /// an empty string); `None` for a full recording. Lets a consumer distinguish "a
+    /// genuinely empty body" from "a body that was deliberately not recorded".
+    pub raw_len: Option<i64>,
 }
 
 /// Per-method aggregate for a session. Latency is derived from request/response
@@ -346,6 +350,53 @@ pub struct InjectCounts {
     pub error: u64,
     pub drop: u64,
     pub truncate: u64,
+}
+
+/// Row counts removed (or, in a dry run, that *would* be removed) by a prune / delete
+/// operation. `tool_fingerprints` is deliberately absent: fingerprint baselines are
+/// never pruned (they are the cross-session rug-pull trust baseline), so a pruned
+/// session's `session_id` on a fingerprint row is simply left dangling.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    pub sessions: u64,
+    pub messages: u64,
+    pub security_events: u64,
+    pub inject_events: u64,
+}
+
+impl std::ops::AddAssign for PruneStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.sessions += rhs.sessions;
+        self.messages += rhs.messages;
+        self.security_events += rhs.security_events;
+        self.inject_events += rhs.inject_events;
+    }
+}
+
+/// One session's id, start time, and an estimate of the raw bytes it occupies (the
+/// summed byte length of its recorded frames). Used by `prune --max-size` to pick the
+/// oldest sessions to drop and to preview how much space a dry run would reclaim.
+pub struct SessionSize {
+    pub id: i64,
+    pub started_at_ms: i64,
+    pub est_bytes: u64,
+}
+
+/// One message row with its full body, for `mcpglass export`. Distinct from
+/// [`MessageDetail`] (which carries dashboard-only fields like a preview): this is the
+/// verbatim record an export bundle masks and serialises.
+pub struct MessageExportRow {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub direction: Direction,
+    pub method: Option<String>,
+    pub rpc_id: Option<String>,
+    pub is_valid_json: bool,
+    pub is_error: bool,
+    /// The stored raw frame (empty string for a metadata-only recording).
+    pub raw: String,
+    /// Original byte length when recorded metadata-only; `None` for a full recording.
+    pub raw_len: Option<i64>,
 }
 
 /// Classification returned by [`Store::record_fingerprint`]: whether an observed
@@ -796,14 +847,29 @@ impl Store {
         Ok(())
     }
 
-    /// Persist one record under `session_id`. Errors are returned, not panicked,
-    /// so the tap loop can drop-and-continue.
+    /// Persist one record under `session_id`, recording the full raw frame (`raw_len`
+    /// left NULL). Errors are returned, not panicked, so the tap loop can
+    /// drop-and-continue.
     pub fn insert(&self, session_id: i64, rec: &Record) -> Result<()> {
+        self.insert_with_raw_len(session_id, rec, None)
+    }
+
+    /// Persist one record under `session_id` with an explicit `raw_len`. Used by the
+    /// metadata-only recording mode, which stores `rec.raw` as an empty string and puts
+    /// the original frame's byte length in `raw_len` — so size accounting and the
+    /// dashboard can still show how big the (unrecorded) body was. A full recording
+    /// passes `raw_len = None` (via [`Store::insert`]).
+    pub fn insert_with_raw_len(
+        &self,
+        session_id: i64,
+        rec: &Record,
+        raw_len: Option<i64>,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO messages
-                    (session_id, ts_ms, direction, raw, method, rpc_id, is_valid_json, is_error)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    (session_id, ts_ms, direction, raw, method, rpc_id, is_valid_json, is_error, raw_len)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session_id,
                     rec.ts_ms,
@@ -813,6 +879,7 @@ impl Store {
                     rec.rpc_id,
                     rec.is_valid_json as i64,
                     rec.is_error as i64,
+                    raw_len,
                 ],
             )
             .context("inserting message")?;
@@ -875,7 +942,7 @@ impl Store {
         page_params.push(Value::Integer(filter.offset as i64));
         let mut stmt = self.conn.prepare(&format!(
             "SELECT id, ts_ms, direction, method, rpc_id, is_valid_json, is_error,
-                    length(CAST(raw AS BLOB)), substr(raw, 1, 200)
+                    COALESCE(raw_len, length(CAST(raw AS BLOB))), substr(raw, 1, 200)
              FROM messages
              WHERE {where_sql}
              ORDER BY id ASC
@@ -893,8 +960,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id, session_id, ts_ms, direction, method, rpc_id,
-                        is_valid_json, is_error, length(CAST(raw AS BLOB)),
-                        substr(raw, 1, 200), raw
+                        is_valid_json, is_error, COALESCE(raw_len, length(CAST(raw AS BLOB))),
+                        substr(raw, 1, 200), raw, raw_len
                  FROM messages WHERE id = ?1",
                 params![id],
                 |r| {
@@ -911,6 +978,7 @@ impl Store {
                         size: r.get::<_, i64>(8)? as u64,
                         preview: r.get(9)?,
                         raw: r.get(10)?,
+                        raw_len: r.get(11)?,
                     })
                 },
             )
@@ -1424,6 +1492,264 @@ impl Store {
         )?;
         Ok(counts)
     }
+
+    // -- data lifecycle (WF4): prune / delete / size / vacuum ----------------
+
+    /// Delete one session and every row that belongs to it (`messages`,
+    /// `security_events`, `inject_events`) in a single transaction, returning the row
+    /// counts removed. Returns `None` if no session has this id (so a caller can answer
+    /// 404). **`tool_fingerprints` rows are never deleted** — they are the cross-session
+    /// rug-pull trust baseline and must outlive the session that first recorded them
+    /// (the dangling `session_id` there is for traceability only).
+    pub fn delete_session(&self, id: i64) -> Result<Option<PruneStats>> {
+        let exists = self
+            .conn
+            .query_row("SELECT 1 FROM sessions WHERE id = ?1", params![id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(None);
+        }
+        let stats = self.delete_with_fk_disabled(|| self.delete_session_rows(id))?;
+        Ok(Some(stats))
+    }
+
+    /// Delete every session started strictly before `cutoff_ms` (and all of its
+    /// messages/security/inject rows) in a single transaction; returns the row counts
+    /// removed. Keeps `tool_fingerprints` (see [`Store::delete_session`]). The companion
+    /// [`Store::preview_sessions_before`] counts the same set without deleting, for a
+    /// dry run.
+    pub fn prune_sessions_before(&self, cutoff_ms: i64) -> Result<PruneStats> {
+        self.delete_with_fk_disabled(|| {
+            let sub = "SELECT id FROM sessions WHERE started_at_ms < ?1";
+            let messages = self.conn.execute(
+                &format!("DELETE FROM messages WHERE session_id IN ({sub})"),
+                params![cutoff_ms],
+            )?;
+            let security_events = self.conn.execute(
+                &format!("DELETE FROM security_events WHERE session_id IN ({sub})"),
+                params![cutoff_ms],
+            )?;
+            let inject_events = self.conn.execute(
+                &format!("DELETE FROM inject_events WHERE session_id IN ({sub})"),
+                params![cutoff_ms],
+            )?;
+            let sessions = self
+                .conn
+                .execute("DELETE FROM sessions WHERE started_at_ms < ?1", params![cutoff_ms])?;
+            Ok(PruneStats {
+                sessions: sessions as u64,
+                messages: messages as u64,
+                security_events: security_events as u64,
+                inject_events: inject_events as u64,
+            })
+        })
+    }
+
+    /// Count (without deleting) what [`Store::prune_sessions_before`] would remove for
+    /// `cutoff_ms` — the dry-run counterpart.
+    pub fn preview_sessions_before(&self, cutoff_ms: i64) -> Result<PruneStats> {
+        let sub = "SELECT id FROM sessions WHERE started_at_ms < ?1";
+        let count = |table: &str, extra: &str| -> Result<u64> {
+            let n: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {extra}"),
+                params![cutoff_ms],
+                |r| r.get(0),
+            )?;
+            Ok(n as u64)
+        };
+        Ok(PruneStats {
+            sessions: count("sessions", "started_at_ms < ?1")?,
+            messages: count("messages", &format!("session_id IN ({sub})"))?,
+            security_events: count("security_events", &format!("session_id IN ({sub})"))?,
+            inject_events: count("inject_events", &format!("session_id IN ({sub})"))?,
+        })
+    }
+
+    /// Count (without deleting) the rows one session id occupies, for a `--max-size`
+    /// dry run's per-session accounting. A missing id yields all-zero counts.
+    pub fn preview_session(&self, id: i64) -> Result<PruneStats> {
+        let count = |table: &str, col: &str| -> Result<u64> {
+            let n: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {col} = ?1"),
+                params![id],
+                |r| r.get(0),
+            )?;
+            Ok(n as u64)
+        };
+        Ok(PruneStats {
+            sessions: count("sessions", "id")?,
+            messages: count("messages", "session_id")?,
+            security_events: count("security_events", "session_id")?,
+            inject_events: count("inject_events", "session_id")?,
+        })
+    }
+
+    /// The id of the oldest session (earliest `started_at_ms`), or `None` when the db has
+    /// no sessions. Used by `prune --max-size` to drop oldest-first.
+    pub fn oldest_session(&self) -> Result<Option<i64>> {
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM sessions ORDER BY started_at_ms ASC, id ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Every session, oldest-first, with an estimate of the raw bytes it occupies (the
+    /// summed byte length of its `messages.raw`). Drives the `--max-size` dry-run
+    /// preview: it walks this list oldest-first, accumulating `est_bytes`, to estimate
+    /// which sessions a real run would drop.
+    pub fn session_size_estimates(&self) -> Result<Vec<SessionSize>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.started_at_ms,
+                    COALESCE((SELECT SUM(length(CAST(m.raw AS BLOB)))
+                                FROM messages m WHERE m.session_id = s.id), 0)
+             FROM sessions s
+             ORDER BY s.started_at_ms ASC, s.id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SessionSize {
+                    id: r.get(0)?,
+                    started_at_ms: r.get(1)?,
+                    est_bytes: r.get::<_, i64>(2)?.max(0) as u64,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The on-disk size of the database file: `page_count * page_size`. In WAL mode a
+    /// delete frees pages onto the freelist (reused, not returned to the OS), so this
+    /// does not shrink until [`Store::vacuum`]; use [`Store::db_used_bytes`] to gauge
+    /// live data during a prune loop.
+    pub fn db_size_bytes(&self) -> Result<u64> {
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok((page_count.max(0) * page_size.max(0)) as u64)
+    }
+
+    /// Bytes of *live* data: `(page_count - freelist_count) * page_size`, i.e. roughly
+    /// the size the file would shrink to after a VACUUM. `prune --max-size` deletes the
+    /// oldest sessions until this drops to the target, then vacuums to realise it on
+    /// disk (the freed pages a plain delete leaves on the freelist are why
+    /// [`Store::db_size_bytes`] alone can't drive the loop).
+    pub fn db_used_bytes(&self) -> Result<u64> {
+        let page_count: i64 = self.conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+        let freelist: i64 = self.conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let page_size: i64 = self.conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        Ok(((page_count - freelist).max(0) * page_size.max(0)) as u64)
+    }
+
+    /// Rebuild the database file, returning freed pages to the OS (the on-disk size then
+    /// reflects live data only). Must run outside a transaction; the lifecycle callers
+    /// invoke it after their deletes have committed.
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM").context("vacuuming database")?;
+        Ok(())
+    }
+
+    /// Every message of a session, oldest-first, with its full body and `raw_len`, for
+    /// `mcpglass export`. Read-only.
+    pub fn export_messages(&self, session_id: i64) -> Result<Vec<MessageExportRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, ts_ms, direction, method, rpc_id, is_valid_json, is_error, raw, raw_len
+             FROM messages WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![session_id], |r| {
+                let dir: String = r.get(2)?;
+                Ok(MessageExportRow {
+                    id: r.get(0)?,
+                    ts_ms: r.get(1)?,
+                    direction: parse_direction(&dir, 2)?,
+                    method: r.get(3)?,
+                    rpc_id: r.get(4)?,
+                    is_valid_json: r.get(5)?,
+                    is_error: r.get(6)?,
+                    raw: r.get(7)?,
+                    raw_len: r.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Delete the child + session rows for one id, assuming an open transaction. Children
+    /// first, then the session (`tool_fingerprints` is intentionally left intact).
+    fn delete_session_rows(&self, id: i64) -> Result<PruneStats> {
+        let messages = self
+            .conn
+            .execute("DELETE FROM messages WHERE session_id = ?1", params![id])?;
+        let security_events = self
+            .conn
+            .execute("DELETE FROM security_events WHERE session_id = ?1", params![id])?;
+        let inject_events = self
+            .conn
+            .execute("DELETE FROM inject_events WHERE session_id = ?1", params![id])?;
+        let sessions = self
+            .conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(PruneStats {
+            sessions: sessions as u64,
+            messages: messages as u64,
+            security_events: security_events as u64,
+            inject_events: inject_events as u64,
+        })
+    }
+
+    /// Run a delete `f` in a transaction with foreign-key enforcement disabled for its
+    /// duration, then restored. Deleting a session while **keeping** its
+    /// `tool_fingerprints` rows (whose `session_id` is intentionally left dangling — the
+    /// cross-session rug-pull baseline must outlive its session) would otherwise trip the
+    /// `tool_fingerprints.session_id REFERENCES sessions(id)` constraint on the bundled
+    /// SQLite (which enforces foreign keys). `PRAGMA foreign_keys` can only be toggled
+    /// *outside* a transaction, so it is set here around [`Store::in_immediate_txn`], and
+    /// restored to its previous value afterwards.
+    fn delete_with_fk_disabled<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let was_on: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap_or(1);
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF");
+        let result = self.in_immediate_txn(f);
+        if was_on != 0 {
+            let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON");
+        }
+        result
+    }
+
+    /// Run `f` inside a `BEGIN IMMEDIATE` transaction, committing on `Ok` and rolling
+    /// back on any error (and on a failed commit). Modelled on the transaction handling
+    /// in [`Store::record_fingerprint`]: `IMMEDIATE` takes the write lock up front so
+    /// two writers (e.g. the tap thread and a dashboard-driven delete) can't deadlock on
+    /// a read->write promotion that `busy_timeout` can't resolve.
+    fn in_immediate_txn<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .context("beginning transaction")?;
+        match f() {
+            Ok(v) => {
+                if let Err(e) = self
+                    .conn
+                    .execute_batch("COMMIT")
+                    .context("committing transaction")
+                {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Build the shared `WHERE` fragment (using anonymous `?` placeholders) and its
@@ -1549,6 +1875,15 @@ fn open_physical(db_path: &Path) -> Result<Connection> {
                 .with_context(|| format!("creating db dir {}", parent.display()))?;
         }
     }
+    // The sessions db records full raw traffic, including any secret in flight — treat
+    // it as sensitive at rest. On Unix, restrict it to the owner (0600) before SQLite
+    // opens it: pre-creating a fresh file 0600 also makes SQLite create the -wal/-shm
+    // sidecars with the same mode (it matches them to the main db file). On Windows the
+    // default %LOCALAPPDATA% ACL already limits the file to the current user, so no ACL
+    // work is done here. Best-effort throughout: a permission failure is never a reason
+    // to fail opening the db (fail-open).
+    #[cfg(unix)]
+    restrict_file_permissions(db_path);
     let conn = Connection::open(db_path)
         .with_context(|| format!("opening db {}", db_path.display()))?;
     // WAL still allows only one writer at a time. The stdio `wrap` path has a single
@@ -1632,6 +1967,24 @@ fn migrate_legacy_v0(db_path: &Path, log: &dyn Fn(&str)) {
                 "could not back up legacy v0 db ({e}); continuing on existing file"
             ));
         }
+    }
+}
+
+/// Restrict `path` to owner-only read/write (0600). If the file does not exist yet it
+/// is pre-created empty with that mode (so SQLite opens an already-restricted file and
+/// matches its -wal/-shm sidecars to it); an existing file has its mode reset
+/// best-effort. Any failure is ignored — hardening must never block opening the db.
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if path.exists() {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    } else {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .open(path);
     }
 }
 
@@ -3219,5 +3572,183 @@ mod tests {
         assert_eq!(c.error, 1);
         assert_eq!(c.drop, 1);
         assert_eq!(c.truncate, 1);
+    }
+
+    // -- data lifecycle (WF4) -----------------------------------------------
+
+    /// Seed a session with `n` c2s messages, one security event, one inject event, and
+    /// one tool fingerprint, then force its `started_at_ms` to `started`. Returns the id.
+    fn seed_full_session(store: &Store, db: &Path, label: &str, started: i64, n: i64) -> i64 {
+        let sid = store.begin_session(label, "echo srv").unwrap();
+        for i in 0..n {
+            store
+                .insert(sid, &rec(Direction::C2s, i, &format!(r#"{{"id":{i},"method":"ping"}}"#)))
+                .unwrap();
+        }
+        store
+            .insert_security_event(
+                sid,
+                &SecurityEvent {
+                    ts_ms: 0,
+                    kind: SecurityEventKind::PolicyDeny,
+                    rule: "r".to_owned(),
+                    detail: "d".to_owned(),
+                    tool_name: None,
+                    rpc_id: None,
+                    action_taken: ActionTaken::Flagged,
+                },
+            )
+            .unwrap();
+        store
+            .insert_inject_event(
+                sid,
+                &InjectEvent {
+                    ts_ms: 0,
+                    direction: Direction::C2s,
+                    rule: "r".to_owned(),
+                    fault: InjectFault::Drop,
+                    detail: "d".to_owned(),
+                    method: None,
+                    rpc_id: None,
+                },
+            )
+            .unwrap();
+        // A fingerprint scoped to this session — must survive pruning the session.
+        rf(store, sid, "srv", &format!("tool-{label}"), "fp", 1);
+        // Force a deterministic start time (begin_session stamps `now`).
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute("UPDATE sessions SET started_at_ms = ?2 WHERE id = ?1", params![sid, started])
+            .unwrap();
+        sid
+    }
+
+    fn table_count(db: &Path, sql: &str) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn delete_session_removes_rows_but_keeps_fingerprints() {
+        let tmp = TempDir::new("delete-session");
+        let db = tmp.db();
+        let store = Store::open(&db).unwrap();
+        let sid = seed_full_session(&store, &db, "s", 100, 5);
+
+        // Unknown id -> None (so the dashboard can 404).
+        assert!(store.delete_session(9999).unwrap().is_none());
+
+        let stats = store.delete_session(sid).unwrap().expect("session existed");
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.messages, 5);
+        assert_eq!(stats.security_events, 1);
+        assert_eq!(stats.inject_events, 1);
+
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM sessions"), 0);
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM messages"), 0);
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM security_events"), 0);
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM inject_events"), 0);
+        // The fingerprint baseline outlives the session it was recorded in.
+        assert_eq!(
+            table_count(&db, "SELECT COUNT(*) FROM tool_fingerprints"),
+            1,
+            "tool fingerprints must never be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_sessions_before_deletes_old_keeps_new_and_preview_matches() {
+        let tmp = TempDir::new("prune-before");
+        let db = tmp.db();
+        let store = Store::open(&db).unwrap();
+        let old = seed_full_session(&store, &db, "old", 100, 3);
+        let new = seed_full_session(&store, &db, "new", 1000, 4);
+
+        // Dry-run preview counts the old session (started_at_ms < 500) without deleting.
+        let preview = store.preview_sessions_before(500).unwrap();
+        assert_eq!(preview.sessions, 1);
+        assert_eq!(preview.messages, 3);
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM sessions"), 2, "preview must not delete");
+
+        let stats = store.prune_sessions_before(500).unwrap();
+        assert_eq!(stats.sessions, 1);
+        assert_eq!(stats.messages, 3);
+        assert_eq!(stats.security_events, 1);
+        assert_eq!(stats.inject_events, 1);
+
+        // The new session and its rows remain; the old one is gone.
+        assert!(store.session(new).unwrap().is_some());
+        assert!(store.session(old).unwrap().is_none());
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM messages"), 4);
+        // Both sessions' fingerprints survive.
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM tool_fingerprints"), 2);
+    }
+
+    #[test]
+    fn size_helpers_and_vacuum() {
+        let tmp = TempDir::new("size-helpers");
+        let db = tmp.db();
+        let store = Store::open(&db).unwrap();
+        seed_full_session(&store, &db, "a", 100, 50);
+        seed_full_session(&store, &db, "b", 200, 50);
+
+        let size = store.db_size_bytes().unwrap();
+        assert!(size > 0);
+        // Used (freelist-adjusted) never exceeds the physical file size.
+        assert!(store.db_used_bytes().unwrap() <= size);
+
+        // Oldest is the earliest started_at_ms.
+        let oldest = store.oldest_session().unwrap().unwrap();
+        let sizes = store.session_size_estimates().unwrap();
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(sizes[0].id, oldest, "estimates come oldest-first");
+        assert!(sizes[0].est_bytes > 0);
+        assert!(sizes[0].started_at_ms <= sizes[1].started_at_ms);
+
+        // Deleting then vacuuming must not shrink below live data, and must not error.
+        store.delete_session(oldest).unwrap();
+        store.vacuum().unwrap();
+        assert!(store.db_size_bytes().unwrap() > 0);
+    }
+
+    #[test]
+    fn metadata_only_insert_records_raw_len_and_size() {
+        let tmp = TempDir::new("metadata-only");
+        let db = tmp.db();
+        let store = Store::open(&db).unwrap();
+        let sid = store.begin_session("meta", "echo").unwrap();
+
+        // A full recording keeps its body; raw_len is NULL and size = body length.
+        let body = r#"{"id":1,"method":"ping"}"#;
+        store.insert(sid, &rec(Direction::C2s, 1, body)).unwrap();
+
+        // A metadata-only recording: empty body, raw_len = original byte length.
+        let meta = Record {
+            ts_ms: 2,
+            direction: Direction::S2c,
+            raw: String::new(),
+            method: None,
+            rpc_id: Some("1".to_owned()),
+            is_valid_json: true,
+            is_error: false,
+        };
+        store.insert_with_raw_len(sid, &meta, Some(body.len() as i64)).unwrap();
+
+        // The list surfaces raw_len as the size for the metadata-only row.
+        let (_, rows) = store
+            .messages(sid, &MessageFilter { limit: 100, ..Default::default() })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].size as usize, body.len(), "full row size = body length");
+        assert_eq!(rows[1].size as usize, body.len(), "metadata-only row size = raw_len");
+
+        // The detail distinguishes the two: full row has raw_len None + a body; the
+        // metadata-only row has an empty body and raw_len set.
+        let full = store.message(rows[0].id).unwrap().unwrap();
+        assert_eq!(full.raw_len, None);
+        assert!(!full.raw.is_empty());
+        let m = store.message(rows[1].id).unwrap().unwrap();
+        assert_eq!(m.raw_len, Some(body.len() as i64));
+        assert!(m.raw.is_empty());
+        assert_eq!(m.size as usize, body.len());
     }
 }

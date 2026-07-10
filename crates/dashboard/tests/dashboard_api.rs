@@ -715,6 +715,107 @@ async fn rejects_non_loopback_origin_and_host() {
     assert_eq!(ok_replay.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
 }
 
+/// `DELETE /api/sessions/{id}`: removes the session and all its messages / security /
+/// inject rows, keeps its tool fingerprints, reports the row counts, and answers 404
+/// for an unknown id. Also confirms the loopback guard covers this mutating route.
+#[tokio::test]
+async fn delete_session_removes_rows_keeps_fingerprints_and_404s() {
+    let tmp = TempDir::new("delete-session");
+    let db = tmp.db();
+    let (sid, other) = {
+        let store = Store::open(&db).unwrap();
+        let sid = store.begin_session("to-delete", "echo").unwrap();
+        for i in 0..3 {
+            store
+                .insert(sid, &rec(Direction::C2s, i, &format!(r#"{{"id":{i},"method":"ping"}}"#)))
+                .unwrap();
+        }
+        store
+            .insert_security_event(
+                sid,
+                &SecurityEvent {
+                    ts_ms: 1,
+                    kind: SecurityEventKind::PolicyDeny,
+                    rule: "r".to_owned(),
+                    detail: "d".to_owned(),
+                    tool_name: None,
+                    rpc_id: None,
+                    action_taken: ActionTaken::Flagged,
+                },
+            )
+            .unwrap();
+        // A fingerprint that must outlive the pruned session.
+        store
+            .record_fingerprint(sid, "srv", "srv", "search", "fp-v1", "fp-v2", "fp-v3", 1)
+            .unwrap();
+        store.end_session(sid).unwrap();
+        // A second session that must be untouched by the delete.
+        let other = store.begin_session("keep", "echo").unwrap();
+        store.end_session(other).unwrap();
+        (sid, other)
+    };
+
+    let addr = spawn_server(db.clone()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    // A forged Host is stopped at the loopback guard before mutating anything.
+    let forged = client
+        .delete(format!("{base}/api/sessions/{sid}"))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // The real delete: 200 with the removed row counts.
+    let del = client
+        .delete(format!("{base}/api/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = del.json().await.unwrap();
+    assert_eq!(body["sessions"].as_u64().unwrap(), 1);
+    assert_eq!(body["messages"].as_u64().unwrap(), 3);
+    assert_eq!(body["security_events"].as_u64().unwrap(), 1);
+
+    // The session is gone from the list, but the other one remains.
+    let sessions: serde_json::Value = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<i64> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_i64().unwrap())
+        .collect();
+    assert!(!ids.contains(&sid), "deleted session must be gone");
+    assert!(ids.contains(&other), "other session must be untouched");
+
+    // The fingerprint baseline survives the delete (never pruned).
+    let fps: i64 = {
+        let conn = Connection::open(&db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM tool_fingerprints", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(fps, 1, "tool fingerprints must survive a session delete");
+
+    // Deleting an unknown id -> 404.
+    let missing = client
+        .delete(format!("{base}/api/sessions/999999"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
 /// `on_ready` must fire with an address the listener actually bound to a real
 /// OS-assigned port (0 in, non-zero out), and that address must already be
 /// connectable by the time the callback runs.

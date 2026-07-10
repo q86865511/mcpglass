@@ -68,14 +68,22 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
 
   const { pretty, ok } = tryPrettyJson(detail.raw);
 
+  // A metadata-only recording (`--record metadata`): the body was deliberately not
+  // stored, so `raw` is empty and `raw_len` carries the original byte length.
+  const metadataOnly = detail.raw === "" && detail.raw_len !== null;
+
   const copy = () => {
     void navigator.clipboard.writeText(detail.raw).then(() => setCopied(true));
   };
 
   // Only a client->server request (has a method and an id) can be replayed; a
-  // response, a notification, or an s2c frame has nothing to re-send.
+  // response, a notification, or an s2c frame has nothing to re-send — and a
+  // metadata-only recording has no body to send at all.
   const canReplay =
-    detail.direction === "c2s" && detail.method !== null && detail.rpc_id !== null;
+    detail.direction === "c2s" &&
+    detail.method !== null &&
+    detail.rpc_id !== null &&
+    !metadataOnly;
 
   const doReplay = () => {
     if (!window.confirm("Re-send this request to the server? Side effects may occur.")) {
@@ -114,12 +122,26 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
         <dd className="mono">{detail.session_id}</dd>
       </dl>
       <div className="detail-raw-header">
-        <span>raw{!ok && " (not valid JSON, showing as-is)"}</span>
-        <button className="copy-btn" onClick={copy}>
-          {copied ? "Copied!" : "Copy"}
-        </button>
+        <span>
+          raw
+          {metadataOnly
+            ? " (metadata-only, body not recorded)"
+            : !ok && " (not valid JSON, showing as-is)"}
+        </span>
+        {!metadataOnly && (
+          <button className="copy-btn" onClick={copy}>
+            {copied ? "Copied!" : "Copy"}
+          </button>
+        )}
       </div>
-      <pre className="detail-raw mono">{pretty}</pre>
+      {metadataOnly ? (
+        <div className="empty-hint">
+          This message was recorded in metadata-only mode. Its body was not stored
+          (original size {formatSize(detail.size)}).
+        </div>
+      ) : (
+        <pre className="detail-raw mono">{pretty}</pre>
+      )}
       {canReplay && (
         <div className="detail-raw-header">
           <span>replay</span>

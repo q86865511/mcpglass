@@ -14,7 +14,7 @@ MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 A
 ## 架構約定
 
 - Workspace crates：`proxy-core`（JSON-RPC 解析、轉發、框架化、SSE 切分、MCP 版本常數、bloat 分析）／`storage`（rusqlite，schema v7）／
-  `policy`（純邏輯：政策/secret/指紋/決策/inject 規則，無 IO）／`cli`（clap 入口＋stdio 熱路徑＋HTTP gateway＋replay/bloat 子指令）／`dashboard`（axum＋rust-embed）。
+  `policy`（純邏輯：政策/secret/指紋/決策/inject 規則/mask_secrets，無 IO）／`cli`（clap 入口＋stdio 熱路徑＋HTTP gateway＋replay/bloat/prune/export 子指令）／`dashboard`（axum＋rust-embed）。
 - 兩種 transport 共用同一 tap/storage/指紋管線（`cli/src/tap.rs`）：stdio＝`wrap`（client spawn）；
   HTTP＝`gateway` 長駐反向代理（`/u/{route}`，gateway.toml 記 route→upstream，只綁 127.0.0.1，Origin＋Host 驗 loopback）。
   HTTP 下的 fail-open 對應：上游連不上誠實回 502（不合成 JSON-RPC 假冒 server）；tap/policy 故障絕不改變或延遲已在流動的回應 bytes。
@@ -23,8 +23,11 @@ MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 A
   enforce 模式政策明確命中（協定內合法拒絕，合成 -32001 回 client，非斷線）、`--inject` 明確設定的模擬故障
   （使用者要求的協定內干預,同 enforce 例外類）。注入層自身仍 fail-open：Injector lock poison/panic/事件入庫失敗一律照常轉發。
   順序：policy 先決策,只有 Forward 的幀才進注入層。
-- 帶外工具（`replay`/`bloat`）不碰活體 wire、唯讀開庫、不落庫,不受 fail-open 約束；replay 會重啟 server/重送請求（可能有副作用,前端確認框標示）。
-- dashboard 有變異端點（`POST /replay`）後,所有路由經 loopback middleware 驗 Origin＋Host（防 DNS rebinding/CSRF-to-localhost）。
+- 診斷類帶外工具（`replay`/`bloat`/`export`）不碰活體 wire、唯讀開庫、不落庫,不受 fail-open 約束；replay 會重啟 server/重送請求（可能有副作用,前端確認框標示）。`export` 一律遮罩（`policy::mask_secrets` 純函式跑內建 secret patterns,body 逐幀、argv 逐 token）,無不遮罩旗標。
+- 資料生命週期（WF4）：`prune` 是生命週期管理指令,天生 writer（讀寫開庫、單交易刪除,非帶外唯讀）,一樣不碰活體 wire;刪除（prune／dashboard `DELETE /api/sessions/{id}`）永遠保留 tool_fingerprints（跨 session rug-pull 信任基線,session_id 懸空可接受）,故刪除交易以 `delete_with_fk_disabled` 暫時關 foreign_keys 容許懸空參照。`--max-size` 用 db_used_bytes（freelist 調整）迴圈刪最舊 session 至達標後自動 VACUUM;`--older-than` 單獨用不自動 VACUUM（WAL 頁面重用）,`--vacuum` 顯式要。
+- 錄製模式 `--record full|metadata|off`（wrap／gateway,啟動旗標不可執行期切換）:off 在 pump 端就不 enqueue tap（零旁路成本,仍 begin_session,security/inject 照記）;metadata 在 storage_loop 丟棄 raw **之前**先做完 tools/list 指紋與 PendingInitialize 解析,raw 存空字串、原 byte 長度寫入 messages.raw_len。security/inject 事件不受 --record 影響（安全承諾獨立於錄製）。
+- 磁碟落地敏感檔（sessions.db、mcpglass.log）Unix 下 best-effort 設 0600（-wal/-shm 繼承主檔）,Windows 靠 %LOCALAPPDATA% ACL 不動。
+- dashboard 有變異端點（`POST /replay`、`DELETE /api/sessions/{id}`）後,所有路由經 loopback middleware 驗 Origin＋Host（防 DNS rebinding/CSRF-to-localhost）。
 - 安全層職責分離：c2s（client→server）為**可攔阻的同步純函式決策**（`policy::evaluate_request`）；
   s2c（server→client）維持**旁路 tap**，指紋比對在 storage thread 做（只告警不阻擋）。
 - 熱路徑日誌節流：channel 滿導致的 tap-drop 每 pump 只同步寫檔一次（避免故障態同步 I/O 回壓 wire）。
