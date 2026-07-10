@@ -18,3 +18,14 @@ toml = "0.8"
 regex = "1"
 sha2 = "0.10"
 anyhow.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+# The benches build request/tool JSON with `serde_json::json!`; a normal dependency
+# is not in scope for a separate bench crate, so it is re-declared here.
+serde_json.workspace = true
+
+# Micro-benchmarks for the c2s decision and tool-fingerprint hot paths (docs/benchmarks.md).
+[[bench]]
+name = "policy_bench"
+harness = false

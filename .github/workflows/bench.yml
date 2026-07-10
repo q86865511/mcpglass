@@ -1,0 +1,36 @@
+name: Benchmarks
+
+# Manual only: benchmark numbers are hardware-relative and must never gate a build.
+# This job characterises the proxy on demand and uploads the raw output as an artifact.
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Micro-benchmarks (criterion). The frontend is not needed: these crates do
+      # not depend on the embedded dashboard assets.
+      - name: criterion micro-benchmarks
+        run: |
+          cargo bench -p proxy-core | tee bench-results.txt
+          cargo bench -p policy | tee -a bench-results.txt
+
+      # End-to-end wrap overhead. `#[ignore]`'d out of the normal suite, run in
+      # release for representative figures.
+      - name: end-to-end wrap overhead
+        run: |
+          cargo test -p cli --release --test bench_e2e -- --ignored --nocapture \
+            | tee -a bench-results.txt
+
+      - name: upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench-results.txt

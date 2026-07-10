@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Performance benchmarks and fail-open regression tests** — the fail-open promise is now backed by
+  numbers and by tests, not just prose ([docs/benchmarks.md](docs/benchmarks.md)):
+  - criterion micro-benchmarks for the hot paths (`parse_line`, `evaluate_request`, tool
+    fingerprinting) and an end-to-end `wrap` overhead benchmark across `--record off|metadata|full`
+    (+ `--enforce`) versus a no-proxy baseline (`cargo test -p cli --release --test bench_e2e --
+    --ignored`).
+  - two regression tests in the normal suite prove a stalled/saturated tap channel and an unwritable
+    database never touch the wire (the storage failure drops records and is logged, forwarding stays
+    byte-identical). The test hooks are `cfg(debug_assertions)`-only, so the storage loop and channel
+    cost nothing in release builds.
+  - a manual `workflow_dispatch` GitHub Actions job runs the benchmarks and uploads the results;
+    numbers are hardware-relative and never gate CI.
 - **Data lifecycle management** — you can now manage the recorded traffic instead of only
   accumulating it:
   - `mcpglass prune` deletes sessions by age (`--older-than 7d`) or to a size cap

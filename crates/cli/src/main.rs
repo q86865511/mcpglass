@@ -56,6 +56,28 @@ pub(crate) fn max_line_bytes() -> usize {
 /// Read buffer size for each pump.
 const READ_BUF_BYTES: usize = 64 * 1024;
 
+/// Capacity of the best-effort storage channel. Comfortably absorbs bursty traffic
+/// without ever back-pressuring the wire: a full channel drops tap events (fail-open),
+/// it never blocks a pump. Large enough that steady-state traffic never reaches it.
+const STORAGE_CHANNEL_CAP: usize = 8192;
+
+/// The storage-channel capacity to use. In release this is the fixed
+/// [`STORAGE_CHANNEL_CAP`] with no runtime cost; in a debug/test build only, the
+/// channel-saturation regression test may shrink it via `MCPGLASS_TEST_CHANNEL_CAP`
+/// so it can overflow the queue in milliseconds instead of flooding 8192 frames.
+#[cfg(not(debug_assertions))]
+fn storage_channel_cap() -> usize {
+    STORAGE_CHANNEL_CAP
+}
+#[cfg(debug_assertions)]
+fn storage_channel_cap() -> usize {
+    std::env::var("MCPGLASS_TEST_CHANNEL_CAP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(STORAGE_CHANNEL_CAP)
+}
+
 #[derive(Parser)]
 #[command(name = "mcpglass", about = "Transparent proxy for MCP stdio traffic")]
 struct Cli {
@@ -443,7 +465,7 @@ async fn run_wrap(
     let child_stdout = child.stdout.take().expect("child stdout was piped");
     let mut child_stderr = child.stderr.take().expect("child stderr was piped");
 
-    let (tx, rx) = mpsc::channel::<StorageMsg>(8192);
+    let (tx, rx) = mpsc::channel::<StorageMsg>(storage_channel_cap());
 
     // Storage owns a sync rusqlite connection on a dedicated blocking thread.
     let storage = tokio::task::spawn_blocking({

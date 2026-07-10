@@ -279,7 +279,7 @@ without a real proxy: `pnpm mock` + `pnpm dev`. Contribution conventions:
 crates/
   proxy-core/     JSON-RPC parsing, framing, SSE splitting, MCP version constants, bloat heuristics
   policy/         pure decision logic — policy / secrets / fingerprints / fault injection (no IO)
-  storage/        rusqlite store (schema v5): sessions, messages, fingerprints, security & inject events
+  storage/        rusqlite store: sessions, messages, fingerprints, security & inject events
   cli/            the mcpglass binary: wrap / attach / detach / gateway / replay / bloat + the tap hot path
   dashboard/      axum REST API + rust-embed'ed React frontend
     frontend/     React + TypeScript (pnpm; `pnpm build` output is embedded at compile time)
@@ -313,6 +313,7 @@ Apache-2.0 — see [LICENSE](LICENSE).
 | [docs/cli.md](docs/cli.md) | Every subcommand, its flags, examples, and caveats |
 | [docs/configuration.md](docs/configuration.md) | Policy TOML and fault-injection TOML reference |
 | [docs/security-model.md](docs/security-model.md) | Fail-open design, monitor/enforce, threat model, data disclosure |
+| [docs/benchmarks.md](docs/benchmarks.md) | Micro/end-to-end benchmarks and the fail-open regression tests |
 | [docs/demo.md](docs/demo.md) | Scripted demo, screenshot/GIF recording pipeline |
 | [CHANGELOG.md](CHANGELOG.md) | Release history (Keep a Changelog) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Build/test/lint workflow and PR conventions |
