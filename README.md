@@ -18,7 +18,7 @@
 > measures what their schemas cost you in context, and can replay or sabotage traffic on demand.
 
 - 🔍 **See the real wire** — not a side-channel test harness: the actual frames your client exchanges with your servers, both stdio and Streamable HTTP
-- 🛡️ **Fail-open by design** — the proxy's own bugs, full disks, or panics never block or delay your traffic; observation is a side-channel tap
+- 🛡️ **Fail-open by design** — while the proxy runs, its own bugs, full disks, or panics never block or delay your traffic; observation is a side-channel tap
 - 🏠 **Local-first** — one binary, one SQLite file, a loopback-only dashboard; nothing is sent anywhere
 
 **Status**: v0.1.1 — stdio + HTTP interception through MCP spec 2025-11-25, one-command config
@@ -56,7 +56,10 @@ cost, and injected-fault history.
 
 The design stance is **fail-open**: mcpglass considers your traffic sacred. Parse failures, a full
 disk, a poisoned lock, a panicking policy engine — none of it may block or delay the bytes flowing
-between client and server. The only deliberate interventions are the ones you explicitly opt into:
+between client and server while the process is alive (process-level death — OOM, `kill -9`, a host
+crash — severs the wire like it would for any proxy; see
+[docs/security-model.md](docs/security-model.md)). The only deliberate interventions are the ones
+you explicitly opt into:
 `enforce`-mode policy blocks (answered as legal in-protocol JSON-RPC errors, never a severed
 connection) and fault injection you configure yourself.
 

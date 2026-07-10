@@ -6,10 +6,12 @@ that never violate it.
 
 ## Fail-open is the iron rule
 
-**Any error in the proxy itself must never block or delay client↔server traffic.** A parse failure,
-a full or broken database, a panic in the policy engine, an unknown JSON-RPC field — all of these
-forward the bytes unchanged. The proxy would rather leak an un-inspectable frame than stall or drop
-your session. Concretely:
+**While the mcpglass process is alive, no failure in its own machinery may block or delay
+client↔server traffic.** A parse failure, a full or broken database, a panic in the policy engine,
+an unknown JSON-RPC field — all of these forward the bytes unchanged. Recording, fingerprinting and
+security-event persistence are strictly best-effort side channels: a full channel or a failed write
+drops the record, never the frame. The proxy would rather leak an un-inspectable frame than stall
+or drop your session. Concretely:
 
 - Forwarding always happens **before** recording. The tap (SQLite writes, fingerprinting) is
   strictly best-effort and off the hot path; a stalled storage thread drops tap events (logging the
@@ -18,6 +20,12 @@ your session. Concretely:
 - Over-HTTP: if an upstream is unreachable the gateway honestly returns `502` — it never synthesizes
   a fake JSON-RPC reply impersonating the server. Tap/policy failures never alter or delay bytes
   already flowing.
+
+**What this guarantee does not cover: process-level failure.** mcpglass sits on the wire, so if its
+process dies — an OOM kill, `kill -9`, a host crash, an OS-level pipe failure — the connection it
+carries is severed, exactly as it would be for any proxy. The fail-open promise is about the code
+paths *inside* a live process (they can fail without touching the wire), not about the process
+itself being unkillable.
 
 ### The deliberate exceptions
 
