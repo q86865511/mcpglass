@@ -253,4 +253,37 @@ mod tests {
         // The stream still works afterwards.
         assert_eq!(events(&mut s, b"data: after\n\n"), vec!["after"]);
     }
+
+    // --- MCP 2025-11-25 SSE resumption (SEP-1699) ---------------------------
+
+    #[test]
+    fn retry_field_and_event_id_are_ignored_data_still_dispatched() {
+        // The 2025-11-25 resumption model has the server emit `id:` (the resumption
+        // token) and, before closing, a `retry:` field. Neither is part of the
+        // recorded JSON-RPC payload: only `data` is, and it must still dispatch.
+        let mut s = SseSplitter::new(1024);
+        let out = events(
+            &mut s,
+            b"id: evt-42\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\nretry: 5000\n\n",
+        );
+        assert_eq!(out, vec![r#"{"jsonrpc":"2.0","id":1,"result":{}}"#]);
+    }
+
+    #[test]
+    fn event_id_then_disconnect_before_blank_line_loses_no_prior_event() {
+        // A server sends a complete event (with its resumption id), then starts a
+        // second event and disconnects mid-way (no terminating blank line) — the
+        // SEP-1699 "send an id, then drop the stream" pattern. The splitter must not
+        // error and must not lose the already-completed first event; the truncated
+        // second event is simply never dispatched (per the SSE spec), matching how a
+        // resumed GET + Last-Event-ID would re-fetch it.
+        let mut s = SseSplitter::new(1024);
+        let out = events(
+            &mut s,
+            b"id: 1\ndata: {\"first\":true}\n\nid: 2\ndata: {\"second\"",
+        );
+        assert_eq!(out, vec![r#"{"first":true}"#]);
+        // No blank line ever arrives for event 2: EOF (no further push) drops it,
+        // exactly as the spec requires — nothing is emitted, nothing panics.
+    }
 }

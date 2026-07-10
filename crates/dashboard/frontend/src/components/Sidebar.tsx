@@ -30,6 +30,20 @@ export function Sidebar({ sessions, selectedId, onSelect }: SidebarProps) {
                   <span>{formatDateTime(s.started_at_ms)}</span>
                   <span>{s.message_count} msgs</span>
                 </div>
+                {s.protocol_version && (
+                  <div className="session-item-proto">
+                    <span
+                      className="badge badge-proto"
+                      title={
+                        "MCP protocol " +
+                        s.protocol_version +
+                        (s.protocol_version_source ? ` (via ${s.protocol_version_source})` : "")
+                      }
+                    >
+                      MCP {s.protocol_version}
+                    </span>
+                  </div>
+                )}
               </button>
             </li>
           );

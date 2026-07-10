@@ -139,7 +139,7 @@ pub async fn run_replay(
     timeout: Duration,
 ) -> Result<ReplayResult, ReplayError> {
     // Synchronous lookups first; the Store is dropped at the end of this block.
-    let (command, raw, rpc_id) = {
+    let (command, raw, rpc_id, protocol_version) = {
         let store = Store::open(&db_path)
             .map_err(|e| ReplayError::Internal(format!("opening session store: {e:#}")))?;
         let msg = store
@@ -174,13 +174,17 @@ pub async fn run_replay(
                 ))
             })?;
 
-        (session.command, msg.raw, rpc_id)
+        (session.command, msg.raw, rpc_id, session.protocol_version)
     };
 
+    // Reconstruct the handshake with the version this session actually negotiated;
+    // a legacy session with none recorded falls back to the build's default constant.
+    let version = protocol_version.unwrap_or_else(|| MCP_PROTOCOL_VERSION.to_owned());
+
     if is_http_command(&command) {
-        replay_http(&command, &raw, &rpc_id, timeout).await
+        replay_http(&command, &raw, &rpc_id, &version, timeout).await
     } else {
-        replay_stdio(&command, &raw, &rpc_id, timeout).await
+        replay_stdio(&command, &raw, &rpc_id, &version, timeout).await
     }
 }
 
@@ -191,15 +195,16 @@ fn is_http_command(command: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
-/// The replay's own `initialize` request, carrying the build's target protocol
-/// version so the reconstructed server negotiates the same version the proxy uses.
-fn initialize_request() -> String {
+/// The replay's own `initialize` request, carrying `version` (the session's
+/// negotiated protocol version, or the build default for a legacy session) so the
+/// reconstructed server negotiates the same version the original session used.
+fn initialize_request(version: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": REPLAY_INIT_ID,
         "method": "initialize",
         "params": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "protocolVersion": version,
             "capabilities": {},
             "clientInfo": { "name": "mcpglass-replay", "version": env!("CARGO_PKG_VERSION") }
         }
@@ -270,6 +275,7 @@ async fn replay_stdio(
     command: &str,
     raw: &str,
     rpc_id: &str,
+    version: &str,
     timeout: Duration,
 ) -> Result<ReplayResult, ReplayError> {
     let parts = split_command(command);
@@ -305,7 +311,7 @@ async fn replay_stdio(
 
     let outcome = match tokio::time::timeout(
         timeout,
-        stdio_exchange(&mut stdin, &mut stdout, raw, rpc_id),
+        stdio_exchange(&mut stdin, &mut stdout, raw, rpc_id, version),
     )
     .await
     {
@@ -330,12 +336,13 @@ async fn stdio_exchange<W, R>(
     stdout: &mut R,
     raw: &str,
     rpc_id: &str,
+    version: &str,
 ) -> Result<ReplayResult, ReplayError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    write_line(stdin, &initialize_request()).await?;
+    write_line(stdin, &initialize_request(version)).await?;
 
     let mut reader = FrameReader::new(stdout);
     // One frame is the initialize response; its exact contents don't matter here.
@@ -456,6 +463,7 @@ async fn replay_http(
     url: &str,
     raw: &str,
     rpc_id: &str,
+    version: &str,
     timeout: Duration,
 ) -> Result<ReplayResult, ReplayError> {
     let client = reqwest::Client::builder()
@@ -463,7 +471,7 @@ async fn replay_http(
         .map_err(|e| ReplayError::Internal(format!("building HTTP client: {e}")))?;
 
     let (result, session_id) =
-        match tokio::time::timeout(timeout, http_exchange(&client, url, raw, rpc_id)).await {
+        match tokio::time::timeout(timeout, http_exchange(&client, url, raw, rpc_id, version)).await {
             Ok(Ok(pair)) => pair,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(ReplayError::Timeout),
@@ -490,11 +498,12 @@ async fn http_exchange(
     url: &str,
     raw: &str,
     rpc_id: &str,
+    version: &str,
 ) -> Result<(ReplayResult, Option<String>), ReplayError> {
     // 1. Fresh initialize; capture the new session id from the response headers. A
     //    non-2xx here (e.g. 401 from an upstream that needs auth) is a hard failure:
     //    without a handshake there is nothing to replay against (bug #3).
-    let init_resp = post_mcp(client, url, None, &initialize_request()).await?;
+    let init_resp = post_mcp(client, url, None, &initialize_request(version), version).await?;
     let status = init_resp.status();
     if !status.is_success() {
         return Err(ReplayError::Upstream(format!(
@@ -511,12 +520,12 @@ async fn http_exchange(
     // 2. Complete the handshake. This is a notification (fire-and-forget: a 202 with
     //    no body is expected), so its status is not gated — if it truly failed the
     //    replayed request in step 3 would surface the problem anyway.
-    let notif = post_mcp(client, url, session_id.as_deref(), INITIALIZED_NOTIFICATION).await?;
+    let notif = post_mcp(client, url, session_id.as_deref(), INITIALIZED_NOTIFICATION, version).await?;
     let _ = notif.bytes().await;
 
     // 3. Re-send the recorded request and read its answer. A non-2xx response (error
     //    page, auth failure, ...) must not be handed back as a fake success (bug #3).
-    let resp = post_mcp(client, url, session_id.as_deref(), raw).await?;
+    let resp = post_mcp(client, url, session_id.as_deref(), raw, version).await?;
     let status = resp.status();
     if !status.is_success() {
         return Err(ReplayError::Upstream(format!(
@@ -558,18 +567,20 @@ async fn http_exchange(
 
 /// POST one JSON-RPC body to the upstream with the MCP client headers, optionally
 /// carrying the negotiated `Mcp-Session-Id`. `Accept` advertises both response shapes
-/// the Streamable HTTP transport may reply with.
+/// the Streamable HTTP transport may reply with; `MCP-Protocol-Version` carries the
+/// session's negotiated version (matching the `initialize` request).
 async fn post_mcp(
     client: &reqwest::Client,
     url: &str,
     session_id: Option<&str>,
     body: &str,
+    version: &str,
 ) -> Result<reqwest::Response, ReplayError> {
     let mut rb = client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
-        .header("mcp-protocol-version", MCP_PROTOCOL_VERSION)
+        .header("mcp-protocol-version", version)
         .body(body.to_owned());
     if let Some(sid) = session_id {
         rb = rb.header("mcp-session-id", sid);
@@ -756,10 +767,16 @@ mod tests {
 
     #[test]
     fn initialize_request_carries_protocol_version_and_fixed_id() {
-        let v: serde_json::Value = serde_json::from_str(&initialize_request()).unwrap();
+        // The version passed in (a session's negotiated version) is echoed verbatim,
+        // so replay reconstructs the handshake the original session used.
+        let v: serde_json::Value = serde_json::from_str(&initialize_request("2025-11-25")).unwrap();
         assert_eq!(v["id"], serde_json::json!(REPLAY_INIT_ID));
         assert_eq!(v["method"], serde_json::json!("initialize"));
-        assert_eq!(v["params"]["protocolVersion"], serde_json::json!(MCP_PROTOCOL_VERSION));
+        assert_eq!(v["params"]["protocolVersion"], serde_json::json!("2025-11-25"));
+        // The build default constant is still the fallback for a legacy session.
+        let legacy: serde_json::Value =
+            serde_json::from_str(&initialize_request(MCP_PROTOCOL_VERSION)).unwrap();
+        assert_eq!(legacy["params"]["protocolVersion"], serde_json::json!(MCP_PROTOCOL_VERSION));
     }
 
     #[test]

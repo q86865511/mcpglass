@@ -378,6 +378,48 @@ async fn monitor_passthrough_tap_and_edges() {
     assert!(up_bodies.lock().unwrap().iter().any(|b| b.contains("tools/list")));
 }
 
+/// The gateway passively records the `MCP-Protocol-Version` header a client sends on
+/// its requests: with no `initialize` handshake observed (the fake upstream answers a
+/// plain result, not an `initialize` response), the header hint is what pins the
+/// session's protocol version — recorded once, source `header`.
+#[tokio::test]
+async fn protocol_version_header_is_recorded_as_hint() {
+    let (up_addr, _up_bodies) = spawn_upstream().await;
+    let gw = spawn_gateway(
+        "proto-hint",
+        "mode = \"monitor\"\n",
+        &[("echo", format!("http://{up_addr}/"))],
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{}", gw.port);
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/u/echo"))
+        .header("content-type", "application/json")
+        .header("mcp-protocol-version", "2025-11-25")
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let db = gw.db.clone();
+    assert!(
+        wait_until(3000, || {
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM sessions
+                 WHERE protocol_version='2025-11-25' AND protocol_version_source='header'",
+            )
+            .filter(|&n| n >= 1)
+            .map(|_| ())
+        })
+        .await,
+        "the MCP-Protocol-Version header must be recorded as a header-source hint"
+    );
+}
+
 /// A DNS-rebound browser sends a same-origin `GET` with *no* `Origin` header at
 /// all (per the Fetch spec) but still carries a `Host` naming the attacker's
 /// domain — the gap `Origin`-only checking misses. A forged `Host` must be

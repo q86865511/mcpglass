@@ -126,3 +126,95 @@ fn passthrough_is_byte_identical_and_recorded() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The MCP 2025-11-25 wire additions (tasks, icons, sampling tools/toolChoice,
+/// URL-mode elicitation, a `CreateTaskResult` with an `_meta` related-task marker)
+/// are unknown to the proxy, which forwards bytes verbatim. This drives every new
+/// shape through `mcpglass wrap` and asserts (a) the bytes are byte-identical to a
+/// direct connection and (b) each frame is recorded with the right method/id — i.e.
+/// the newer spec is pure pass-through, no frame mangled or dropped.
+#[test]
+fn wire_2025_11_25_shapes_pass_through_and_record() {
+    // Each line is one JSON-RPC frame the newer spec introduces. echo-mcp echoes
+    // each verbatim, so the recorded s2c is byte-identical to the c2s.
+    let frames = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"tasks/get","params":{"task":{"ttl":30000}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tasks/result","params":{"taskId":"abc"}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tasks/list"}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tasks/cancel","params":{"taskId":"abc"}}"#,
+        r#"{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"abc","status":"working"}}"#,
+        r#"{"jsonrpc":"2.0","id":5,"result":{"task":{"taskId":"abc","ttl":30000},"_meta":{"io.modelcontextprotocol/related-task":{"taskId":"abc"}}}}"#,
+        r#"{"jsonrpc":"2.0","id":6,"method":"sampling/createMessage","params":{"messages":[],"tools":[{"name":"calc"}],"toolChoice":{"type":"auto"}}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"method":"elicitation/create","params":{"mode":"url","url":"https://example.test/form"}}"#,
+        r#"{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{"answer":"yes"}}}"#,
+        r#"{"jsonrpc":"2.0","id":8,"result":{"tools":[{"name":"read","icons":[{"src":"data:image/png;base64,AA","mimeType":"image/png","sizes":["16x16"]}]}]}}"#,
+    ];
+    let input: String = frames.iter().map(|f| format!("{f}\n")).collect();
+
+    // Baseline: talk to echo directly.
+    let direct = Command::new(ECHO_MCP);
+    let (direct_out, direct_code) = run_capture(direct, input.as_bytes());
+    assert_eq!(direct_code, 0);
+
+    let tmp = std::env::temp_dir().join(format!("mcpglass-it-1125-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let db: PathBuf = tmp.join("sessions.db");
+    let log: PathBuf = tmp.join("mcpglass.log");
+
+    let mut proxied = Command::new(MCPGLASS);
+    proxied.args([
+        "wrap",
+        "--db",
+        db.to_str().unwrap(),
+        "--log",
+        log.to_str().unwrap(),
+        "--",
+        ECHO_MCP,
+    ]);
+    let (proxied_out, proxied_code) = run_capture(proxied, input.as_bytes());
+
+    // (a) Byte-identical to the direct connection: no frame was mangled.
+    assert_eq!(proxied_out, direct_out, "new wire shapes must pass through verbatim");
+    assert_eq!(proxied_code, 0);
+
+    // (b) Recording: the tasks request family and the augmented requests are indexed
+    // by method; the CreateTaskResult / ElicitResult are recorded as responses (no
+    // method, id present) and must not be flagged errors.
+    let conn = rusqlite::Connection::open(&db).expect("open db");
+    for method in ["tasks/get", "tasks/list", "sampling/createMessage", "elicitation/create"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE direction='c2s' AND method=?1",
+                [method],
+                |r| r.get(0),
+            )
+            .expect("query method");
+        assert!(n >= 1, "expected a c2s {method} record");
+    }
+    // The status notification: has a method, no id.
+    let notif: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE method='notifications/tasks/status' AND rpc_id IS NULL AND is_valid_json=1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query tasks notification");
+    assert!(notif >= 1, "expected a tasks/status notification with null id");
+    // The CreateTaskResult (id 5) is a valid, non-error response with no method.
+    let create_task_result: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages
+             WHERE rpc_id='5' AND method IS NULL AND is_valid_json=1 AND is_error=0
+               AND instr(raw, 'related-task') > 0",
+            [],
+            |r| r.get(0),
+        )
+        .expect("query CreateTaskResult");
+    assert!(
+        create_task_result >= 1,
+        "the CreateTaskResult must record verbatim (with its _meta related-task) as a non-error response"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

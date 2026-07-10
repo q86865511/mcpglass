@@ -10,6 +10,13 @@ export interface SessionSummary {
   started_at_ms: number;
   ended_at_ms: number | null;
   message_count: number;
+  // MCP protocol version the server selected (null when unobserved, e.g. stdio
+  // traffic with no captured handshake or a legacy pre-v6 session).
+  protocol_version: string | null;
+  // MCP protocol version the client proposed (null when unobserved).
+  client_protocol_version: string | null;
+  // How the version was observed: "initialize" | "header" | null.
+  protocol_version_source: string | null;
 }
 
 export interface SessionsResponse {

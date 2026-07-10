@@ -9,7 +9,7 @@
 [![CI](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml/badge.svg)](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/Rust-1.86%2B-dea584?logo=rust&logoColor=white)](Cargo.toml)
 [![Single binary](https://img.shields.io/badge/deploy-single%20binary-2ea44f)](crates/cli)
-[![MCP spec](https://img.shields.io/badge/MCP-2025--06--18-6e56cf)](https://modelcontextprotocol.io/)
+[![MCP spec](https://img.shields.io/badge/MCP-2025--11--25-6e56cf)](https://modelcontextprotocol.io/)
 [![Local only](https://img.shields.io/badge/data-100%25%20local-informational)](docs/security-model.md)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
@@ -65,7 +65,8 @@ connection) and fault injection you configure yourself.
   server with zero behavior change; recording is a side-channel tap that never applies backpressure
   to the wire.
 - **Streamable HTTP gateway** — `mcpglass gateway` is a local reverse proxy for url-type servers
-  (MCP spec 2025-06-18): JSON and SSE responses stream through untouched while being recorded;
+  (MCP spec through 2025-11-25): JSON and SSE responses stream through untouched while being
+  recorded;
   policy applies per request; loopback-only with Origin + Host validation against DNS rebinding.
 - **One-command takeover** — `mcpglass attach [claude-code|claude-desktop|cursor|all]` rewrites
   client configs (stdio servers get wrapped, url servers get repointed at the gateway with their

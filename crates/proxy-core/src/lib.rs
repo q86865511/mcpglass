@@ -10,10 +10,16 @@ pub use sse::SseSplitter;
 
 pub mod bloat;
 
-/// The MCP protocol version this build targets. Centralised here (per the project
-/// convention that protocol constants live in `proxy-core`) so the stdio wrap and
-/// the HTTP gateway agree on one value — e.g. the `MCP-Protocol-Version` header of
-/// the Streamable HTTP transport.
+/// Fallback MCP protocol version for replaying a *legacy* session that carries no
+/// recorded protocol version (a pre-v6 db row, or traffic where the `initialize`
+/// handshake was never observed). Centralised here per the project convention that
+/// protocol constants live in `proxy-core`.
+///
+/// The proxy itself is version-agnostic — it forwards bytes verbatim and passively
+/// records whichever version a session actually negotiated (see
+/// `storage::Store::set_session_protocol`). This constant is used only as the
+/// `initialize` / `MCP-Protocol-Version` value when replay has no observed version to
+/// reconstruct from; a session with a recorded version replays with *that* instead.
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
 /// Which leg of the conversation a framed line belongs to.
@@ -262,5 +268,82 @@ mod tests {
             assert_eq!(d.as_str().parse::<Direction>(), Ok(d));
         }
         assert!("bogus".parse::<Direction>().is_err());
+    }
+
+    // --- MCP 2025-11-25 wire shapes: the parser is version-agnostic, so new
+    // methods/fields must be extracted (method/id) and preserved verbatim, never
+    // rejected. These lock in that the tap treats the newer spec as pass-through. --
+
+    #[test]
+    fn parse_tasks_requests_and_notification_extract_method_and_id() {
+        // The experimental `tasks/*` request family (2025-11-25): each carries a
+        // method and an id the parser must surface, plus a `task:{ttl}` params block
+        // it simply ignores (only method/id are indexed).
+        for method in ["tasks/get", "tasks/result", "tasks/list", "tasks/cancel"] {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":"t1","method":"{method}","params":{{"task":{{"ttl":30000}}}}}}"#
+            );
+            let p = parse_line(line.as_bytes(), Direction::C2s);
+            assert_eq!(p.method.as_deref(), Some(method));
+            assert_eq!(p.rpc_id.as_deref(), Some("t1"));
+            assert!(p.is_valid_json);
+        }
+        // The status notification has a method but no id (a notification).
+        let notif = parse_line(
+            br#"{"jsonrpc":"2.0","method":"notifications/tasks/status","params":{"taskId":"x","status":"working"}}"#,
+            Direction::S2c,
+        );
+        assert_eq!(notif.method.as_deref(), Some("notifications/tasks/status"));
+        assert_eq!(notif.rpc_id, None);
+    }
+
+    #[test]
+    fn parse_create_task_result_is_a_plain_response() {
+        // A `CreateTaskResult` (the response to an augmented request) is just a
+        // JSON-RPC response: it has an id, no method, and its `_meta` related-task
+        // marker is preserved verbatim in the raw frame. It must not be flagged an
+        // error, and must not disturb request/response correlation (only id + method
+        // are read; the response has method None).
+        let body = br#"{"jsonrpc":"2.0","id":7,"result":{"task":{"taskId":"abc","ttl":30000},"_meta":{"io.modelcontextprotocol/related-task":{"taskId":"abc"}}}}"#;
+        let p = parse_line(body, Direction::S2c);
+        assert_eq!(p.method, None);
+        assert_eq!(p.rpc_id.as_deref(), Some("7"));
+        assert!(p.is_valid_json);
+        assert!(!p.is_error, "a result response is not an error");
+    }
+
+    #[test]
+    fn parse_2025_11_25_augmented_shapes_are_valid_json() {
+        // icons on a tools/list result, sampling with tools/toolChoice, and a
+        // URL-mode elicitation each carry new fields the parser has no schema for —
+        // it must still parse them as valid JSON and index the id, since the tap
+        // records and forwards them unchanged.
+        let icons = parse_line(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read","icons":[{"src":"data:image/png;base64,AA","mimeType":"image/png","sizes":["16x16"]}]}]}}"#,
+            Direction::S2c,
+        );
+        assert!(icons.is_valid_json);
+        assert_eq!(icons.rpc_id.as_deref(), Some("1"));
+
+        let sampling = parse_line(
+            br#"{"jsonrpc":"2.0","id":2,"method":"sampling/createMessage","params":{"messages":[],"tools":[{"name":"calc"}],"toolChoice":{"type":"auto"}}}"#,
+            Direction::S2c,
+        );
+        assert_eq!(sampling.method.as_deref(), Some("sampling/createMessage"));
+        assert_eq!(sampling.rpc_id.as_deref(), Some("2"));
+
+        let elicit = parse_line(
+            br#"{"jsonrpc":"2.0","id":3,"method":"elicitation/create","params":{"mode":"url","url":"https://example.test/form"}}"#,
+            Direction::C2s,
+        );
+        assert_eq!(elicit.method.as_deref(), Some("elicitation/create"));
+        // The new ElicitResult shape is a plain response with an id and no method.
+        let elicit_result = parse_line(
+            br#"{"jsonrpc":"2.0","id":3,"result":{"action":"accept","content":{"answer":"yes"}}}"#,
+            Direction::C2s,
+        );
+        assert_eq!(elicit_result.method, None);
+        assert_eq!(elicit_result.rpc_id.as_deref(), Some("3"));
+        assert!(elicit_result.is_valid_json);
     }
 }

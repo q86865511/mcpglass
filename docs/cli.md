@@ -115,7 +115,8 @@ session.
 
 ## `gateway`
 
-Run the long-lived reverse proxy for url-type (Streamable HTTP, spec 2025-06-18) MCP servers. JSON
+Run the long-lived reverse proxy for url-type (Streamable HTTP, spec through 2025-11-25) MCP
+servers. JSON
 and SSE responses stream through untouched while a side-channel tap records them; policy decisions
 apply per request. `attach` repoints url servers at this gateway.
 
