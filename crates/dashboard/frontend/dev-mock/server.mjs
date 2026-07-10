@@ -56,6 +56,12 @@ function buildSessionMessages(sessionId, count, startTs) {
       });
     }
 
+    // A sprinkle of metadata-only recordings (as `--record metadata` produces):
+    // the body is dropped (raw = "") and its original byte length kept in raw_len,
+    // so the detail panel's "metadata-only" rendering has something to show.
+    const rawLen = Buffer.byteLength(raw, "utf8");
+    const metadataOnly = isValidJson && i % 19 === 5;
+
     messages.push({
       id,
       session_id: sessionId,
@@ -65,8 +71,9 @@ function buildSessionMessages(sessionId, count, startTs) {
       rpc_id: rpcId,
       is_valid_json: isValidJson,
       is_error: isError,
-      size: Buffer.byteLength(raw, "utf8"),
-      raw,
+      size: rawLen,
+      raw: metadataOnly ? "" : raw,
+      raw_len: metadataOnly ? rawLen : null,
     });
   }
   return messages;
@@ -370,6 +377,32 @@ const server = createServer((req, res) => {
 
   if (parts.length === 2 && parts[1] === "sessions" && req.method === "GET") {
     send(200, sessionsPayload());
+    return;
+  }
+
+  // DELETE /api/sessions/{id}: drop the session and all its messages/events, keeping
+  // (conceptually) its tool fingerprints. Mirrors the real backend's 404 on unknown id.
+  if (parts.length === 3 && parts[1] === "sessions" && req.method === "DELETE") {
+    const id = Number(parts[2]);
+    const idx = sessionDefs.findIndex((d) => d.id === id);
+    if (idx === -1) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    const msgs = messagesBySession.get(id) ?? [];
+    const security = securityEventsBySession.get(id) ?? [];
+    const inject = injectEventsBySession.get(id) ?? [];
+    for (const m of msgs) messagesById.delete(m.id);
+    messagesBySession.delete(id);
+    securityEventsBySession.delete(id);
+    injectEventsBySession.delete(id);
+    sessionDefs.splice(idx, 1);
+    send(200, {
+      sessions: 1,
+      messages: msgs.length,
+      security_events: security.length,
+      inject_events: inject.length,
+    });
     return;
   }
 

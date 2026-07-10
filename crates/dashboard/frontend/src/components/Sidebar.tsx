@@ -5,9 +5,10 @@ interface SidebarProps {
   sessions: SessionSummary[];
   selectedId: number | null;
   onSelect: (id: number) => void;
+  onDelete: (id: number) => void;
 }
 
-export function Sidebar({ sessions, selectedId, onSelect }: SidebarProps) {
+export function Sidebar({ sessions, selectedId, onSelect, onDelete }: SidebarProps) {
   return (
     <aside className="sidebar">
       <div className="sidebar-header">Sessions</div>
@@ -15,7 +16,7 @@ export function Sidebar({ sessions, selectedId, onSelect }: SidebarProps) {
         {sessions.map((s) => {
           const live = s.ended_at_ms === null;
           return (
-            <li key={s.id}>
+            <li key={s.id} className="session-row">
               <button
                 className={
                   "session-item" + (s.id === selectedId ? " session-item-active" : "")
@@ -44,6 +45,14 @@ export function Sidebar({ sessions, selectedId, onSelect }: SidebarProps) {
                     </span>
                   </div>
                 )}
+              </button>
+              <button
+                className="session-delete"
+                title="Delete this session"
+                aria-label={`Delete session ${s.label}`}
+                onClick={() => onDelete(s.id)}
+              >
+                ×
               </button>
             </li>
           );

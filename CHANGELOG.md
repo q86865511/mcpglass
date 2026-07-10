@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Data lifecycle management** — you can now manage the recorded traffic instead of only
+  accumulating it:
+  - `mcpglass prune` deletes sessions by age (`--older-than 7d`) or to a size cap
+    (`--max-size 500M`, oldest-first + vacuum), with `--dry-run` and `--vacuum`. Tool fingerprints
+    are never pruned (they are the cross-session rug-pull baseline).
+  - The dashboard sidebar has a per-session delete button (`DELETE /api/sessions/{id}`, confirmed),
+    which likewise keeps fingerprints.
+  - `wrap`/`gateway` take `--record full|metadata|off`: `metadata` keeps method/ids/timing and the
+    original body size but drops the raw body; `off` records nothing to `messages`. Security and
+    inject events are always recorded regardless.
+  - `mcpglass export --session <id> --out bundle.json` writes a single session to a JSON bundle with
+    every recorded body and argv token secret-masked (there is no un-masked export).
+- **Sensitive files hardened at rest** — on Unix the sessions database and proxy log (and SQLite's
+  `-wal`/`-shm` sidecars) are restricted to owner-only `0600`; Windows relies on the default
+  `%LOCALAPPDATA%` ACL.
 - **Structured server identity (schema v7)** — a session now records its server's
   identity as structured data (`program`, the full `argv` as a JSON array, `transport`,
   and a `server_id` hash) instead of relying on the joined command string. Two runs of

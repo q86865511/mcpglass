@@ -28,14 +28,14 @@ use axum::http::header::{HOST, ORIGIN};
 use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use proxy_core::Direction;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use storage::{
-    InjectCounts, InjectEventRow, MessageDetail, MessageFilter, MessageRow, SecurityCounts,
-    SecurityEventRow, SessionSummary, Stats, Store,
+    InjectCounts, InjectEventRow, MessageDetail, MessageFilter, MessageRow, PruneStats,
+    SecurityCounts, SecurityEventRow, SessionSummary, Stats, Store,
 };
 
 /// The built frontend, baked into the binary so `mcpglass dashboard` needs no
@@ -137,6 +137,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions/{id}", delete(delete_session))
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/sessions/{id}/stats", get(session_stats))
         .route("/api/sessions/{id}/context", get(session_context))
@@ -272,6 +273,43 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<SessionsRes
     }))
 }
 
+/// The row counts removed by a `DELETE /api/sessions/{id}`. Mirrors
+/// [`storage::PruneStats`]; `tool_fingerprints` is intentionally never deleted (the
+/// cross-session rug-pull baseline), so it does not appear here.
+#[derive(Serialize)]
+struct DeleteSessionResponse {
+    sessions: u64,
+    messages: u64,
+    security_events: u64,
+    inject_events: u64,
+}
+
+impl From<PruneStats> for DeleteSessionResponse {
+    fn from(s: PruneStats) -> Self {
+        Self {
+            sessions: s.sessions,
+            messages: s.messages,
+            security_events: s.security_events,
+            inject_events: s.inject_events,
+        }
+    }
+}
+
+/// `DELETE /api/sessions/{id}`: delete one session and all of its messages / security
+/// events / inject events (keeping its tool fingerprints). A mutating endpoint, so —
+/// like `replay` — it is covered by the loopback [`loopback_guard`] layer. An unknown
+/// id answers `404`.
+async fn delete_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Response, AppError> {
+    let removed = run_blocking(state.store.clone(), move |store| store.delete_session(id)).await?;
+    match removed {
+        Some(stats) => Ok(Json(DeleteSessionResponse::from(stats)).into_response()),
+        None => Ok((StatusCode::NOT_FOUND, "session not found").into_response()),
+    }
+}
+
 #[derive(Serialize)]
 struct MessageRowDto {
     id: i64,
@@ -358,6 +396,10 @@ struct MessageDetailDto {
     size: u64,
     preview: String,
     raw: String,
+    /// Original byte length when the frame was recorded metadata-only (`raw` is then
+    /// `""`); `null` for a full recording. Lets the UI show "metadata-only, body not
+    /// recorded" instead of an empty body.
+    raw_len: Option<i64>,
 }
 
 impl From<MessageDetail> for MessageDetailDto {
@@ -374,6 +416,7 @@ impl From<MessageDetail> for MessageDetailDto {
             size: m.size,
             preview: m.preview,
             raw: m.raw,
+            raw_len: m.raw_len,
         }
     }
 }

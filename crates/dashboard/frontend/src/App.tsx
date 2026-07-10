@@ -11,6 +11,7 @@ import type {
   SessionSummary,
 } from "./api";
 import {
+  deleteSession,
   fetchContext,
   fetchInjectCounts,
   fetchInjectEvents,
@@ -234,6 +235,29 @@ export function App() {
       });
   }, [selectedSessionId]);
 
+  const handleDeleteSession = useCallback(
+    (id: number) => {
+      if (
+        !window.confirm(
+          "Delete this session and all its recorded messages? This cannot be undone. (Tool fingerprints are kept.)",
+        )
+      ) {
+        return;
+      }
+      deleteSession(id)
+        .then(() => {
+          // If the deleted session was selected, clear it; loadSessions then
+          // picks the newest remaining one.
+          setSelectedSessionId((cur) => (cur === id ? null : cur));
+          loadSessions();
+        })
+        .catch((e: unknown) =>
+          setSessionsError(e instanceof Error ? e.message : String(e)),
+        );
+    },
+    [loadSessions],
+  );
+
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
@@ -320,6 +344,7 @@ export function App() {
         sessions={sessions}
         selectedId={selectedSessionId}
         onSelect={setSelectedSessionId}
+        onDelete={handleDeleteSession}
       />
       <main className="main">
         {sessionsError && <div className="banner banner-error">Failed to load sessions: {sessionsError}</div>}

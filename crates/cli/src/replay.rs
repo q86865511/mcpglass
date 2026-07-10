@@ -163,6 +163,13 @@ pub async fn run_replay(
                 "message {message_id} is a notification (no id); only a request expecting a response can be replayed"
             )));
         };
+        // A metadata-only recording (`--record metadata`) kept the frame's metadata but
+        // not its body, so there is nothing to re-send.
+        if msg.raw.is_empty() && msg.raw_len.is_some() {
+            return Err(ReplayError::NotReplayable(format!(
+                "message {message_id} was recorded metadata-only (body not recorded); nothing to replay"
+            )));
+        }
 
         let session = store
             .session(msg.session_id)
