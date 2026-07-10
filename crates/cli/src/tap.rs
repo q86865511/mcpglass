@@ -227,7 +227,21 @@ pub(crate) fn storage_loop(
     // read off the same tapped frames (plus header hints), never touching the wire.
     let mut pending_initialize = PendingInitialize::new();
     let mut protocol_source = ProtocolSource::None;
+    // Test-only backpressure hook: in a debug/test build only, an optional per-message
+    // stall (`MCPGLASS_TEST_STORAGE_STALL_MS`) lets the fail-open regression tests force
+    // the tap channel to fill so the drop path is exercised. It is `cfg`-gated, not a
+    // runtime branch, so the storage loop compiles down to zero cost in release builds.
+    #[cfg(debug_assertions)]
+    let test_stall = std::env::var("MCPGLASS_TEST_STORAGE_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(std::time::Duration::from_millis);
     while let Some(msg) = rx.blocking_recv() {
+        #[cfg(debug_assertions)]
+        if let Some(stall) = test_stall {
+            std::thread::sleep(stall);
+        }
         match msg {
             StorageMsg::Tap(ev) => {
                 let direction = ev.direction;
