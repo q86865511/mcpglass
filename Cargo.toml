@@ -13,6 +13,11 @@ authors = ["q86865511"]
 keywords = ["mcp", "proxy", "observability", "security", "debugging"]
 categories = ["development-tools::debugging", "command-line-utilities"]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 # Shared dependency versions, resolved once for the whole workspace.
 [workspace.dependencies]
 anyhow = "1"

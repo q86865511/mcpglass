@@ -33,6 +33,10 @@ All notable changes to this project are documented here. The format is based on
   rug-pull surface) is flagged. Existing fingerprints upgrade silently on next
   sighting with no false-positive alert. `icons` are deliberately excluded (their
   remote URLs churn benignly) and remain on the watch list.
+- **Prebuilt release binaries** — `.github/workflows/release.yml` builds and publishes
+  platform archives (Linux x86_64, Windows x86_64, macOS Apple Silicon/Intel) on every `v*` tag,
+  with `SHA256SUMS`, an SPDX SBOM, and a build provenance attestation. See
+  [docs/RELEASING.md](docs/RELEASING.md).
 
 ### Changed
 

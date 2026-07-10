@@ -132,9 +132,38 @@ threat model — is in [docs/security-model.md](docs/security-model.md).
 
 ## 🚀 Quick start
 
-There is no prebuilt binary yet — build from source. You need a
-[Rust toolchain](https://rustup.rs/) (1.86+) and [pnpm](https://pnpm.io/) (the dashboard frontend
-is embedded into the binary at build time):
+### Download a prebuilt binary
+
+Grab the archive for your platform from the [latest release](https://github.com/q86865511/mcpglass/releases/latest)
+(Linux x86_64, Windows x86_64, macOS Apple Silicon, macOS Intel), then verify and extract it:
+
+```sh
+# Verify the download against the release's SHA256SUMS.
+sha256sum -c SHA256SUMS --ignore-missing
+
+# Optional: verify the GitHub Actions build provenance attestation.
+gh attestation verify mcpglass-v0.1.1-x86_64-unknown-linux-gnu.tar.gz --owner q86865511
+
+tar -xzf mcpglass-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+cd mcpglass-v0.1.1-x86_64-unknown-linux-gnu
+./mcpglass --help
+```
+
+On macOS, clear the quarantine attribute before the first run or Gatekeeper will refuse to launch
+the binary:
+
+```sh
+xattr -d com.apple.quarantine ./mcpglass
+```
+
+Then move `mcpglass` (or `mcpglass.exe`) onto your `PATH`. See [docs/RELEASING.md](docs/RELEASING.md)
+for how releases are built.
+
+<details>
+<summary>Build from source instead</summary>
+
+You need a [Rust toolchain](https://rustup.rs/) (1.86+) and [pnpm](https://pnpm.io/) (the dashboard
+frontend is embedded into the binary at build time):
 
 ```sh
 git clone https://github.com/q86865511/mcpglass
@@ -150,6 +179,8 @@ cargo build --release --workspace
 # 2b. ...or install it onto your PATH
 cargo install --path crates/cli
 ```
+
+</details>
 
 Then point your client's existing MCP servers through the proxy and watch:
 
