@@ -5,7 +5,7 @@ conventions.
 
 ## Prerequisites
 
-- A [Rust toolchain](https://rustup.rs/), **1.80 or newer** (the workspace's `rust-version`), with
+- A [Rust toolchain](https://rustup.rs/), **1.86 or newer** (the workspace's `rust-version`), with
   the `clippy` component.
 - [pnpm](https://pnpm.io/) and Node.js 20+ for the dashboard frontend.
 
