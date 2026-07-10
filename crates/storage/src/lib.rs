@@ -1982,6 +1982,7 @@ fn restrict_file_permissions(path: &Path) {
     } else {
         let _ = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .mode(0o600)
             .open(path);
