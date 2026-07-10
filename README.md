@@ -7,7 +7,7 @@
 <p align="center"><img src="docs/assets/dashboard-demo.gif" alt="The mcpglass dashboard — session timeline, per-message detail, Security / Context / Inject tabs" width="100%"></p>
 
 [![CI](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml/badge.svg)](https://github.com/q86865511/mcpglass/actions/workflows/ci.yml)
-[![Rust](https://img.shields.io/badge/Rust-1.80%2B-dea584?logo=rust&logoColor=white)](Cargo.toml)
+[![Rust](https://img.shields.io/badge/Rust-1.86%2B-dea584?logo=rust&logoColor=white)](Cargo.toml)
 [![Single binary](https://img.shields.io/badge/deploy-single%20binary-2ea44f)](crates/cli)
 [![MCP spec](https://img.shields.io/badge/MCP-2025--06--18-6e56cf)](https://modelcontextprotocol.io/)
 [![Local only](https://img.shields.io/badge/data-100%25%20local-informational)](docs/security-model.md)
@@ -132,7 +132,7 @@ threat model — is in [docs/security-model.md](docs/security-model.md).
 ## 🚀 Quick start
 
 There is no prebuilt binary yet — build from source. You need a
-[Rust toolchain](https://rustup.rs/) (1.80+) and [pnpm](https://pnpm.io/) (the dashboard frontend
+[Rust toolchain](https://rustup.rs/) (1.86+) and [pnpm](https://pnpm.io/) (the dashboard frontend
 is embedded into the binary at build time):
 
 ```sh
