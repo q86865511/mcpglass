@@ -1,9 +1,10 @@
 # PROGRESS — mcpglass
 
 ## 目前狀態
-v0.1.1 已正式發佈（四平台 binaries＋SBOM＋attestation）；v0.2.0 全部五個 PR（#5 fail-open 措辭、#6 schema v7 identity、#7 資料生命週期、#9 benchmark＋fail-open 迴歸）皆 merge 進 master，253 測試全綠。剩：docs/compat.md 手動 client 清單（使用者自跑）、v0.2.0 正式 tag 時機、收集真實使用者回饋。
+v0.1.1 已正式發佈；v0.2.0 五個 PR（#5/#6/#7/#9）皆 merge 進 master。2026-07-13 **v0.2.0 已版本定版**（bump 三處＋CHANGELOG 收斂，本機 250 測試綠/1 手動 bench ignored、clippy 零警告，上游 conformance＠0.1.16 與 MCP spec 2025-11-25 對齊確認），進入發版流程：待 push v0.2.0-rc1 演練→各平台 artifact smoke test→push 正式 tag。剩：docs/compat.md 手動 client 清單（使用者自跑，發版第 7 步）、收集真實使用者回饋。
 
 ## 已完成
+- [2026-07-13] 🏷️ v0.2.0 版本定版（發版流程第 1–5 步，模式 b 自動 commit）：三處版本 bump（Cargo.toml `[workspace.package]`/frontend package.json/README Status → 0.2.0）＋CHANGELOG `[Unreleased]` 收斂為 `[0.2.0] - 2026-07-13`（底部加 v0.1.1...v0.2.0 比較連結）；本機證綠 `cargo test --workspace` 250 passed/0 failed/1 ignored（設計內手動 bench）、`clippy -D warnings` 零警告、五 crate 顯示 v0.2.0；上游對齊查證（conformance CI 已釘 `@modelcontextprotocol/conformance@0.1.16`＝npm latest，MCP spec current 仍 2025-11-25、無新 final 版）。待 push `v0.2.0-rc1` 演練→artifact smoke test→正式 tag（發版第 6–8 步，需使用者權限框與親自 smoke test）。
 - [2026-07-11] 🧬 v0.2.0 全數 merge（#5/#6/#7/#9，各經「agent 實作→主對話獨立重跑→reviewer 獨立審查→發現逐條裁決修正」流程）：
   - **fail-open 承諾收斂**（#5）：security-model/README 措辭改「程序存活時 tap 不施加 backpressure；程序級故障（OOM/kill/host crash）明確除外」——把不可證的絕對宣稱改成可驗證範圍。
   - **schema v7 結構化 server identity**（#6）：sessions 四欄（program/argv_json/transport/server_id）＋messages.raw_len；policy::ServerIdentity（型別上無 env 欄）＋sha256 canonical hash；指紋 scope 改 server_id，**lazy re-key 讓升級不歸零 rug-pull 基線**（BEGIN IMMEDIATE 同交易整批重鍵，「升級後首錄零告警」整合測試釘住）；replay 由 argv_json 無損還原。237 測試；reviewer 一條低嚴重度（COMMIT 洩漏交易毒化偵測）已修。
