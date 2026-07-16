@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-16
+
+### Added
+
+- **Dashboard visual overhaul (oscilloscope theme)** — the embedded React dashboard was rebuilt on a
+  CSS design-token system with a dark and a light theme (follows `prefers-color-scheme`, remembers
+  your choice). The two message directions read as scope channels (c2s = CH1, s2c = CH2) throughout
+  the timeline, detail panel, and stats. The layout is responsive: below 900px the session sidebar
+  becomes an off-canvas drawer, and below 600px the table sheds its lower-priority columns.
+- **Dashboard data lifecycle UI** — the CLI-only prune and export flows are now in the dashboard:
+  - `POST /api/prune` deletes sessions by age and/or to a size cap, with a dry-run preview so the
+    prune dialog can show how many sessions and messages it would remove before you confirm. Tool
+    fingerprints are never pruned.
+  - `GET /api/sessions/{id}/export` (and the timeline's EXPORT button) downloads the same
+    secret-masked JSON bundle as `mcpglass export`; there is no un-masked path.
+  - `GET /api/health` now reports build capabilities, so the Replay button is disabled up front when
+    the running binary has no replay backend instead of failing only on click.
+- **Dashboard UX** — toast notifications for copy/replay/delete, a confirm dialog (replacing the
+  browser's native `confirm`) for destructive actions, loading skeletons, deep-linkable URLs
+  (`#/s/{id}/{view}?msg=`), debounced search, and keyboard navigation (`j`/`k` to move between
+  frames, `/` to focus search, `Esc` to close). Auto-refresh now defaults on at a 3s interval and
+  pauses while the tab is hidden.
+- **`mcpglass dashboard --policy <file>`** — the dashboard's export endpoint loads the same policy
+  (including custom secret patterns) as the CLI; without the flag it uses the built-in patterns.
+
+### Changed
+
+- The dashboard's auto-refresh default changed from off to on (3s), and the poll now pauses while the
+  browser tab is backgrounded.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
@@ -153,6 +183,7 @@ on the local machine.
   machine. Secret filtering masks values only in the security audit view. See
   [SECURITY.md](SECURITY.md).
 
+[0.3.0]: https://github.com/q86865511/mcpglass/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/q86865511/mcpglass/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/q86865511/mcpglass/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/q86865511/mcpglass/releases/tag/v0.1.0

@@ -27,7 +27,7 @@ MCP 流量的 Wireshark＋防火牆：Rust 單一 binary 透明代理，坐在 A
 - 資料生命週期（WF4）：`prune` 是生命週期管理指令,天生 writer（讀寫開庫、單交易刪除,非帶外唯讀）,一樣不碰活體 wire;刪除（prune／dashboard `DELETE /api/sessions/{id}`）永遠保留 tool_fingerprints（跨 session rug-pull 信任基線,session_id 懸空可接受）,故刪除交易以 `delete_with_fk_disabled` 暫時關 foreign_keys 容許懸空參照。`--max-size` 用 db_used_bytes（freelist 調整）迴圈刪最舊 session 至達標後自動 VACUUM;`--older-than` 單獨用不自動 VACUUM（WAL 頁面重用）,`--vacuum` 顯式要。
 - 錄製模式 `--record full|metadata|off`（wrap／gateway,啟動旗標不可執行期切換）:off 在 pump 端就不 enqueue tap（零旁路成本,仍 begin_session,security/inject 照記）;metadata 在 storage_loop 丟棄 raw **之前**先做完 tools/list 指紋與 PendingInitialize 解析,raw 存空字串、原 byte 長度寫入 messages.raw_len。security/inject 事件不受 --record 影響（安全承諾獨立於錄製）。
 - 磁碟落地敏感檔（sessions.db、mcpglass.log）Unix 下 best-effort 設 0600（-wal/-shm 繼承主檔）,Windows 靠 %LOCALAPPDATA% ACL 不動。
-- dashboard 有變異端點（`POST /replay`、`DELETE /api/sessions/{id}`）後,所有路由經 loopback middleware 驗 Origin＋Host（防 DNS rebinding/CSRF-to-localhost）。
+- dashboard 有變異端點（`POST /replay`、`DELETE /api/sessions/{id}`、`POST /api/prune`）後,所有路由經 loopback middleware 驗 Origin＋Host（防 DNS rebinding/CSRF-to-localhost）。`GET /api/sessions/{id}/export` 與 CLI export 共用 `dashboard::build_export_bundle`（單一遮罩路徑,經 `serve` 的 policy 參數）;`GET /api/health` 回 capabilities（replay 可用性),前端 replay 按鈕據此 gating。dashboard 前端為 CSS token 雙主題（Oscilloscope 儀器風,`styles/` 五檔）＋hash 深連結（`#/s/{id}/{view}?msg=`）。
 - 安全層職責分離：c2s（client→server）為**可攔阻的同步純函式決策**（`policy::evaluate_request`）；
   s2c（server→client）維持**旁路 tap**，指紋比對在 storage thread 做（只告警不阻擋）。
 - 熱路徑日誌節流：channel 滿導致的 tap-drop 每 pump 只同步寫檔一次（避免故障態同步 I/O 回壓 wire）。

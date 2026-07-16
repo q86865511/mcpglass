@@ -1,7 +1,7 @@
 # PROGRESS — mcpglass
 
 ## 目前狀態
-v0.1.1 已正式發佈；v0.2.0 五個 PR（#5/#6/#7/#9）皆 merge 進 master。2026-07-13 **v0.2.0 已版本定版**（bump 三處＋CHANGELOG 收斂，本機 250 測試綠/1 手動 bench ignored、clippy 零警告，上游 conformance＠0.1.16 與 MCP spec 2025-11-25 對齊確認），進入發版流程：待 push v0.2.0-rc1 演練→各平台 artifact smoke test→push 正式 tag。剩：docs/compat.md 手動 client 清單（使用者自跑，發版第 7 步）、收集真實使用者回饋。
+v0.1.1、v0.2.0 已正式發佈。2026-07-16 **dashboard GUI 大改（v0.3.0）**於 worktree 分支 `claude/session-2884c3` 完成六階段（Oscilloscope 儀器風雙主題＋響應式、UX 元件 toast/modal/skeleton/鍵盤/深連結、dashboard prune/export/health capabilities 端點、README 素材以新 UI 重錄）,三處版號 bump 至 0.3.0＋CHANGELOG 定版,本機 `cargo test --workspace`＋`clippy -D warnings`＋`pnpm build` 全綠。待:push 分支→PR→merge master→發版流程（v0.3.0-rc1 演練→各平台 artifact smoke test（使用者親自）→正式 tag）。
 
 ## 已完成
 - [2026-07-16] 🎛️ dashboard GUI 翻新計劃 P2/P3/P5 完成＋README 素材重錄（worktree session-2884c3,計劃全六階段收官）：

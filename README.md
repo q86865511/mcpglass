@@ -21,7 +21,7 @@
 - 🛡️ **Fail-open by design** — while the proxy runs, its own bugs, full disks, or panics never block or delay your traffic; observation is a side-channel tap
 - 🏠 **Local-first** — one binary, one SQLite file, a loopback-only dashboard; nothing is sent anywhere
 
-**Status**: v0.2.0 — stdio + HTTP interception through MCP spec 2025-11-25, one-command config
+**Status**: v0.3.0 — stdio + HTTP interception through MCP spec 2025-11-25, one-command config
 takeover, dashboard, security layer (fingerprint pinning incl. `outputSchema` / secret detection /
 allow-deny), context bloat analytics, request replay, fault injection, prebuilt binaries.
 See [CHANGELOG.md](CHANGELOG.md).
