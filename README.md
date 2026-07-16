@@ -52,7 +52,8 @@ mcpglass is a **transparent proxy** you insert in one command. `mcpglass attach`
 client's config so every existing server runs through the proxy (with backups; `detach` restores).
 From then on every frame is recorded into a local SQLite file and browsable in an embedded React
 dashboard: per-session timelines, payload inspection, per-method latency, security alerts, context
-cost, and injected-fault history.
+cost, and injected-fault history — in an oscilloscope-style dark or light theme, with keyboard
+navigation (`j`/`k`/`/`) and deep-linkable URLs.
 
 The design stance is **fail-open**: mcpglass considers your traffic sacred. Parse failures, a full
 disk, a poisoned lock, a panicking policy engine — none of it may block or delay the bytes flowing
@@ -95,9 +96,10 @@ connection) and fault injection you configure yourself.
 - **Honest storage** — the SQLite file records full raw traffic *verbatim* (that is the point of a
   traffic recorder), disclosed loudly rather than hidden; secret masking applies to the audit view.
 - **Data lifecycle control** — record less (`--record metadata|off`), prune later
-  (`mcpglass prune --older-than 7d` / `--max-size 500M`, or delete a session from the dashboard), and
-  share safely (`mcpglass export` writes a secret-masked JSON bundle). Deleting keeps tool
-  fingerprints; on Unix the db and log are `0600` at rest.
+  (`mcpglass prune --older-than 7d` / `--max-size 500M`, or from the dashboard's prune dialog with a
+  dry-run preview), and share safely (`mcpglass export`, or the dashboard's EXPORT button — both
+  write a secret-masked JSON bundle, always). Deleting keeps tool fingerprints; on Unix the db and
+  log are `0600` at rest.
 
 ## 🏗️ Architecture
 

@@ -48,8 +48,17 @@ async function shot(label) {
 
 await send("Page.enable");
 await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+// The dashboard follows prefers-color-scheme; headless Edge defaults to light.
+// Pin dark so scenes 1-6 are the dark theme and the final toggle scene shows light.
+await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
 await send("Page.navigate", { url });
 await sleep(2500); // let React mount and fetch
+// A previous run's final theme toggle persists in the profile's localStorage and
+// would override the emulated color scheme — clear it and reload so every run
+// starts from the dark default.
+await send("Runtime.evaluate", { expression: "localStorage.removeItem('mcpglass-theme'); location.hash = ''" });
+await send("Page.reload");
+await sleep(2500);
 
 await shot("overview");                 // scene 1: timeline of the inject session
 await click(".message-row:nth-of-type(6)"); await sleep(700);
@@ -61,7 +70,7 @@ await shot("context-tab");              // scene 4: context bloat analysis
 await click(".view-tab:nth-of-type(4)"); await sleep(700);
 await shot("inject-tab");               // scene 5: injected faults
 await click(".view-tab:nth-of-type(1)"); await sleep(700);
-await click(".session-row:nth-of-type(2)"); await sleep(900);
+await click(".session-row:nth-of-type(2) .session-item"); await sleep(900);
 await shot("clean-session");            // scene 6: the clean session timeline
 await click(".theme-toggle"); await sleep(700);
 await shot("light-theme");              // scene 7: the same timeline in the light theme
