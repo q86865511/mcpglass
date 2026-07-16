@@ -1,12 +1,15 @@
 import { useState } from "react";
 import type { SessionStats } from "../api";
+import { sessionExportUrl } from "../api";
 import { formatLatency } from "../format";
 
 interface StatsBarProps {
   stats: SessionStats | null;
+  // The selected session, so the export link can target it. Null hides the button.
+  sessionId: number | null;
 }
 
-export function StatsBar({ stats }: StatsBarProps) {
+export function StatsBar({ stats, sessionId }: StatsBarProps) {
   const [expanded, setExpanded] = useState(false);
 
   if (!stats) {
@@ -32,9 +35,21 @@ export function StatsBar({ stats }: StatsBarProps) {
             {stats.totals.errors}
           </div>
         </div>
-        <button className="stats-toggle" onClick={() => setExpanded((v) => !v)}>
-          {expanded ? "hide per-method latency ▲" : "show per-method latency ▼"}
-        </button>
+        <div className="stats-actions">
+          <button className="stats-toggle" onClick={() => setExpanded((v) => !v)}>
+            {expanded ? "hide per-method latency ▲" : "show per-method latency ▼"}
+          </button>
+          {sessionId !== null && (
+            <a
+              className="btn stats-export"
+              href={sessionExportUrl(sessionId)}
+              download
+              title="download masked session bundle (secrets redacted)"
+            >
+              EXPORT
+            </a>
+          )}
+        </div>
       </div>
       {expanded && (
         <table className="stats-table">

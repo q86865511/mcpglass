@@ -57,6 +57,20 @@
   align-self: center;
 }
 
+/* Right-aligned action cluster: latency toggle + export link. */
+.stats-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+/* Inside the cluster the toggle's own auto-margin is redundant. */
+.stats-actions .stats-toggle {
+  margin-left: 0;
+}
+
 .stats-table {
   margin-top: var(--space-5);
   width: 100%;

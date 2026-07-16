@@ -28,10 +28,14 @@ function send(method, params = {}) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function click(x, y) {
-  await send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
-  await send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
-  await send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+// Click via selector so the scenes survive layout changes (coordinates broke
+// whenever the dashboard chrome moved; see docs/demo.md).
+async function click(selector) {
+  const { result, exceptionDetails } = await send("Runtime.evaluate", {
+    expression: `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return "missing"; el.click(); return "ok"; })()`,
+    returnByValue: true,
+  });
+  if (exceptionDetails || result.value !== "ok") throw new Error(`click ${selector}: ${result?.value ?? "eval failed"}`);
 }
 
 let frame = 0;
@@ -48,17 +52,19 @@ await send("Page.navigate", { url });
 await sleep(2500); // let React mount and fetch
 
 await shot("overview");                 // scene 1: timeline of the inject session
-await click(600, 332); await sleep(700);
+await click(".message-row:nth-of-type(6)"); await sleep(700);
 await shot("message-detail");           // scene 2: tools/call payload in the detail panel
-await click(385, 75); await sleep(700);
+await click(".view-tab:nth-of-type(2)"); await sleep(700);
 await shot("security-tab");             // scene 3: security events
-await click(455, 75); await sleep(700);
+await click(".view-tab:nth-of-type(3)"); await sleep(700);
 await shot("context-tab");              // scene 4: context bloat analysis
-await click(520, 75); await sleep(700);
+await click(".view-tab:nth-of-type(4)"); await sleep(700);
 await shot("inject-tab");               // scene 5: injected faults
-await click(310, 75); await sleep(700);
-await click(130, 120); await sleep(900);
+await click(".view-tab:nth-of-type(1)"); await sleep(700);
+await click(".session-row:nth-of-type(2)"); await sleep(900);
 await shot("clean-session");            // scene 6: the clean session timeline
+await click(".theme-toggle"); await sleep(700);
+await shot("light-theme");              // scene 7: the same timeline in the light theme
 
 ws.close();
 console.log("done:", frame, "frames");

@@ -8,9 +8,13 @@ import { useToast } from "./Toast";
 
 interface DetailPanelProps {
   messageId: number | null;
+  // Whether this backend build can actually drive a replay (from the health
+  // endpoint's capabilities). When false the Replay button is shown but disabled,
+  // so the control is discoverable but can't fire against a build that lacks it.
+  replayEnabled: boolean;
 }
 
-export function DetailPanel({ messageId }: DetailPanelProps) {
+export function DetailPanel({ messageId, replayEnabled }: DetailPanelProps) {
   const toast = useToast();
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -169,7 +173,8 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
           <button
             className="copy-btn btn-primary"
             onClick={() => setConfirmReplay(true)}
-            disabled={replaying}
+            disabled={replaying || !replayEnabled}
+            title={replayEnabled ? undefined : "replay backend not available in this build"}
           >
             {replaying ? "Replaying…" : "Replay"}
           </button>

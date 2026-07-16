@@ -96,14 +96,45 @@
   flex-shrink: 0;
   background: var(--bg-raised);
   border-right: 1px solid var(--border);
-  overflow-y: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
 }
 
 .sidebar-header {
+  flex-shrink: 0;
   padding: var(--space-5) var(--space-5);
   border-bottom: 1px solid var(--border);
+}
+
+/* The session list is the one scrolling region; header and footer stay pinned. */
+.session-list {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* Pinned maintenance footer. */
+.sidebar-footer {
+  flex-shrink: 0;
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--border);
+}
+
+.sidebar-prune {
+  width: 100%;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  padding: var(--space-3) var(--space-4);
+  cursor: pointer;
+  transition: color 120ms ease-out, border-color 120ms ease-out;
+}
+
+.sidebar-prune:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
 }
 
 /* ---- Main column ---- */

@@ -358,7 +358,110 @@ function statsPayload(sessionId) {
   };
 }
 
-const server = createServer((req, res) => {
+// Read and JSON-parse a request body (for POST routes). Returns null on invalid
+// JSON so the caller can answer 400.
+function collectBody(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      if (!text) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(text));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+// Simulated on-disk DB size, shrunk by a real (non-dry-run) prune so the toast's
+// "before → after" readout shows movement.
+let mockDbSize = 4_800_000;
+
+function prunePayload(body) {
+  const hasAge = typeof body.older_than_ms === "number";
+  const hasSize = typeof body.max_size_bytes === "number";
+  const dryRun = body.dry_run === true;
+  // Fixed plausible estimate — enough to populate the preview readout.
+  const stats = { sessions: 1, messages: 42, security_events: 0, inject_events: 2 };
+  const before = mockDbSize;
+  let after = before;
+  if (!dryRun) {
+    // Realise the freed space (a real prune vacuums for max-size / when asked).
+    after = Math.max(1_200_000, before - 1_200_000);
+    mockDbSize = after;
+  }
+  return { hasAge, hasSize, payload: { stats, db_size_before: before, db_size_after: after } };
+}
+
+function exportBundle(sessionId) {
+  const def = sessionDefs.find((d) => d.id === sessionId);
+  if (!def) return null;
+  const messages = (messagesBySession.get(sessionId) ?? []).slice(0, 3).map((m) => ({
+    id: m.id,
+    ts_ms: m.ts_ms,
+    direction: m.direction,
+    method: m.method,
+    rpc_id: m.rpc_id,
+    // Pretend a secret was masked, to mirror the real (always-masked) export.
+    raw: m.raw.replace(/AKIA[0-9A-Z]{16}/g, "AKIA****************"),
+  }));
+  return {
+    note: "masked session export (dev mock) — secrets redacted",
+    session: {
+      id: def.id,
+      label: def.label,
+      command: def.command,
+      started_at_ms: def.started_at_ms,
+      ended_at_ms: def.ended_at_ms,
+    },
+    messages,
+  };
+}
+
+// A ContextReport-shaped fixture (see api.ts). Populated for a session that has
+// messages; unknown sessions report zero tools (exercises the empty state).
+function contextReport(sessionId) {
+  if (!messagesBySession.has(sessionId)) {
+    return {
+      approximate: true,
+      tool_count: 0,
+      total_chars: 0,
+      est_total_tokens: 0,
+      tools: [],
+      fat_tools: [],
+    };
+  }
+  const rawTools = [
+    { name: "fs_read", total_chars: 3200, description_tokens: 620 },
+    { name: "http_fetch", total_chars: 2100, description_tokens: 410 },
+    { name: "search", total_chars: 1400, description_tokens: 280 },
+    { name: "fs_write", total_chars: 900, description_tokens: 150 },
+    { name: "prompts_get", total_chars: 400, description_tokens: 70 },
+  ];
+  const total_chars = rawTools.reduce((a, t) => a + t.total_chars, 0);
+  const est_total_tokens = Math.round(total_chars / 4);
+  const tools = rawTools.map((t) => {
+    const est_tokens = Math.round(t.total_chars / 4);
+    return {
+      name: t.name,
+      total_chars: t.total_chars,
+      est_tokens,
+      description_tokens: t.description_tokens,
+      pct: est_total_tokens === 0 ? 0 : Math.round((est_tokens / est_total_tokens) * 1000) / 10,
+    };
+  });
+  // Tools whose description alone is "fat" (mirrors the backend's fat_tools).
+  const fat_tools = rawTools.filter((t) => t.description_tokens > 400).map((t) => t.name);
+  return { approximate: true, tool_count: tools.length, total_chars, est_total_tokens, tools, fat_tools };
+}
+
+const server = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${HOST}:${PORT}`);
   const parts = url.pathname.split("/").filter(Boolean); // e.g. ["api","sessions","2","messages"]
 
@@ -407,7 +510,10 @@ const server = createServer((req, res) => {
   }
 
   if (parts.length === 2 && parts[1] === "health" && req.method === "GET") {
-    send(200, { version: "0.1.0" });
+    // Flip `replay` to false here to exercise the dashboard's replay-gating
+    // (the Replay button then renders disabled). Kept true so the mock mirrors a
+    // full-capability backend.
+    send(200, { version: "0.1.0", capabilities: { replay: true } });
     return;
   }
 
@@ -484,6 +590,80 @@ const server = createServer((req, res) => {
     }
     const preview = full.raw.length > 120 ? full.raw.slice(0, 120) : full.raw;
     send(200, { ...full, preview });
+    return;
+  }
+
+  // GET /api/sessions/{id}/context: context-bloat report fixture.
+  if (parts.length === 4 && parts[1] === "sessions" && parts[3] === "context" && req.method === "GET") {
+    const sessionId = Number(parts[2]);
+    if (!messagesBySession.has(sessionId)) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    send(200, contextReport(sessionId));
+    return;
+  }
+
+  // GET /api/sessions/{id}/export: masked bundle, offered as a file download.
+  if (parts.length === 4 && parts[1] === "sessions" && parts[3] === "export" && req.method === "GET") {
+    const sessionId = Number(parts[2]);
+    const bundle = exportBundle(sessionId);
+    if (!bundle) {
+      send(404, { error: "session not found" });
+      return;
+    }
+    res.setHeader("Content-Disposition", `attachment; filename="mcpglass-session-${sessionId}.json"`);
+    send(200, bundle);
+    return;
+  }
+
+  // POST /api/prune: delete by age and/or size. At least one condition required
+  // (else 400, mirroring the backend). dry_run returns an estimate without change.
+  if (parts.length === 2 && parts[1] === "prune" && req.method === "POST") {
+    const body = await collectBody(req);
+    if (body === null) {
+      res.setHeader("Content-Type", "text/plain");
+      res.writeHead(400);
+      res.end("invalid JSON body");
+      return;
+    }
+    const { hasAge, hasSize, payload } = prunePayload(body);
+    if (!hasAge && !hasSize) {
+      res.setHeader("Content-Type", "text/plain");
+      res.writeHead(400);
+      res.end("prune needs at least one of older_than_ms or max_size_bytes");
+      return;
+    }
+    send(200, payload);
+    return;
+  }
+
+  // POST /api/messages/{id}/replay: re-send a recorded c2s request (dev stub).
+  // Only a client->server request with a method + id is replayable (else 400),
+  // mirroring the real backend's categorised errors.
+  if (
+    parts.length === 4 &&
+    parts[1] === "messages" &&
+    parts[3] === "replay" &&
+    req.method === "POST"
+  ) {
+    const id = Number(parts[2]);
+    const full = messagesById.get(id);
+    if (!full) {
+      send(404, { error: "message not found" });
+      return;
+    }
+    if (full.direction !== "c2s" || full.method === null || full.rpc_id === null) {
+      res.setHeader("Content-Type", "text/plain");
+      res.writeHead(400);
+      res.end("message is not a replayable client->server request");
+      return;
+    }
+    send(200, {
+      transport: "stdio",
+      response_raw: JSON.stringify({ jsonrpc: "2.0", id: full.rpc_id, result: { ok: true, replayed: true } }),
+      note: "fresh handshake, possible side effects, not recorded (dev mock)",
+    });
     return;
   }
 

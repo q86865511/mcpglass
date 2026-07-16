@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ContextReport,
   Direction,
+  HealthResponse,
   InjectCounts,
   InjectEventsResponse,
   MessagesResponse,
@@ -12,6 +13,7 @@ import type {
 import {
   deleteSession,
   fetchContext,
+  fetchHealth,
   fetchInjectCounts,
   fetchInjectEvents,
   fetchMessages,
@@ -33,6 +35,7 @@ import { SecurityView } from "./components/SecurityView";
 import { ContextView } from "./components/ContextView";
 import { InjectView } from "./components/InjectView";
 import { ConfirmDialog } from "./components/ConfirmDialog";
+import { PruneDialog } from "./components/PruneDialog";
 import { useToast } from "./components/Toast";
 
 const PAGE_SIZE = 100;
@@ -68,6 +71,9 @@ export function App() {
   // Pending delete confirmation (null = dialog closed). Carries the label so the
   // modal can name the session being deleted.
   const [confirmDelete, setConfirmDelete] = useState<{ id: number; label: string } | null>(null);
+
+  // Data-lifecycle (prune) dialog open state.
+  const [pruneOpen, setPruneOpen] = useState(false);
 
   // Lets the `/` shortcut focus the raw-JSON search box in the toolbar.
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -117,6 +123,13 @@ export function App() {
     retry: retrySessions,
   } = useApi(fetchSessions, [pollTick]);
   const sessions = sessionsData?.sessions ?? [];
+
+  // Fetched once at startup to gate capability-dependent controls (currently the
+  // Replay button). Until it resolves we assume replay is available, so a working
+  // backend never shows a briefly-disabled button; a build without replay flips it
+  // off once health lands.
+  const healthApi = useApi<HealthResponse>((signal) => fetchHealth(signal), []);
+  const replayEnabled = healthApi.data?.capabilities.replay ?? true;
 
   const messagesApi = useApi<MessagesResponse>(
     sid === null
@@ -360,6 +373,7 @@ export function App() {
           selectedId={selectedSessionId}
           onSelect={handleSelectSession}
           onDelete={handleDeleteSession}
+          onPrune={() => setPruneOpen(true)}
           open={drawerOpen}
         />
         {drawerOpen && (
@@ -375,7 +389,7 @@ export function App() {
           </div>
         ) : (
           <>
-            <StatsBar stats={stats} />
+            <StatsBar stats={stats} sessionId={sid} />
             <div className="view-tabs">
               <button
                 className={"view-tab" + (view === "messages" ? " view-tab-active" : "")}
@@ -444,7 +458,7 @@ export function App() {
                       onOffsetChange={setOffset}
                     />
                   </div>
-                  <DetailPanel messageId={selectedMessageId} />
+                  <DetailPanel messageId={selectedMessageId} replayEnabled={replayEnabled} />
                 </div>
               </>
             ) : view === "security" ? (
@@ -502,6 +516,11 @@ export function App() {
         variant="danger"
         onConfirm={confirmDeleteSession}
         onCancel={() => setConfirmDelete(null)}
+      />
+      <PruneDialog
+        open={pruneOpen}
+        onCancel={() => setPruneOpen(false)}
+        onPruned={retrySessions}
       />
     </div>
   );

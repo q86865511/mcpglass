@@ -125,8 +125,64 @@ export interface InjectCounts {
   truncate: number;
 }
 
+// Which optional backend features this dashboard build wired in, so the UI can
+// hide/disable controls it can't drive (currently just replay).
+export interface Capabilities {
+  replay: boolean;
+}
+
 export interface HealthResponse {
   version: string;
+  capabilities: Capabilities;
+}
+
+// Row counts a prune removed (or, in a dry run, would remove). Mirrors the
+// backend's PruneStatsDto; tool_fingerprints is intentionally never here (it is
+// the cross-session rug-pull baseline and is always kept).
+export interface PruneStats {
+  sessions: number;
+  messages: number;
+  security_events: number;
+  inject_events: number;
+}
+
+// A POST /api/prune request. At least one of older_than_ms / max_size_bytes is
+// required (the backend answers 400 otherwise). older_than_ms is a *duration*
+// (cutoff = now - value), not an absolute timestamp.
+export interface PruneRequest {
+  older_than_ms?: number;
+  max_size_bytes?: number;
+  dry_run: boolean;
+  vacuum: boolean;
+}
+
+export interface PruneResponse {
+  stats: PruneStats;
+  db_size_before: number;
+  db_size_after: number;
+}
+
+// Same-origin URL for a session's masked export bundle. Used as an <a download>
+// href so the browser saves the file directly (no fetch — a fetch would buffer
+// the whole bundle in memory just to re-offer it as a download).
+export function sessionExportUrl(id: number): string {
+  return `/api/sessions/${id}/export`;
+}
+
+// Delete recorded sessions by age and/or to a size target (tool fingerprints are
+// always kept, guaranteed by the backend). On a non-2xx the backend returns a
+// plain-text reason, surfaced as the Error.
+export async function postPrune(body: PruneRequest): Promise<PruneResponse> {
+  const res = await fetch("/api/prune", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(text || `prune -> HTTP ${res.status}`);
+  }
+  return (await res.json()) as PruneResponse;
 }
 
 async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
@@ -208,8 +264,8 @@ export function fetchSessionStats(
   return getJson<SessionStats>(`/api/sessions/${sessionId}/stats`, signal);
 }
 
-export function fetchHealth(): Promise<HealthResponse> {
-  return getJson<HealthResponse>("/api/health");
+export function fetchHealth(signal?: AbortSignal): Promise<HealthResponse> {
+  return getJson<HealthResponse>("/api/health", signal);
 }
 
 export interface SecurityEventsFilters {

@@ -340,6 +340,26 @@ button {
   color: var(--red);
 }
 
+/* Disabled neutral/affirmative/danger buttons (replay unavailable, prune busy).
+   Placed after the :hover rules so it wins on equal specificity. */
+.btn:disabled,
+.copy-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+/* Export link — a `.btn` on an <a>, so undo anchor defaults and give it the
+   instrument micro-label feel (uppercase, tracked). */
+.stats-export {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
+
 .pagination button:disabled {
   opacity: 0.4;
   cursor: default;
@@ -577,6 +597,96 @@ button {
   display: flex;
   justify-content: flex-end;
   gap: var(--space-4);
+}
+
+/* ---- Prune dialog form ---- */
+
+.prune-intro {
+  margin: 0 0 var(--space-5);
+  line-height: 1.5;
+}
+
+/* The always-present product promise: fingerprints survive a prune. */
+.prune-keep {
+  color: var(--ch1);
+}
+
+.prune-form {
+  display: flex;
+  gap: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.prune-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  flex: 1;
+  min-width: 130px;
+}
+
+.prune-field input[type="number"] {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  transition: border-color 120ms ease-out;
+}
+
+.prune-field input[type="number"]:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--border-strong);
+}
+
+.prune-vacuum {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-top: var(--space-5);
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.prune-vacuum input[type="checkbox"] {
+  accent-color: var(--ch1);
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.prune-hint {
+  margin: var(--space-5) 0 0;
+  font-size: var(--fs-sm);
+}
+
+.prune-preview {
+  margin-top: var(--space-5);
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--border);
+}
+
+.prune-preview-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-2) var(--space-5);
+  margin: var(--space-4) 0 0;
+}
+
+.prune-preview-grid dt {
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+
+.prune-preview-grid dd {
+  margin: 0;
+  text-align: right;
+  font-size: var(--fs-sm);
 }
 
 /* ==========================================================================

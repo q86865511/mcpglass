@@ -6,12 +6,14 @@ interface SidebarProps {
   selectedId: number | null;
   onSelect: (id: number) => void;
   onDelete: (id: number) => void;
+  // Opens the data-lifecycle (prune) dialog from the pinned footer button.
+  onPrune: () => void;
   // Drawer state — applied as an open class at the <=900px off-canvas breakpoint;
   // ignored (sidebar is always in-flow) on wider viewports.
   open: boolean;
 }
 
-export function Sidebar({ sessions, selectedId, onSelect, onDelete, open }: SidebarProps) {
+export function Sidebar({ sessions, selectedId, onSelect, onDelete, onPrune, open }: SidebarProps) {
   return (
     <aside className={"sidebar" + (open ? " sidebar-open" : "")}>
       <div className="sidebar-header tick-label">Sessions</div>
@@ -68,6 +70,16 @@ export function Sidebar({ sessions, selectedId, onSelect, onDelete, open }: Side
           );
         })}
       </ul>
+      <div className="sidebar-footer">
+        <button
+          type="button"
+          className="sidebar-prune tick-label"
+          onClick={onPrune}
+          title="Delete recorded sessions by age or size (tool fingerprints kept)"
+        >
+          Prune data
+        </button>
+      </div>
     </aside>
   );
 }
