@@ -450,6 +450,199 @@ button {
 }
 
 /* ==========================================================================
+   Toasts — bottom-right transient readouts
+   ========================================================================== */
+
+.toast-stack {
+  position: fixed;
+  right: var(--space-6);
+  bottom: var(--space-6);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: min(360px, 90vw);
+  /* Container is click-through; individual toasts re-enable pointer events. */
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  /* Left rail carries the semantic colour (default = info/dim). */
+  border-left: 2px solid var(--text-dim);
+  border-radius: var(--radius-sm);
+  padding: var(--space-4) var(--space-5);
+  font-size: var(--fs-sm);
+  color: var(--text);
+  box-shadow: var(--shadow-drawer);
+  animation: toast-in 120ms ease-out;
+}
+
+.toast-success {
+  border-left-color: var(--ch1);
+}
+
+.toast-error {
+  border-left-color: var(--red);
+}
+
+.toast-info {
+  border-left-color: var(--text-dim);
+}
+
+.toast-leaving {
+  animation: toast-out 120ms ease-out forwards;
+}
+
+.toast-msg {
+  flex: 1;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.toast-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: var(--fs-lg);
+  line-height: 1;
+  padding: 0;
+  transition: color 120ms ease-out;
+}
+
+.toast-close:hover {
+  color: var(--text);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes toast-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* ==========================================================================
+   Modal confirm dialog — centred over a scrim
+   ========================================================================== */
+
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-6);
+  background: var(--scrim);
+  animation: toast-in 120ms ease-out;
+}
+
+.modal-dialog {
+  width: 100%;
+  max-width: 420px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: var(--space-6);
+  box-shadow: var(--shadow-drawer);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.modal-body {
+  font-size: var(--fs-sm);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-4);
+}
+
+/* ==========================================================================
+   Skeleton loading — first-load placeholders (no prior data)
+   ========================================================================== */
+
+.skeleton-table {
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-3) 0;
+}
+
+.skeleton-row {
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+
+.skeleton-bar {
+  display: block;
+  height: 10px;
+  width: 100%;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  /* Very light pulse; disabled under prefers-reduced-motion (base.css). */
+  animation: skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+/* A little width variance so rows don't read as a solid block. */
+.skeleton-row:nth-child(3n) .skeleton-bar {
+  width: 72%;
+}
+
+.skeleton-row:nth-child(3n + 1) .skeleton-bar {
+  width: 88%;
+}
+
+.skeleton-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.skeleton-bar-title {
+  width: 40%;
+  height: 14px;
+}
+
+.skeleton-bar-field {
+  width: 70%;
+}
+
+.skeleton-bar-block {
+  height: 160px;
+}
+
+@keyframes skeleton-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* ==========================================================================
    Responsive — compact table (<=600px): drop rpc_id + size columns
    ========================================================================== */
 

@@ -2,18 +2,23 @@ import { useEffect, useState } from "react";
 import type { MessageDetail, ReplayResult } from "../api";
 import { fetchMessageDetail, postReplay } from "../api";
 import { formatClock, formatSize, tryPrettyJson } from "../format";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { DetailSkeleton } from "./Skeleton";
+import { useToast } from "./Toast";
 
 interface DetailPanelProps {
   messageId: number | null;
 }
 
 export function DetailPanel({ messageId }: DetailPanelProps) {
+  const toast = useToast();
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [replaying, setReplaying] = useState(false);
   const [replayResult, setReplayResult] = useState<ReplayResult | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
+  const [confirmReplay, setConfirmReplay] = useState(false);
 
   useEffect(() => {
     setCopied(false);
@@ -21,6 +26,7 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
     setReplaying(false);
     setReplayResult(null);
     setReplayError(null);
+    setConfirmReplay(false);
     if (messageId === null) {
       setDetail(null);
       setError(null);
@@ -43,9 +49,13 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
   }, [messageId]);
 
   if (messageId === null) {
+    // Instrument standby: no frame selected.
     return (
       <aside className="detail-panel detail-panel-empty">
-        <div className="empty-hint">Select a message to see its detail.</div>
+        <div className="detail-standby">
+          <div className="tick-label">Select a frame</div>
+          <div className="detail-standby-hint">click a message row or press j / k</div>
+        </div>
       </aside>
     );
   }
@@ -61,7 +71,7 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
   if (!detail) {
     return (
       <aside className="detail-panel">
-        <div className="empty-hint">Loading…</div>
+        <DetailSkeleton />
       </aside>
     );
   }
@@ -73,7 +83,13 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
   const metadataOnly = detail.raw === "" && detail.raw_len !== null;
 
   const copy = () => {
-    void navigator.clipboard.writeText(detail.raw).then(() => setCopied(true));
+    void navigator.clipboard.writeText(detail.raw).then(
+      () => {
+        setCopied(true);
+        toast("Copied raw message to clipboard", "success");
+      },
+      () => toast("Copy failed — clipboard unavailable", "error"),
+    );
   };
 
   // Only a client->server request (has a method and an id) can be replayed; a
@@ -85,16 +101,21 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
     detail.rpc_id !== null &&
     !metadataOnly;
 
-  const doReplay = () => {
-    if (!window.confirm("Re-send this request to the server? Side effects may occur.")) {
-      return;
-    }
+  const runReplay = () => {
+    setConfirmReplay(false);
     setReplaying(true);
     setReplayResult(null);
     setReplayError(null);
     postReplay(detail.id)
-      .then((r) => setReplayResult(r))
-      .catch((e: unknown) => setReplayError(e instanceof Error ? e.message : String(e)))
+      .then((r) => {
+        setReplayResult(r);
+        toast(`Replay sent (${r.transport})`, "success");
+      })
+      .catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        setReplayError(msg);
+        toast(`Replay failed: ${msg}`, "error");
+      })
       .finally(() => setReplaying(false));
   };
 
@@ -145,7 +166,11 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
       {canReplay && (
         <div className="detail-raw-header">
           <span>replay</span>
-          <button className="copy-btn btn-primary" onClick={doReplay} disabled={replaying}>
+          <button
+            className="copy-btn btn-primary"
+            onClick={() => setConfirmReplay(true)}
+            disabled={replaying}
+          >
             {replaying ? "Replaying…" : "Replay"}
           </button>
         </div>
@@ -166,6 +191,15 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
           <div className="empty-hint">{replayResult.note}</div>
         </>
       )}
+      <ConfirmDialog
+        open={confirmReplay}
+        title="Replay request"
+        message="Re-send this recorded request to the server, out of band? It runs a fresh handshake, side effects may occur, and the replay itself is not recorded."
+        confirmLabel="Replay"
+        variant="primary"
+        onConfirm={runReplay}
+        onCancel={() => setConfirmReplay(false)}
+      />
     </aside>
   );
 }

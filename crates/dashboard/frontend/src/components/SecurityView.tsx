@@ -1,6 +1,7 @@
 import type { ActionTaken, SecurityCounts, SecurityEvent, SecurityEventKind } from "../api";
 import { formatClock } from "../format";
 import { Pagination } from "./Pagination";
+import { TableSkeleton } from "./Skeleton";
 
 interface SecurityViewProps {
   counts: SecurityCounts | null;
@@ -9,6 +10,8 @@ interface SecurityViewProps {
   offset: number;
   limit: number;
   onOffsetChange: (offset: number) => void;
+  // First-load flag: show a skeleton only when loading with no prior rows.
+  loading: boolean;
 }
 
 const KIND_LABEL: Record<SecurityEventKind, string> = {
@@ -50,18 +53,22 @@ function CountBadges({ counts }: { counts: SecurityCounts | null }) {
   );
 }
 
-export function SecurityView({ counts, events, total, offset, limit, onOffsetChange }: SecurityViewProps) {
+export function SecurityView({ counts, events, total, offset, limit, onOffsetChange, loading }: SecurityViewProps) {
   return (
     <div className="security-view">
       <CountBadges counts={counts} />
       {events.length === 0 ? (
-        <div className="empty-hint">
-          No security events — traffic looks clean.
-          <br />
-          <span className="dim">
-            (mcpglass only flags in monitor mode; enable enforce mode to also block.)
-          </span>
-        </div>
+        loading ? (
+          <TableSkeleton rows={6} />
+        ) : (
+          <div className="empty-hint">
+            No security events — traffic looks clean.
+            <br />
+            <span className="dim">
+              (mcpglass only flags in monitor mode; enable enforce mode to also block.)
+            </span>
+          </div>
+        )
       ) : (
         <>
           <table className="security-table">

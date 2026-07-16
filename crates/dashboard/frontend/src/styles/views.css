@@ -394,6 +394,25 @@
   color: var(--text-dim);
 }
 
+/* Detail panel standby — instrument idle state when no frame is selected. */
+.detail-standby {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  text-align: center;
+}
+
+.detail-standby .tick-label {
+  font-size: var(--fs-sm);
+}
+
+.detail-standby-hint {
+  font-size: var(--fs-sm);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
 .empty-state {
   margin: auto;
   text-align: center;

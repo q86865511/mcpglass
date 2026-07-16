@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ContextReport,
   Direction,
@@ -32,13 +32,16 @@ import { Pagination } from "./components/Pagination";
 import { SecurityView } from "./components/SecurityView";
 import { ContextView } from "./components/ContextView";
 import { InjectView } from "./components/InjectView";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { useToast } from "./components/Toast";
 
 const PAGE_SIZE = 100;
-const AUTO_REFRESH_MS = 2000;
+const AUTO_REFRESH_MS = 3000;
 
 export function App() {
   const { route, setRoute } = useHashRoute();
   const { theme, toggleTheme } = useTheme();
+  const toast = useToast();
 
   // The hash is the single source of truth for session / view / message. A malformed
   // or stale id parses to null, which the "pick a default session" effect below heals.
@@ -57,22 +60,53 @@ export function App() {
   const [offset, setOffset] = useState(0);
   const [securityOffset, setSecurityOffset] = useState(0);
   const [injectOffset, setInjectOffset] = useState(0);
-  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
 
   // Off-canvas sidebar drawer (only shown at the <=900px breakpoint).
   const [drawerOpen, setDrawerOpen] = useState(false);
 
-  const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Pending delete confirmation (null = dialog closed). Carries the label so the
+  // modal can name the session being deleted.
+  const [confirmDelete, setConfirmDelete] = useState<{ id: number; label: string } | null>(null);
+
+  // Lets the `/` shortcut focus the raw-JSON search box in the toolbar.
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Polling tick: advances every AUTO_REFRESH_MS while auto-refresh is on. Resources
   // fold it into their deps to re-fetch; per-view resources gate it on their view so
   // e.g. security is only polled while the Security tab is open (initial loads, driven
   // by the session dep, still happen regardless of the visible view).
+  //
+  // The interval pauses while the tab is hidden (no point polling a background tab)
+  // and fires one immediate catch-up tick when the tab becomes visible again.
   const [pollTick, setPollTick] = useState(0);
   useEffect(() => {
     if (!autoRefresh) return;
-    const id = setInterval(() => setPollTick((t) => t + 1), AUTO_REFRESH_MS);
-    return () => clearInterval(id);
+    let id: number | undefined;
+    const stop = () => {
+      if (id !== undefined) {
+        window.clearInterval(id);
+        id = undefined;
+      }
+    };
+    const start = () => {
+      stop();
+      id = window.setInterval(() => setPollTick((t) => t + 1), AUTO_REFRESH_MS);
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        setPollTick((t) => t + 1); // immediate refresh on return to foreground
+        start();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    if (!document.hidden) start();
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      stop();
+    };
   }, [autoRefresh]);
 
   const sid = selectedSessionId;
@@ -196,26 +230,95 @@ export function App() {
 
   const handleDeleteSession = useCallback(
     (id: number) => {
-      if (
-        !window.confirm(
-          "Delete this session and all its recorded messages? This cannot be undone. (Tool fingerprints are kept.)",
-        )
-      ) {
+      const label = sessions.find((s) => s.id === id)?.label ?? `#${id}`;
+      setConfirmDelete({ id, label });
+    },
+    [sessions],
+  );
+
+  const confirmDeleteSession = useCallback(() => {
+    if (confirmDelete === null) return;
+    const { id, label } = confirmDelete;
+    setConfirmDelete(null);
+    deleteSession(id)
+      .then(() => {
+        toast(`Deleted session ${label}`, "success");
+        // Reload the list; if the deleted session was the selected one, the
+        // "pick a default session" effect re-selects the newest remaining.
+        retrySessions();
+      })
+      .catch((e: unknown) =>
+        toast(`Failed to delete session: ${e instanceof Error ? e.message : String(e)}`, "error"),
+      );
+  }, [confirmDelete, retrySessions, toast]);
+
+  // Global keyboard shortcuts. Skipped while typing in a field (except Esc, which
+  // blurs it) and while a modal is open (the dialog handles its own keys).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (document.querySelector(".modal-scrim")) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      const typing =
+        tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!target?.isContentEditable;
+      if (typing) {
+        if (e.key === "Escape") target?.blur();
         return;
       }
-      deleteSession(id)
-        .then(() => {
-          setDeleteError(null);
-          // Reload the list; if the deleted session was the selected one, the
-          // "pick a default session" effect re-selects the newest remaining.
-          retrySessions();
-        })
-        .catch((e: unknown) =>
-          setDeleteError(e instanceof Error ? e.message : String(e)),
-        );
-    },
-    [retrySessions],
-  );
+
+      if (e.key === "Escape") {
+        // Peel back one layer: selected frame → drawer.
+        if (selectedMessageId !== null) clearSelectedMessage();
+        else if (drawerOpen) setDrawerOpen(false);
+        return;
+      }
+
+      // The remaining shortcuts only make sense on the Messages view.
+      if (view !== "messages") return;
+
+      if (e.key === "/") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        return;
+      }
+
+      if (e.key === "j" || e.key === "k") {
+        const msgs = messagesApi.data?.messages ?? [];
+        if (msgs.length === 0) return;
+        e.preventDefault();
+        const idx = msgs.findIndex((m) => m.id === selectedMessageId);
+        const next =
+          e.key === "j"
+            ? idx < 0
+              ? 0
+              : Math.min(msgs.length - 1, idx + 1)
+            : idx < 0
+              ? msgs.length - 1
+              : Math.max(0, idx - 1);
+        handleSelectMessage(msgs[next].id);
+        return;
+      }
+
+      if (e.key === "Enter") {
+        // Redundant with j/k (which select directly): pick the first row when
+        // nothing is selected yet.
+        const msgs = messagesApi.data?.messages ?? [];
+        if (selectedMessageId === null && msgs.length > 0) {
+          e.preventDefault();
+          handleSelectMessage(msgs[0].id);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [
+    view,
+    selectedMessageId,
+    drawerOpen,
+    clearSelectedMessage,
+    handleSelectMessage,
+    messagesApi.data,
+  ]);
 
   const stats = statsApi.data;
   const securityCounts = securityCountsApi.data;
@@ -264,7 +367,6 @@ export function App() {
         )}
         <main className="main">
         {sessionsError && <div className="banner banner-error">Failed to load sessions: {sessionsError}</div>}
-        {deleteError && <div className="banner banner-error">Failed to delete session: {deleteError}</div>}
         {hasNoSessions ? (
           <div className="empty-state">
             <h2>No sessions yet</h2>
@@ -322,6 +424,7 @@ export function App() {
                   onQueryChange={handleQueryChange}
                   autoRefresh={autoRefresh}
                   onAutoRefreshChange={setAutoRefresh}
+                  searchInputRef={searchInputRef}
                 />
                 {messagesApi.error && (
                   <div className="banner banner-error">Failed to load messages: {messagesApi.error}</div>
@@ -332,6 +435,7 @@ export function App() {
                       messages={messagesApi.data?.messages ?? []}
                       selectedId={selectedMessageId}
                       onSelect={handleSelectMessage}
+                      loading={messagesApi.loading}
                     />
                     <Pagination
                       offset={offset}
@@ -355,6 +459,7 @@ export function App() {
                   offset={securityOffset}
                   limit={PAGE_SIZE}
                   onOffsetChange={setSecurityOffset}
+                  loading={securityApi.loading}
                 />
               </>
             ) : view === "context" ? (
@@ -376,6 +481,7 @@ export function App() {
                   offset={injectOffset}
                   limit={PAGE_SIZE}
                   onOffsetChange={setInjectOffset}
+                  loading={injectApi.loading}
                 />
               </>
             )}
@@ -383,6 +489,20 @@ export function App() {
         )}
         </main>
       </div>
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        title="Delete session"
+        message={
+          <>
+            Delete session <span className="mono">{confirmDelete?.label}</span> and all its recorded
+            messages? This cannot be undone. (Tool fingerprints are kept.)
+          </>
+        }
+        confirmLabel="Delete"
+        variant="danger"
+        onConfirm={confirmDeleteSession}
+        onCancel={() => setConfirmDelete(null)}
+      />
     </div>
   );
 }
