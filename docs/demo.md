@@ -75,9 +75,10 @@ node scripts\record-gif\cdp-capture.mjs 9333 "http://127.0.0.1:7411/" "$env:TEMP
 powershell -File scripts\record-gif\encode-gif.ps1 -FrameDir "$env:TEMP\gif-frames" -OutFile docs\assets\dashboard-demo.gif -DelayCs 160
 ```
 
-Caveats: the click coordinates in `cdp-capture.mjs` assume the 1440×900 viewport it sets and the
-demo database's two sessions — re-check them after dashboard layout changes. `encode-gif.ps1` is
-Windows-only (WPF); on other platforms use ffmpeg's palettegen instead.
+Caveats: `cdp-capture.mjs` clicks by CSS selector (`.view-tab`, `.message-row`, `.session-row`,
+`.theme-toggle`), so it survives layout changes but must be re-checked if those class names are
+renamed. It assumes the demo database's two sessions. `encode-gif.ps1` is Windows-only (WPF); on
+other platforms use ffmpeg's palettegen instead.
 
 ### Manual capture — tool options (Windows)
 

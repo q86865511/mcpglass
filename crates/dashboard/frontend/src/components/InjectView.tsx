@@ -1,6 +1,7 @@
 import type { Direction, InjectCounts, InjectEvent, InjectFault } from "../api";
 import { formatClock } from "../format";
 import { Pagination } from "./Pagination";
+import { TableSkeleton } from "./Skeleton";
 
 interface InjectViewProps {
   counts: InjectCounts | null;
@@ -9,6 +10,8 @@ interface InjectViewProps {
   offset: number;
   limit: number;
   onOffsetChange: (offset: number) => void;
+  // First-load flag: show a skeleton only when loading with no prior rows.
+  loading: boolean;
 }
 
 const FAULT_LABEL: Record<InjectFault, string> = {
@@ -50,18 +53,22 @@ function CountBadges({ counts }: { counts: InjectCounts | null }) {
   );
 }
 
-export function InjectView({ counts, events, total, offset, limit, onOffsetChange }: InjectViewProps) {
+export function InjectView({ counts, events, total, offset, limit, onOffsetChange, loading }: InjectViewProps) {
   return (
     <div className="inject-view">
       <CountBadges counts={counts} />
       {events.length === 0 ? (
-        <div className="empty-hint">
-          No fault-injection events — nothing simulated for this session.
-          <br />
-          <span className="dim">
-            (mcpglass only injects faults when `--inject` rules are configured on `wrap`/`gateway`.)
-          </span>
-        </div>
+        loading ? (
+          <TableSkeleton rows={6} />
+        ) : (
+          <div className="empty-hint">
+            No fault-injection events — nothing simulated for this session.
+            <br />
+            <span className="dim">
+              (mcpglass only injects faults when `--inject` rules are configured on `wrap`/`gateway`.)
+            </span>
+          </div>
+        )
       ) : (
         <>
           <table className="inject-table">

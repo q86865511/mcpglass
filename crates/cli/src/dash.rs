@@ -21,20 +21,41 @@ const DASHBOARD_REPLAY_TIMEOUT: Duration = Duration::from_secs(30);
 /// `on_ready` callback, i.e. only after the listener has actually bound. That
 /// way a port conflict surfaces as a bind error instead of a browser tab
 /// pointed at whatever else is already listening on that port.
-pub async fn run(db: Option<PathBuf>, port: u16, no_open: bool) -> i32 {
+pub async fn run(db: Option<PathBuf>, port: u16, no_open: bool, policy: Option<PathBuf>) -> i32 {
+    // Resolve the export-masking policy before binding: an explicitly-passed `--policy`
+    // that fails to load must fail loud (mirrors `mcpglass export --policy`), never
+    // silently fall back to built-in-only masking. Without `--policy`, the default
+    // policy masks the built-in patterns only.
+    let pol = match &policy {
+        Some(p) => match policy::Policy::load(p) {
+            Ok(pol) => pol,
+            Err(e) => {
+                eprintln!("mcpglass: loading policy {}: {e:#}", p.display());
+                return 1;
+            }
+        },
+        None => policy::Policy::default(),
+    };
+
     let db_path = db
         .or_else(|| crate::default_data_dir().map(|d| d.join("sessions.db")))
         .unwrap_or_else(|| std::env::temp_dir().join("mcpglass").join("sessions.db"));
 
-    let result = dashboard::serve(db_path.clone(), port, Some(replay_backend(db_path)), |addr| {
-        let url = format!("http://{addr}");
-        println!("Dashboard: {url}");
-        if !no_open {
-            if let Err(e) = opener::open(&url) {
-                eprintln!("could not open browser: {e}");
+    let result = dashboard::serve(
+        db_path.clone(),
+        port,
+        Some(replay_backend(db_path)),
+        pol,
+        |addr| {
+            let url = format!("http://{addr}");
+            println!("Dashboard: {url}");
+            if !no_open {
+                if let Err(e) = opener::open(&url) {
+                    eprintln!("could not open browser: {e}");
+                }
             }
-        }
-    })
+        },
+    )
     .await;
 
     match result {

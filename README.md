@@ -21,7 +21,7 @@
 - 🛡️ **Fail-open by design** — while the proxy runs, its own bugs, full disks, or panics never block or delay your traffic; observation is a side-channel tap
 - 🏠 **Local-first** — one binary, one SQLite file, a loopback-only dashboard; nothing is sent anywhere
 
-**Status**: v0.2.0 — stdio + HTTP interception through MCP spec 2025-11-25, one-command config
+**Status**: v0.3.0 — stdio + HTTP interception through MCP spec 2025-11-25, one-command config
 takeover, dashboard, security layer (fingerprint pinning incl. `outputSchema` / secret detection /
 allow-deny), context bloat analytics, request replay, fault injection, prebuilt binaries.
 See [CHANGELOG.md](CHANGELOG.md).
@@ -52,7 +52,8 @@ mcpglass is a **transparent proxy** you insert in one command. `mcpglass attach`
 client's config so every existing server runs through the proxy (with backups; `detach` restores).
 From then on every frame is recorded into a local SQLite file and browsable in an embedded React
 dashboard: per-session timelines, payload inspection, per-method latency, security alerts, context
-cost, and injected-fault history.
+cost, and injected-fault history — in an oscilloscope-style dark or light theme, with keyboard
+navigation (`j`/`k`/`/`) and deep-linkable URLs.
 
 The design stance is **fail-open**: mcpglass considers your traffic sacred. Parse failures, a full
 disk, a poisoned lock, a panicking policy engine — none of it may block or delay the bytes flowing
@@ -95,9 +96,10 @@ connection) and fault injection you configure yourself.
 - **Honest storage** — the SQLite file records full raw traffic *verbatim* (that is the point of a
   traffic recorder), disclosed loudly rather than hidden; secret masking applies to the audit view.
 - **Data lifecycle control** — record less (`--record metadata|off`), prune later
-  (`mcpglass prune --older-than 7d` / `--max-size 500M`, or delete a session from the dashboard), and
-  share safely (`mcpglass export` writes a secret-masked JSON bundle). Deleting keeps tool
-  fingerprints; on Unix the db and log are `0600` at rest.
+  (`mcpglass prune --older-than 7d` / `--max-size 500M`, or from the dashboard's prune dialog with a
+  dry-run preview), and share safely (`mcpglass export`, or the dashboard's EXPORT button — both
+  write a secret-masked JSON bundle, always). Deleting keeps tool fingerprints; on Unix the db and
+  log are `0600` at rest.
 
 ## 🏗️ Architecture
 
@@ -150,10 +152,10 @@ Grab the archive for your platform from the [latest release](https://github.com/
 sha256sum -c SHA256SUMS --ignore-missing
 
 # Optional: verify the GitHub Actions build provenance attestation.
-gh attestation verify mcpglass-v0.1.1-x86_64-unknown-linux-gnu.tar.gz --owner q86865511
+gh attestation verify mcpglass-v0.2.0-x86_64-unknown-linux-gnu.tar.gz --owner q86865511
 
-tar -xzf mcpglass-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-cd mcpglass-v0.1.1-x86_64-unknown-linux-gnu
+tar -xzf mcpglass-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd mcpglass-v0.2.0-x86_64-unknown-linux-gnu
 ./mcpglass --help
 ```
 
@@ -268,7 +270,7 @@ cargo clippy --workspace -- -D warnings
 cd crates/dashboard/frontend && pnpm build    # tsc strict + vite, embedded via rust-embed
 ```
 
-CI runs all of the above on Ubuntu and Windows for every push and PR
+CI runs all of the above on Ubuntu, Windows, and macOS for every push and PR
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)). Frontend development against fixture data
 without a real proxy: `pnpm mock` + `pnpm dev`. Contribution conventions:
 [CONTRIBUTING.md](CONTRIBUTING.md) · vulnerability reports: [SECURITY.md](SECURITY.md).

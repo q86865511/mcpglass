@@ -1,0 +1,99 @@
+/* mcpglass dashboard — base layer: reset, document, typography helpers, focus,
+ * scrollbars, motion. Consumes tokens from tokens.css. No component styles here. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- Typography helpers ---- */
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.dim {
+  color: var(--text-dim);
+}
+
+/* Instrument micro-label: uppercase, tracked, faint — the panel silk-screen look. */
+.tick-label {
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+/* Data grids read as measurement columns: fixed-width figures line up. */
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- Focus ---- */
+
+:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Elements that manage their own visual focus still shouldn't show the UA ring
+ * on mouse interaction. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ---- Scrollbars (thin, instrument-neutral) ---- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--radius);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---- Motion ---- *
+ * The only transitions in the UI are the three below; honour reduced-motion by
+ * killing every transition/animation. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

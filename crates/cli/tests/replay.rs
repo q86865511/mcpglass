@@ -359,7 +359,7 @@ async fn spawn_dashboard(db: PathBuf, replay: Option<dashboard::ReplayFn>) -> So
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let mut tx = Some(tx);
-        let _ = dashboard::serve(db, 0, replay, move |addr| {
+        let _ = dashboard::serve(db, 0, replay, policy::Policy::default(), move |addr| {
             let _ = tx.take().unwrap().send(addr);
         })
         .await;

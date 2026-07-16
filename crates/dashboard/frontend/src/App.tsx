@@ -2,17 +2,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ContextReport,
   Direction,
+  HealthResponse,
   InjectCounts,
   InjectEventsResponse,
   MessagesResponse,
   SecurityCounts,
   SecurityEventsResponse,
   SessionStats,
-  SessionSummary,
 } from "./api";
 import {
   deleteSession,
   fetchContext,
+  fetchHealth,
   fetchInjectCounts,
   fetchInjectEvents,
   fetchMessages,
@@ -21,6 +22,9 @@ import {
   fetchSessionStats,
   fetchSessions,
 } from "./api";
+import { useApi } from "./hooks/useApi";
+import { useHashRoute } from "./hooks/useHashRoute";
+import { useTheme } from "./hooks/useTheme";
 import { Sidebar } from "./components/Sidebar";
 import { Toolbar } from "./components/Toolbar";
 import { MessageTable } from "./components/MessageTable";
@@ -30,323 +34,352 @@ import { Pagination } from "./components/Pagination";
 import { SecurityView } from "./components/SecurityView";
 import { ContextView } from "./components/ContextView";
 import { InjectView } from "./components/InjectView";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { PruneDialog } from "./components/PruneDialog";
+import { useToast } from "./components/Toast";
 
 const PAGE_SIZE = 100;
-const AUTO_REFRESH_MS = 2000;
-
-type View = "messages" | "security" | "context" | "inject";
+const AUTO_REFRESH_MS = 3000;
 
 export function App() {
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [sessionsError, setSessionsError] = useState<string | null>(null);
-  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
+  const { route, setRoute } = useHashRoute();
+  const { theme, toggleTheme } = useTheme();
+  const toast = useToast();
 
-  const [view, setView] = useState<View>("messages");
+  // The hash is the single source of truth for session / view / message. A malformed
+  // or stale id parses to null, which the "pick a default session" effect below heals.
+  const parsedSession = route.sessionId !== null ? Number(route.sessionId) : null;
+  const selectedSessionId =
+    parsedSession !== null && Number.isFinite(parsedSession) ? parsedSession : null;
+  const view = route.view;
+  const parsedMessage = route.messageId !== null ? Number(route.messageId) : null;
+  const selectedMessageId =
+    parsedMessage !== null && Number.isFinite(parsedMessage) ? parsedMessage : null;
 
+  // Filters and paging stay local (deliberately out of the hash).
   const [direction, setDirection] = useState<Direction | "">("");
   const [method, setMethod] = useState("");
   const [query, setQuery] = useState("");
   const [offset, setOffset] = useState(0);
-  const [autoRefresh, setAutoRefresh] = useState(false);
-
-  const [messagesResp, setMessagesResp] = useState<MessagesResponse | null>(null);
-  const [messagesError, setMessagesError] = useState<string | null>(null);
-  const [selectedMessageId, setSelectedMessageId] = useState<number | null>(null);
-
-  const [stats, setStats] = useState<SessionStats | null>(null);
-
   const [securityOffset, setSecurityOffset] = useState(0);
-  const [securityResp, setSecurityResp] = useState<SecurityEventsResponse | null>(null);
-  const [securityError, setSecurityError] = useState<string | null>(null);
-  const [securityCounts, setSecurityCounts] = useState<SecurityCounts | null>(null);
-
-  const [contextReport, setContextReport] = useState<ContextReport | null>(null);
-  const [contextError, setContextError] = useState<string | null>(null);
-
   const [injectOffset, setInjectOffset] = useState(0);
-  const [injectResp, setInjectResp] = useState<InjectEventsResponse | null>(null);
-  const [injectError, setInjectError] = useState<string | null>(null);
-  const [injectCounts, setInjectCounts] = useState<InjectCounts | null>(null);
+  const [autoRefresh, setAutoRefresh] = useState(true);
 
-  // Monotonic request counters so a slow, stale response (e.g. from a
-  // session we've since navigated away from) can't clobber a newer one.
-  const messagesSeqRef = useRef(0);
-  const statsSeqRef = useRef(0);
-  const securitySeqRef = useRef(0);
-  const securityCountsSeqRef = useRef(0);
-  const contextSeqRef = useRef(0);
-  const injectSeqRef = useRef(0);
-  const injectCountsSeqRef = useRef(0);
+  // Off-canvas sidebar drawer (only shown at the <=900px breakpoint).
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
-  // Reset paging/selection when switching sessions or changing filters.
+  // Pending delete confirmation (null = dialog closed). Carries the label so the
+  // modal can name the session being deleted.
+  const [confirmDelete, setConfirmDelete] = useState<{ id: number; label: string } | null>(null);
+
+  // Data-lifecycle (prune) dialog open state.
+  const [pruneOpen, setPruneOpen] = useState(false);
+
+  // Lets the `/` shortcut focus the raw-JSON search box in the toolbar.
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Polling tick: advances every AUTO_REFRESH_MS while auto-refresh is on. Resources
+  // fold it into their deps to re-fetch; per-view resources gate it on their view so
+  // e.g. security is only polled while the Security tab is open (initial loads, driven
+  // by the session dep, still happen regardless of the visible view).
+  //
+  // The interval pauses while the tab is hidden (no point polling a background tab)
+  // and fires one immediate catch-up tick when the tab becomes visible again.
+  const [pollTick, setPollTick] = useState(0);
+  useEffect(() => {
+    if (!autoRefresh) return;
+    let id: number | undefined;
+    const stop = () => {
+      if (id !== undefined) {
+        window.clearInterval(id);
+        id = undefined;
+      }
+    };
+    const start = () => {
+      stop();
+      id = window.setInterval(() => setPollTick((t) => t + 1), AUTO_REFRESH_MS);
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        setPollTick((t) => t + 1); // immediate refresh on return to foreground
+        start();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    if (!document.hidden) start();
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      stop();
+    };
+  }, [autoRefresh]);
+
+  const sid = selectedSessionId;
+
+  const {
+    data: sessionsData,
+    error: sessionsError,
+    retry: retrySessions,
+  } = useApi(fetchSessions, [pollTick]);
+  const sessions = sessionsData?.sessions ?? [];
+
+  // Fetched once at startup to gate capability-dependent controls (currently the
+  // Replay button). Until it resolves we assume replay is available, so a working
+  // backend never shows a briefly-disabled button; a build without replay flips it
+  // off once health lands.
+  const healthApi = useApi<HealthResponse>((signal) => fetchHealth(signal), []);
+  const replayEnabled = healthApi.data?.capabilities.replay ?? true;
+
+  const messagesApi = useApi<MessagesResponse>(
+    sid === null
+      ? null
+      : (signal) =>
+          fetchMessages(
+            sid,
+            { limit: PAGE_SIZE, offset, direction, method: method.trim(), q: query.trim() },
+            signal,
+          ),
+    [sid, offset, direction, method, query, pollTick],
+  );
+
+  const statsApi = useApi<SessionStats>(
+    sid === null ? null : (signal) => fetchSessionStats(sid, signal),
+    [sid, pollTick],
+  );
+
+  const securityApi = useApi<SecurityEventsResponse>(
+    sid === null
+      ? null
+      : (signal) => fetchSecurityEvents(sid, { limit: PAGE_SIZE, offset: securityOffset }, signal),
+    [sid, securityOffset, view === "security" ? pollTick : 0],
+  );
+
+  const securityCountsApi = useApi<SecurityCounts>(
+    sid === null ? null : (signal) => fetchSecurityCounts(sid, signal),
+    [sid, view === "security" ? pollTick : 0],
+  );
+
+  const contextApi = useApi<ContextReport>(
+    sid === null ? null : (signal) => fetchContext(sid, signal),
+    [sid, view === "context" ? pollTick : 0],
+  );
+
+  const injectApi = useApi<InjectEventsResponse>(
+    sid === null
+      ? null
+      : (signal) => fetchInjectEvents(sid, { limit: PAGE_SIZE, offset: injectOffset }, signal),
+    [sid, injectOffset, view === "inject" ? pollTick : 0],
+  );
+
+  const injectCountsApi = useApi<InjectCounts>(
+    sid === null ? null : (signal) => fetchInjectCounts(sid, signal),
+    [sid, view === "inject" ? pollTick : 0],
+  );
+
+  // Once sessions are known, make sure the hash points at a real one. Runs on the
+  // initial deep link (keeping a valid target), and after a delete (the deleted id no
+  // longer matches → fall back to the newest remaining session).
+  useEffect(() => {
+    if (sessions.length === 0) return;
+    const exists =
+      route.sessionId !== null && sessions.some((s) => String(s.id) === route.sessionId);
+    if (!exists) {
+      setRoute({ sessionId: String(sessions[0].id), messageId: null });
+    }
+  }, [sessions, route.sessionId, setRoute]);
+
+  // Reset paging when the session or filters change.
   useEffect(() => {
     setOffset(0);
-    setSelectedMessageId(null);
     setSecurityOffset(0);
     setInjectOffset(0);
-  }, [selectedSessionId, direction, method, query]);
+  }, [sid, direction, method, query]);
 
-  const loadSessions = useCallback(() => {
-    fetchSessions()
-      .then((r) => {
-        setSessions(r.sessions);
-        setSessionsError(null);
-        setSelectedSessionId((cur) => {
-          if (cur !== null && r.sessions.some((s) => s.id === cur)) return cur;
-          return r.sessions[0]?.id ?? null;
-        });
-      })
-      .catch((e: unknown) => setSessionsError(e instanceof Error ? e.message : String(e)));
-  }, []);
+  const clearSelectedMessage = useCallback(() => {
+    if (route.messageId !== null) setRoute({ messageId: null });
+  }, [route.messageId, setRoute]);
 
-  const loadMessages = useCallback(() => {
-    if (selectedSessionId === null) {
-      messagesSeqRef.current += 1;
-      setMessagesResp(null);
-      return;
-    }
-    const seq = ++messagesSeqRef.current;
-    fetchMessages(selectedSessionId, {
-      limit: PAGE_SIZE,
-      offset,
-      direction,
-      method: method.trim(),
-      q: query.trim(),
-    })
-      .then((r) => {
-        if (messagesSeqRef.current !== seq) return; // superseded by a newer request
-        setMessagesResp(r);
-        setMessagesError(null);
-      })
-      .catch((e: unknown) => {
-        if (messagesSeqRef.current !== seq) return;
-        setMessagesError(e instanceof Error ? e.message : String(e));
-      });
-  }, [selectedSessionId, offset, direction, method, query]);
+  // Filter changes drop the current message selection (it may no longer be in view),
+  // mirroring the old behaviour. Session changes handle this per navigation path:
+  // a sidebar click clears the message explicitly; a deep link keeps it.
+  const handleDirectionChange = useCallback(
+    (v: Direction | "") => {
+      setDirection(v);
+      clearSelectedMessage();
+    },
+    [clearSelectedMessage],
+  );
+  const handleMethodChange = useCallback(
+    (v: string) => {
+      setMethod(v);
+      clearSelectedMessage();
+    },
+    [clearSelectedMessage],
+  );
+  const handleQueryChange = useCallback(
+    (v: string) => {
+      setQuery(v);
+      clearSelectedMessage();
+    },
+    [clearSelectedMessage],
+  );
 
-  const loadStats = useCallback(() => {
-    if (selectedSessionId === null) {
-      statsSeqRef.current += 1;
-      setStats(null);
-      return;
-    }
-    const seq = ++statsSeqRef.current;
-    fetchSessionStats(selectedSessionId)
-      .then((r) => {
-        if (statsSeqRef.current !== seq) return; // superseded by a newer request
-        setStats(r);
-      })
-      .catch(() => {
-        if (statsSeqRef.current !== seq) return;
-        setStats(null);
-      });
-  }, [selectedSessionId]);
-
-  const loadSecurity = useCallback(() => {
-    if (selectedSessionId === null) {
-      securitySeqRef.current += 1;
-      setSecurityResp(null);
-      return;
-    }
-    const seq = ++securitySeqRef.current;
-    fetchSecurityEvents(selectedSessionId, { limit: PAGE_SIZE, offset: securityOffset })
-      .then((r) => {
-        if (securitySeqRef.current !== seq) return; // superseded by a newer request
-        setSecurityResp(r);
-        setSecurityError(null);
-      })
-      .catch((e: unknown) => {
-        if (securitySeqRef.current !== seq) return;
-        setSecurityError(e instanceof Error ? e.message : String(e));
-      });
-  }, [selectedSessionId, securityOffset]);
-
-  const loadSecurityCounts = useCallback(() => {
-    if (selectedSessionId === null) {
-      securityCountsSeqRef.current += 1;
-      setSecurityCounts(null);
-      return;
-    }
-    const seq = ++securityCountsSeqRef.current;
-    fetchSecurityCounts(selectedSessionId)
-      .then((r) => {
-        if (securityCountsSeqRef.current !== seq) return; // superseded by a newer request
-        setSecurityCounts(r);
-      })
-      .catch(() => {
-        if (securityCountsSeqRef.current !== seq) return;
-        setSecurityCounts(null);
-      });
-  }, [selectedSessionId]);
-
-  const loadContext = useCallback(() => {
-    if (selectedSessionId === null) {
-      contextSeqRef.current += 1;
-      setContextReport(null);
-      return;
-    }
-    const seq = ++contextSeqRef.current;
-    fetchContext(selectedSessionId)
-      .then((r) => {
-        if (contextSeqRef.current !== seq) return; // superseded by a newer request
-        setContextReport(r);
-        setContextError(null);
-      })
-      .catch((e: unknown) => {
-        if (contextSeqRef.current !== seq) return;
-        setContextError(e instanceof Error ? e.message : String(e));
-      });
-  }, [selectedSessionId]);
-
-  const loadInject = useCallback(() => {
-    if (selectedSessionId === null) {
-      injectSeqRef.current += 1;
-      setInjectResp(null);
-      return;
-    }
-    const seq = ++injectSeqRef.current;
-    fetchInjectEvents(selectedSessionId, { limit: PAGE_SIZE, offset: injectOffset })
-      .then((r) => {
-        if (injectSeqRef.current !== seq) return; // superseded by a newer request
-        setInjectResp(r);
-        setInjectError(null);
-      })
-      .catch((e: unknown) => {
-        if (injectSeqRef.current !== seq) return;
-        setInjectError(e instanceof Error ? e.message : String(e));
-      });
-  }, [selectedSessionId, injectOffset]);
-
-  const loadInjectCounts = useCallback(() => {
-    if (selectedSessionId === null) {
-      injectCountsSeqRef.current += 1;
-      setInjectCounts(null);
-      return;
-    }
-    const seq = ++injectCountsSeqRef.current;
-    fetchInjectCounts(selectedSessionId)
-      .then((r) => {
-        if (injectCountsSeqRef.current !== seq) return; // superseded by a newer request
-        setInjectCounts(r);
-      })
-      .catch(() => {
-        if (injectCountsSeqRef.current !== seq) return;
-        setInjectCounts(null);
-      });
-  }, [selectedSessionId]);
+  const handleSelectSession = useCallback(
+    (id: number) => {
+      setRoute({ sessionId: String(id), messageId: null });
+      setDrawerOpen(false); // close the drawer after a pick on small screens
+    },
+    [setRoute],
+  );
+  const handleSelectMessage = useCallback(
+    (id: number) => setRoute({ messageId: String(id) }),
+    [setRoute],
+  );
+  const handleSelectView = useCallback(
+    (v: typeof view) => setRoute({ view: v }),
+    [setRoute],
+  );
 
   const handleDeleteSession = useCallback(
     (id: number) => {
-      if (
-        !window.confirm(
-          "Delete this session and all its recorded messages? This cannot be undone. (Tool fingerprints are kept.)",
-        )
-      ) {
-        return;
-      }
-      deleteSession(id)
-        .then(() => {
-          // If the deleted session was selected, clear it; loadSessions then
-          // picks the newest remaining one.
-          setSelectedSessionId((cur) => (cur === id ? null : cur));
-          loadSessions();
-        })
-        .catch((e: unknown) =>
-          setSessionsError(e instanceof Error ? e.message : String(e)),
-        );
+      const label = sessions.find((s) => s.id === id)?.label ?? `#${id}`;
+      setConfirmDelete({ id, label });
     },
-    [loadSessions],
+    [sessions],
   );
 
-  useEffect(() => {
-    loadSessions();
-  }, [loadSessions]);
+  const confirmDeleteSession = useCallback(() => {
+    if (confirmDelete === null) return;
+    const { id, label } = confirmDelete;
+    setConfirmDelete(null);
+    deleteSession(id)
+      .then(() => {
+        toast(`Deleted session ${label}`, "success");
+        // Reload the list; if the deleted session was the selected one, the
+        // "pick a default session" effect re-selects the newest remaining.
+        retrySessions();
+      })
+      .catch((e: unknown) =>
+        toast(`Failed to delete session: ${e instanceof Error ? e.message : String(e)}`, "error"),
+      );
+  }, [confirmDelete, retrySessions, toast]);
 
+  // Global keyboard shortcuts. Skipped while typing in a field (except Esc, which
+  // blurs it) and while a modal is open (the dialog handles its own keys).
   useEffect(() => {
-    loadMessages();
-  }, [loadMessages]);
-
-  useEffect(() => {
-    loadStats();
-  }, [loadStats]);
-
-  useEffect(() => {
-    loadSecurity();
-  }, [loadSecurity]);
-
-  useEffect(() => {
-    loadSecurityCounts();
-  }, [loadSecurityCounts]);
-
-  useEffect(() => {
-    loadContext();
-  }, [loadContext]);
-
-  useEffect(() => {
-    loadInject();
-  }, [loadInject]);
-
-  useEffect(() => {
-    loadInjectCounts();
-  }, [loadInjectCounts]);
-
-  const autoRefreshRef = useRef({
-    loadSessions,
-    loadMessages,
-    loadStats,
-    loadSecurity,
-    loadSecurityCounts,
-    loadContext,
-    loadInject,
-    loadInjectCounts,
-  });
-  autoRefreshRef.current = {
-    loadSessions,
-    loadMessages,
-    loadStats,
-    loadSecurity,
-    loadSecurityCounts,
-    loadContext,
-    loadInject,
-    loadInjectCounts,
-  };
-  const viewRef = useRef(view);
-  viewRef.current = view;
-
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const id = setInterval(() => {
-      autoRefreshRef.current.loadSessions();
-      autoRefreshRef.current.loadMessages();
-      autoRefreshRef.current.loadStats();
-      // Security events/counts, the context report and inject events are only
-      // polled while their own view is visible.
-      if (viewRef.current === "security") {
-        autoRefreshRef.current.loadSecurity();
-        autoRefreshRef.current.loadSecurityCounts();
+    const onKey = (e: KeyboardEvent) => {
+      if (document.querySelector(".modal-scrim")) return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      const typing =
+        tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!target?.isContentEditable;
+      if (typing) {
+        if (e.key === "Escape") target?.blur();
+        return;
       }
-      if (viewRef.current === "context") {
-        autoRefreshRef.current.loadContext();
+
+      if (e.key === "Escape") {
+        // Peel back one layer: selected frame → drawer.
+        if (selectedMessageId !== null) clearSelectedMessage();
+        else if (drawerOpen) setDrawerOpen(false);
+        return;
       }
-      if (viewRef.current === "inject") {
-        autoRefreshRef.current.loadInject();
-        autoRefreshRef.current.loadInjectCounts();
+
+      // The remaining shortcuts only make sense on the Messages view.
+      if (view !== "messages") return;
+
+      if (e.key === "/") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+        return;
       }
-    }, AUTO_REFRESH_MS);
-    return () => clearInterval(id);
-  }, [autoRefresh]);
+
+      if (e.key === "j" || e.key === "k") {
+        const msgs = messagesApi.data?.messages ?? [];
+        if (msgs.length === 0) return;
+        e.preventDefault();
+        const idx = msgs.findIndex((m) => m.id === selectedMessageId);
+        const next =
+          e.key === "j"
+            ? idx < 0
+              ? 0
+              : Math.min(msgs.length - 1, idx + 1)
+            : idx < 0
+              ? msgs.length - 1
+              : Math.max(0, idx - 1);
+        handleSelectMessage(msgs[next].id);
+        return;
+      }
+
+      if (e.key === "Enter") {
+        // Redundant with j/k (which select directly): pick the first row when
+        // nothing is selected yet.
+        const msgs = messagesApi.data?.messages ?? [];
+        if (selectedMessageId === null && msgs.length > 0) {
+          e.preventDefault();
+          handleSelectMessage(msgs[0].id);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [
+    view,
+    selectedMessageId,
+    drawerOpen,
+    clearSelectedMessage,
+    handleSelectMessage,
+    messagesApi.data,
+  ]);
+
+  const stats = statsApi.data;
+  const securityCounts = securityCountsApi.data;
+  const injectCounts = injectCountsApi.data;
 
   const hasNoSessions = sessions.length === 0 && !sessionsError;
 
   return (
     <div className="app">
-      <Sidebar
-        sessions={sessions}
-        selectedId={selectedSessionId}
-        onSelect={setSelectedSessionId}
-        onDelete={handleDeleteSession}
-      />
-      <main className="main">
+      <header className="app-header">
+        <button
+          type="button"
+          className="drawer-toggle"
+          onClick={() => setDrawerOpen((o) => !o)}
+          aria-label="Toggle sessions sidebar"
+          aria-expanded={drawerOpen}
+        >
+          ☰
+        </button>
+        <div className="wordmark">
+          <span className="wordmark-led" aria-hidden="true" />
+          MCPGLASS
+        </div>
+        <div className="header-right">
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            aria-label="Toggle colour theme"
+          >
+            {theme === "dark" ? "☀" : "☾"}
+          </button>
+        </div>
+      </header>
+      <div className="app-body">
+        <Sidebar
+          sessions={sessions}
+          selectedId={selectedSessionId}
+          onSelect={handleSelectSession}
+          onDelete={handleDeleteSession}
+          onPrune={() => setPruneOpen(true)}
+          open={drawerOpen}
+        />
+        {drawerOpen && (
+          <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} aria-hidden="true" />
+        )}
+        <main className="main">
         {sessionsError && <div className="banner banner-error">Failed to load sessions: {sessionsError}</div>}
         {hasNoSessions ? (
           <div className="empty-state">
@@ -356,37 +389,41 @@ export function App() {
           </div>
         ) : (
           <>
-            <StatsBar stats={stats} />
+            <StatsBar stats={stats} sessionId={sid} />
             <div className="view-tabs">
               <button
                 className={"view-tab" + (view === "messages" ? " view-tab-active" : "")}
-                onClick={() => setView("messages")}
+                onClick={() => handleSelectView("messages")}
               >
                 Messages
               </button>
               <button
                 className={"view-tab" + (view === "security" ? " view-tab-active" : "")}
-                onClick={() => setView("security")}
+                onClick={() => handleSelectView("security")}
               >
                 Security
                 {securityCounts && securityCounts.blocked > 0 && (
-                  <span className="view-tab-alert" title="blocked events present" />
+                  <span className="tab-alert tab-alert-red" title="blocked events present">
+                    {securityCounts.blocked}
+                  </span>
                 )}
               </button>
               <button
                 className={"view-tab" + (view === "context" ? " view-tab-active" : "")}
-                onClick={() => setView("context")}
+                onClick={() => handleSelectView("context")}
               >
                 Context
               </button>
               <button
                 className={"view-tab" + (view === "inject" ? " view-tab-active" : "")}
-                onClick={() => setView("inject")}
+                onClick={() => handleSelectView("inject")}
               >
                 Inject
                 {injectCounts &&
                   injectCounts.delay + injectCounts.error + injectCounts.drop + injectCounts.truncate > 0 && (
-                    <span className="view-tab-alert" title="fault-injection events present" />
+                    <span className="tab-alert" title="fault-injection events present">
+                      {injectCounts.delay + injectCounts.error + injectCounts.drop + injectCounts.truncate}
+                    </span>
                   )}
               </button>
             </div>
@@ -394,71 +431,97 @@ export function App() {
               <>
                 <Toolbar
                   direction={direction}
-                  onDirectionChange={setDirection}
+                  onDirectionChange={handleDirectionChange}
                   method={method}
-                  onMethodChange={setMethod}
+                  onMethodChange={handleMethodChange}
                   query={query}
-                  onQueryChange={setQuery}
+                  onQueryChange={handleQueryChange}
                   autoRefresh={autoRefresh}
                   onAutoRefreshChange={setAutoRefresh}
+                  searchInputRef={searchInputRef}
                 />
-                {messagesError && <div className="banner banner-error">Failed to load messages: {messagesError}</div>}
+                {messagesApi.error && (
+                  <div className="banner banner-error">Failed to load messages: {messagesApi.error}</div>
+                )}
                 <div className="content-split">
                   <div className="table-pane">
                     <MessageTable
-                      messages={messagesResp?.messages ?? []}
+                      messages={messagesApi.data?.messages ?? []}
                       selectedId={selectedMessageId}
-                      onSelect={setSelectedMessageId}
+                      onSelect={handleSelectMessage}
+                      loading={messagesApi.loading}
                     />
                     <Pagination
                       offset={offset}
                       limit={PAGE_SIZE}
-                      total={messagesResp?.total ?? 0}
+                      total={messagesApi.data?.total ?? 0}
                       onOffsetChange={setOffset}
                     />
                   </div>
-                  <DetailPanel messageId={selectedMessageId} />
+                  <DetailPanel messageId={selectedMessageId} replayEnabled={replayEnabled} />
                 </div>
               </>
             ) : view === "security" ? (
               <>
-                {securityError && (
-                  <div className="banner banner-error">Failed to load security events: {securityError}</div>
+                {securityApi.error && (
+                  <div className="banner banner-error">Failed to load security events: {securityApi.error}</div>
                 )}
                 <SecurityView
                   counts={securityCounts}
-                  events={securityResp?.events ?? []}
-                  total={securityResp?.total ?? 0}
+                  events={securityApi.data?.events ?? []}
+                  total={securityApi.data?.total ?? 0}
                   offset={securityOffset}
                   limit={PAGE_SIZE}
                   onOffsetChange={setSecurityOffset}
+                  loading={securityApi.loading}
                 />
               </>
             ) : view === "context" ? (
               <>
-                {contextError && (
-                  <div className="banner banner-error">Failed to load context report: {contextError}</div>
+                {contextApi.error && (
+                  <div className="banner banner-error">Failed to load context report: {contextApi.error}</div>
                 )}
-                <ContextView report={contextReport} />
+                <ContextView report={contextApi.data} />
               </>
             ) : (
               <>
-                {injectError && (
-                  <div className="banner banner-error">Failed to load inject events: {injectError}</div>
+                {injectApi.error && (
+                  <div className="banner banner-error">Failed to load inject events: {injectApi.error}</div>
                 )}
                 <InjectView
                   counts={injectCounts}
-                  events={injectResp?.events ?? []}
-                  total={injectResp?.total ?? 0}
+                  events={injectApi.data?.events ?? []}
+                  total={injectApi.data?.total ?? 0}
                   offset={injectOffset}
                   limit={PAGE_SIZE}
                   onOffsetChange={setInjectOffset}
+                  loading={injectApi.loading}
                 />
               </>
             )}
           </>
         )}
-      </main>
+        </main>
+      </div>
+      <ConfirmDialog
+        open={confirmDelete !== null}
+        title="Delete session"
+        message={
+          <>
+            Delete session <span className="mono">{confirmDelete?.label}</span> and all its recorded
+            messages? This cannot be undone. (Tool fingerprints are kept.)
+          </>
+        }
+        confirmLabel="Delete"
+        variant="danger"
+        onConfirm={confirmDeleteSession}
+        onCancel={() => setConfirmDelete(null)}
+      />
+      <PruneDialog
+        open={pruneOpen}
+        onCancel={() => setPruneOpen(false)}
+        onPruned={retrySessions}
+      />
     </div>
   );
 }

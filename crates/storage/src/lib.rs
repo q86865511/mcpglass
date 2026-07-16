@@ -1623,6 +1623,49 @@ impl Store {
         Ok(rows)
     }
 
+    /// Delete the oldest sessions until *live* data ([`Store::db_used_bytes`]) is at or
+    /// under `target_bytes`, returning the row counts removed. Oldest-first, one session
+    /// per transaction (via [`Store::delete_session`]); if a session races away between
+    /// the pick and the delete it stops rather than spinning. Does **not** vacuum — the
+    /// caller decides when to realise the freed pages on disk (both `prune --max-size`
+    /// and the dashboard vacuum afterwards). Keeps `tool_fingerprints` (see
+    /// [`Store::delete_session`]). [`Store::preview_max_size`] is the dry-run counterpart.
+    pub fn prune_to_max_size(&self, target_bytes: u64) -> Result<PruneStats> {
+        let mut acc = PruneStats::default();
+        loop {
+            if self.db_used_bytes()? <= target_bytes {
+                break;
+            }
+            let Some(oldest) = self.oldest_session()? else {
+                break; // nothing left to delete
+            };
+            match self.delete_session(oldest)? {
+                Some(s) => acc += s,
+                None => break, // raced away; stop rather than spin
+            }
+        }
+        Ok(acc)
+    }
+
+    /// Count (without deleting) what [`Store::prune_to_max_size`] would remove for
+    /// `target_bytes`: walk [`Store::session_size_estimates`] oldest-first, subtracting
+    /// each session's estimated bytes from the current live size and accumulating its row
+    /// counts, until the running size would drop to the target. The space figure is an
+    /// estimate — a real vacuum's exact reclaim can't be known without deleting — so this
+    /// is for a `--dry-run` preview only.
+    pub fn preview_max_size(&self, target_bytes: u64) -> Result<PruneStats> {
+        let mut remaining = self.db_used_bytes()?;
+        let mut acc = PruneStats::default();
+        for s in self.session_size_estimates()? {
+            if remaining <= target_bytes {
+                break;
+            }
+            acc += self.preview_session(s.id)?;
+            remaining = remaining.saturating_sub(s.est_bytes);
+        }
+        Ok(acc)
+    }
+
     /// The on-disk size of the database file: `page_count * page_size`. In WAL mode a
     /// delete frees pages onto the freelist (reused, not returned to the OS), so this
     /// does not shrink until [`Store::vacuum`]; use [`Store::db_used_bytes`] to gauge
@@ -3709,6 +3752,86 @@ mod tests {
         store.delete_session(oldest).unwrap();
         store.vacuum().unwrap();
         assert!(store.db_size_bytes().unwrap() > 0);
+    }
+
+    /// Seed one session whose messages carry a large padded body, so the session's
+    /// footprint dwarfs the fixed schema/index/fingerprint overhead and `db_used_bytes`
+    /// moves measurably (by many pages) as it is deleted — a precondition for testing a
+    /// fractional `--max-size` target without page-granularity flakiness.
+    fn seed_big_session(store: &Store, db: &Path, label: &str, started: i64) -> i64 {
+        let sid = store.begin_session(label, "echo srv").unwrap();
+        let pad = "x".repeat(4000);
+        for i in 0..60 {
+            store
+                .insert(sid, &rec(Direction::C2s, i, &format!(r#"{{"id":{i},"pad":"{pad}"}}"#)))
+                .unwrap();
+        }
+        rf(store, sid, "srv", &format!("tool-{label}"), "fp", 1);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.execute("UPDATE sessions SET started_at_ms = ?2 WHERE id = ?1", params![sid, started])
+            .unwrap();
+        sid
+    }
+
+    #[test]
+    fn prune_to_max_size_deletes_oldest_first_and_keeps_fingerprints() {
+        let tmp = TempDir::new("prune-max-size");
+        let db = tmp.db();
+        let store = Store::open(&db).unwrap();
+        // Three large, roughly-equal sessions (~240 KB of body each) so the content
+        // dominates fixed overhead and a fractional target is reachable page-wise.
+        let oldest = seed_big_session(&store, &db, "oldest", 100);
+        let middle = seed_big_session(&store, &db, "middle", 200);
+        let newest = seed_big_session(&store, &db, "newest", 300);
+
+        let full = store.db_used_bytes().unwrap();
+        assert!(full > 0);
+
+        // Target at 55% of full: reachable by dropping the two oldest (leaving ~1/3 of
+        // the content plus overhead, comfortably under 55%). A dry-run preview counts
+        // sessions to drop without touching the db.
+        let target = full * 55 / 100;
+        let preview = store.preview_max_size(target).unwrap();
+        assert!(preview.sessions >= 1, "preview should plan to drop the oldest session(s)");
+        assert_eq!(
+            table_count(&db, "SELECT COUNT(*) FROM sessions"),
+            3,
+            "preview must not delete anything"
+        );
+
+        // The real run drops oldest-first until live data is at or under the target.
+        let stats = store.prune_to_max_size(target).unwrap();
+        assert!(stats.sessions >= 1);
+        assert!(
+            store.db_used_bytes().unwrap() <= target,
+            "live data must be at or under the target after pruning"
+        );
+
+        // Oldest went first; the newest is always among the survivors here.
+        assert!(store.session(oldest).unwrap().is_none(), "oldest must be deleted first");
+        assert!(store.session(newest).unwrap().is_some(), "newest must survive");
+        let _ = middle; // middle's fate depends on page granularity; not asserted.
+
+        // Every fingerprint baseline survives, even for the deleted oldest session.
+        assert_eq!(
+            table_count(&db, "SELECT COUNT(*) FROM tool_fingerprints"),
+            3,
+            "tool fingerprints must never be pruned"
+        );
+    }
+
+    #[test]
+    fn prune_to_max_size_target_above_live_deletes_nothing() {
+        let tmp = TempDir::new("prune-max-size-noop");
+        let db = tmp.db();
+        let store = Store::open(&db).unwrap();
+        seed_full_session(&store, &db, "keep", 100, 10);
+        let live = store.db_used_bytes().unwrap();
+
+        // A target at or above current live data removes nothing.
+        let stats = store.prune_to_max_size(live + 1).unwrap();
+        assert_eq!(stats.sessions, 0);
+        assert_eq!(table_count(&db, "SELECT COUNT(*) FROM sessions"), 1);
     }
 
     #[test]

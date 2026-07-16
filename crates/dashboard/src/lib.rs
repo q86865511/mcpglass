@@ -30,6 +30,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use policy::Policy;
 use proxy_core::Direction;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,9 @@ use storage::{
     InjectCounts, InjectEventRow, MessageDetail, MessageFilter, MessageRow, PruneStats,
     SecurityCounts, SecurityEventRow, SessionSummary, Stats, Store,
 };
+
+mod export;
+pub use export::build_export_bundle;
 
 /// The built frontend, baked into the binary so `mcpglass dashboard` needs no
 /// separate static-file directory at runtime.
@@ -100,6 +104,11 @@ pub type ReplayFn = Arc<
 struct AppState {
     store: StoreHandle,
     replay: Option<ReplayFn>,
+    /// Secret-masking policy for the export endpoint. Shared behind an `Arc` so a
+    /// per-request state clone stays cheap (a `Policy` owns compiled custom regexes).
+    /// `Policy::default()` when `mcpglass dashboard` was run without `--policy` — the
+    /// export then masks the built-in patterns only.
+    policy: Arc<Policy>,
 }
 
 /// Bind `127.0.0.1:<port>` and serve the dashboard until the process exits.
@@ -115,11 +124,15 @@ struct AppState {
 /// use) surfaces as an error instead of a browser tab pointed at the wrong
 /// server.
 /// `replay` is the optional replay backend (see [`ReplayFn`]); `None` makes the
-/// `POST /api/messages/{id}/replay` endpoint answer `501 Not Implemented`.
+/// `POST /api/messages/{id}/replay` endpoint answer `501 Not Implemented` and the
+/// health endpoint report `capabilities.replay = false`.
+/// `policy` supplies the secret-masking patterns the `GET /api/sessions/{id}/export`
+/// endpoint applies; pass `Policy::default()` to mask the built-in patterns only.
 pub async fn serve(
     db_path: PathBuf,
     port: u16,
     replay: Option<ReplayFn>,
+    policy: Policy,
     on_ready: impl FnOnce(SocketAddr),
 ) -> anyhow::Result<()> {
     // Decide before opening anything: once a legacy v0 file is migrated by
@@ -133,6 +146,7 @@ pub async fn serve(
     let state = AppState {
         store: store_handle,
         replay,
+        policy: Arc::new(policy),
     };
     let app = Router::new()
         .route("/api/health", get(health))
@@ -151,8 +165,10 @@ pub async fn serve(
             "/api/sessions/{id}/inject/counts",
             get(session_inject_counts),
         )
+        .route("/api/sessions/{id}/export", get(export_session))
         .route("/api/messages/{id}", get(message_detail))
         .route("/api/messages/{id}/replay", post(replay_message))
+        .route("/api/prune", post(prune))
         .fallback(static_asset)
         .with_state(state)
         // DNS-rebinding / CSRF gate over *every* route (API and static alike). The
@@ -221,11 +237,23 @@ impl IntoResponse for AppError {
 #[derive(Serialize)]
 struct HealthResponse {
     version: String,
+    capabilities: Capabilities,
 }
 
-async fn health() -> Json<HealthResponse> {
+/// Which optional backend features this dashboard build has wired in, so the frontend
+/// can hide controls it can't drive. `replay` mirrors whether a [`ReplayFn`] was
+/// supplied to [`serve`] (absent in tests and in embeddings without a replay backend).
+#[derive(Serialize)]
+struct Capabilities {
+    replay: bool,
+}
+
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        capabilities: Capabilities {
+            replay: state.replay.is_some(),
+        },
     })
 }
 
@@ -273,18 +301,19 @@ async fn list_sessions(State(state): State<AppState>) -> Result<Json<SessionsRes
     }))
 }
 
-/// The row counts removed by a `DELETE /api/sessions/{id}`. Mirrors
+/// The row counts a prune / delete removed (or, in a dry run, would remove). Mirrors
 /// [`storage::PruneStats`]; `tool_fingerprints` is intentionally never deleted (the
-/// cross-session rug-pull baseline), so it does not appear here.
+/// cross-session rug-pull baseline), so it does not appear here. Shared by
+/// `DELETE /api/sessions/{id}` and `POST /api/prune`.
 #[derive(Serialize)]
-struct DeleteSessionResponse {
+struct PruneStatsDto {
     sessions: u64,
     messages: u64,
     security_events: u64,
     inject_events: u64,
 }
 
-impl From<PruneStats> for DeleteSessionResponse {
+impl From<PruneStats> for PruneStatsDto {
     fn from(s: PruneStats) -> Self {
         Self {
             sessions: s.sessions,
@@ -305,9 +334,134 @@ async fn delete_session(
 ) -> Result<Response, AppError> {
     let removed = run_blocking(state.store.clone(), move |store| store.delete_session(id)).await?;
     match removed {
-        Some(stats) => Ok(Json(DeleteSessionResponse::from(stats)).into_response()),
+        Some(stats) => Ok(Json(PruneStatsDto::from(stats)).into_response()),
         None => Ok((StatusCode::NOT_FOUND, "session not found").into_response()),
     }
+}
+
+/// A `POST /api/prune` request. At least one of `older_than_ms` / `max_size_bytes` is
+/// required (an empty prune is a 400). `dry_run` and `vacuum` default to `false`.
+#[derive(Deserialize)]
+struct PruneRequest {
+    /// Delete sessions started more than this many milliseconds ago (a duration, like
+    /// the CLI's `--older-than`, not an absolute timestamp): the cutoff is
+    /// `now - older_than_ms`. `None` skips the age condition.
+    older_than_ms: Option<i64>,
+    /// Delete oldest sessions until live data is at or under this many bytes (the CLI's
+    /// `--max-size`). `None` skips the size condition.
+    max_size_bytes: Option<u64>,
+    /// Report what would be removed without touching the database.
+    #[serde(default)]
+    dry_run: bool,
+    /// After deleting, VACUUM to return freed pages to the OS. Implied by
+    /// `max_size_bytes` (parity with the CLI, where `--max-size` always vacuums);
+    /// ignored in a dry run.
+    #[serde(default)]
+    vacuum: bool,
+}
+
+/// The result of a `POST /api/prune`: the row counts removed (or, in a dry run, that
+/// would be removed) plus the on-disk file size on either side of the operation
+/// (`db_size_after == db_size_before` for a dry run, and until a VACUUM realises the
+/// freed pages).
+#[derive(Serialize)]
+struct PruneResponse {
+    stats: PruneStatsDto,
+    db_size_before: u64,
+    db_size_after: u64,
+}
+
+/// `POST /api/prune`: delete recorded sessions by age and/or to a size target, keeping
+/// tool fingerprints (the storage layer guarantees that). A mutating endpoint, so it is
+/// covered by the loopback [`loopback_guard`] layer. This is the dashboard face of
+/// `mcpglass prune`, and delegates to the same `storage` primitives so the behaviour
+/// matches: `max_size_bytes` deletes oldest-first until live data reaches the target
+/// and always vacuums (unless `dry_run`); `older_than_ms` deletes by cutoff and vacuums
+/// only when `vacuum` is set. At least one condition is required (else 400).
+async fn prune(
+    State(state): State<AppState>,
+    Json(req): Json<PruneRequest>,
+) -> Result<Response, AppError> {
+    let PruneRequest {
+        older_than_ms,
+        max_size_bytes,
+        dry_run,
+        vacuum,
+    } = req;
+    if older_than_ms.is_none() && max_size_bytes.is_none() {
+        return Err(AppError::bad_request(
+            "prune needs at least one of older_than_ms or max_size_bytes",
+        ));
+    }
+    // `older_than_ms` is a duration; resolve it to an absolute cutoff up front (mirrors
+    // the CLI's `now_ms() - dur`).
+    let cutoff_ms = older_than_ms.map(|dur| now_ms() - dur);
+
+    let (total, before, after) = run_blocking(state.store.clone(), move |store| {
+        let size_before = store.db_size_bytes()?;
+        let mut total = PruneStats::default();
+        if let Some(cutoff) = cutoff_ms {
+            total += if dry_run {
+                store.preview_sessions_before(cutoff)?
+            } else {
+                store.prune_sessions_before(cutoff)?
+            };
+        }
+        if let Some(target) = max_size_bytes {
+            total += if dry_run {
+                store.preview_max_size(target)?
+            } else {
+                store.prune_to_max_size(target)?
+            };
+        }
+        // Realise freed space: `--max-size` always vacuums; `--older-than` only when
+        // asked. Never in a dry run (nothing was deleted).
+        if !dry_run && (max_size_bytes.is_some() || vacuum) {
+            store.vacuum()?;
+        }
+        let size_after = store.db_size_bytes()?;
+        Ok((total, size_before, size_after))
+    })
+    .await?;
+
+    Ok(Json(PruneResponse {
+        stats: total.into(),
+        db_size_before: before,
+        db_size_after: after,
+    })
+    .into_response())
+}
+
+/// `GET /api/sessions/{id}/export`: the full session as a secret-masked JSON bundle
+/// (see [`build_export_bundle`]), with a `Content-Disposition` header so a browser
+/// saves it as a file. Read-only and always masked — there is no un-masked option, by
+/// design. An unknown id answers `404`.
+async fn export_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Response, AppError> {
+    let policy = state.policy.clone();
+    let bundle = run_blocking(state.store.clone(), move |store| {
+        build_export_bundle(store, &policy, id)
+    })
+    .await?;
+    match bundle {
+        Some(value) => {
+            let disposition = format!("attachment; filename=\"mcpglass-session-{id}.json\"");
+            Ok(([(header::CONTENT_DISPOSITION, disposition)], Json(value)).into_response())
+        }
+        None => Ok((StatusCode::NOT_FOUND, "session not found").into_response()),
+    }
+}
+
+/// Milliseconds since the Unix epoch, for resolving a prune `older_than_ms` duration to
+/// an absolute cutoff. Matches the tap path's `now_ms`.
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Serialize)]

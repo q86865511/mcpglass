@@ -1,0 +1,122 @@
+/* mcpglass dashboard — design tokens (oscilloscope instrument theme).
+ *
+ * `:root` carries the dark values (the default look: CRT phosphor on near-black).
+ * `[data-theme="light"]` overrides only the palette (a cool grey paper face); the
+ * scales, radii and fonts are theme-agnostic.
+ *
+ * Base colours are defined here as literal hex — this is the ONE file allowed to.
+ * Everywhere else, alpha variants must go through
+ * `color-mix(in srgb, var(--x) N%, transparent)`, never a fresh rgba()/hex.
+ *
+ * The signature language: c2s/s2c message directions map to an oscilloscope's two
+ * channels — CH1 (--ch1, phosphor green, doubles as --accent) and CH2 (--ch2, cyan).
+ *
+ * Legacy variable names (--bg-panel, --bg-panel-alt, --text-muted, --fs-*, --radius-*)
+ * are kept as aliases so nothing that still references them breaks.
+ */
+
+:root {
+  /* ---- Surfaces (dark) ---- */
+  --bg: #0a0f0c; /* base canvas — near-black with a green undertone */
+  --bg-raised: #0f1511; /* panels, sidebar */
+  --bg-overlay: #141c16; /* hover / raised-on-raised / active row */
+  --bg-deep: #070b09; /* raw JSON wells */
+  --border: #1d2921; /* hairline */
+  --border-strong: #2a3a2f;
+
+  /* ---- Text ---- */
+  --text: #c9d8cd;
+  --text-dim: #8fa396;
+  --text-faint: #5c6e63; /* dimmest layer, instrument micro-labels, idle LEDs */
+
+  /* ---- Channels (the signature) ---- */
+  --ch1: #3fe077; /* CH1 = c2s = phosphor green */
+  --ch2: #53d3e0; /* CH2 = s2c = cyan */
+  --accent: var(--ch1);
+  --accent-dim: #2a3a2f;
+
+  /* ---- Semantic colours ---- */
+  --green: var(--ch1);
+  --amber: #ffb454; /* warning LED */
+  --orange: var(--amber);
+  --red: #ff5f56; /* alarm LED */
+  --danger: var(--red);
+  --yellow: #e8d44d;
+
+  /* ---- Instrument glow ---- *
+   * Blur radius for the two things allowed to glow (LED dots, active trace lines).
+   * Set to 0 in the light theme so the glow silently switches off. */
+  --glow: 4px;
+
+  /* ---- Legacy surface aliases ---- */
+  --bg-panel: var(--bg-raised);
+  --bg-panel-alt: var(--bg-overlay);
+  --text-muted: var(--text-faint);
+
+  /* ---- Spacing scale (4px base) ---- */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 24px;
+  --space-8: 32px;
+
+  /* ---- Font-size scale ---- */
+  --fs-xs: 11px; /* instrument micro-labels */
+  --fs-sm: 12px;
+  --fs-base: 13px; /* body default */
+  --fs-lg: 15px; /* readout values */
+  --fs-xl: 18px;
+  /* legacy aliases */
+  --fs-1: 10px;
+  --fs-2: var(--fs-xs);
+  --fs-3: var(--fs-sm);
+  --fs-4: var(--fs-base);
+  --fs-5: var(--fs-lg);
+  --fs-6: var(--fs-xl);
+
+  /* ---- Radii (small = instrument feel) ---- */
+  --radius-sm: 3px;
+  --radius: 5px;
+  /* legacy aliases */
+  --radius-1: var(--radius-sm);
+  --radius-2: var(--radius);
+  --radius-pill: var(--radius);
+
+  /* ---- Shadows (kept flat; only the drawer floats) ---- */
+  --shadow-drawer: 0 0 0 1px rgba(0, 0, 0, 0.4), 8px 0 24px rgba(0, 0, 0, 0.45);
+  --scrim: rgba(0, 0, 0, 0.45); /* off-canvas drawer backdrop */
+
+  /* ---- Typography ---- */
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Light theme — a cool grey paper face. Deeper channel/semantic hues so text and
+ * chips stay readable on the light surfaces (contrast checked against --bg-raised). */
+[data-theme="light"] {
+  --bg: #e8ece9;
+  --bg-raised: #f3f6f3;
+  --bg-overlay: #ffffff;
+  --bg-deep: #dde3de;
+  --border: #c9d2cb;
+  --border-strong: #a9b6ac;
+
+  --text: #17211b;
+  --text-dim: #51625a;
+  --text-faint: #7c8b81;
+
+  --ch1: #0b7a43;
+  --ch2: #0e7490;
+  --accent-dim: #a9b6ac;
+
+  --amber: #a66300;
+  --red: #c4302b;
+  --yellow: #8a7b00;
+
+  --glow: 0; /* no phosphor glow on paper */
+
+  --shadow-drawer: 0 0 0 1px rgba(16, 24, 40, 0.12), 8px 0 24px rgba(16, 24, 40, 0.18);
+}

@@ -97,8 +97,15 @@ pub async fn run(
     }
 
     // --max-size: drop oldest sessions until live data is at or under the target.
+    // The loop (real run) and the estimate walk (dry run) both live in `storage` so
+    // the dashboard's prune endpoint shares the exact same behaviour.
     if let Some(target) = max_bytes {
-        match apply_max_size(&store, target, dry_run) {
+        let stats = if dry_run {
+            store.preview_max_size(target)
+        } else {
+            store.prune_to_max_size(target)
+        };
+        match stats {
             Ok(s) => {
                 total += s;
                 println!(
@@ -144,43 +151,6 @@ pub async fn run(
         );
     }
     0
-}
-
-/// Delete (or preview) the oldest sessions until live data is at or under `target`
-/// bytes. The real run measures live bytes via [`Store::db_used_bytes`] and deletes
-/// oldest-first until it drops to the target; the dry run walks
-/// [`Store::session_size_estimates`] oldest-first, subtracting each session's estimated
-/// bytes from the current live size, and counts the sessions it would remove (the
-/// space figure is an estimate — labelled as such — since a real vacuum's exact
-/// reclaim can't be known without deleting).
-fn apply_max_size(store: &Store, target: u64, dry_run: bool) -> anyhow::Result<PruneStats> {
-    if dry_run {
-        let mut remaining = store.db_used_bytes()?;
-        let mut acc = PruneStats::default();
-        for s in store.session_size_estimates()? {
-            if remaining <= target {
-                break;
-            }
-            acc += store.preview_session(s.id)?;
-            remaining = remaining.saturating_sub(s.est_bytes);
-        }
-        return Ok(acc);
-    }
-
-    let mut acc = PruneStats::default();
-    loop {
-        if store.db_used_bytes()? <= target {
-            break;
-        }
-        let Some(oldest) = store.oldest_session()? else {
-            break; // nothing left to delete
-        };
-        match store.delete_session(oldest)? {
-            Some(s) => acc += s,
-            None => break, // raced away; stop rather than spin
-        }
-    }
-    Ok(acc)
 }
 
 /// Parse a duration like `7d`, `24h`, `30m`, `90s` into milliseconds. A bare number is
