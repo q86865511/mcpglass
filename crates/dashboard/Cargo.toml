@@ -14,6 +14,7 @@ description = "Embedded web dashboard (axum + rust-embed) for browsing mcpglass 
 [dependencies]
 storage = { path = "../storage" }
 proxy-core = { path = "../proxy-core" }
+policy = { path = "../policy" }
 axum = "0.8"
 tokio = { workspace = true, features = ["net"] }
 serde = { version = "1", features = ["derive"] }

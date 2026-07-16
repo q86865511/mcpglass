@@ -182,7 +182,8 @@ async fn spawn_server(db_path: PathBuf) -> std::net::SocketAddr {
         let mut tx = Some(tx);
         // These API-surface tests don't exercise replay; pass no backend (the
         // replay endpoint then answers 501, covered separately in cli/tests/replay.rs).
-        dashboard::serve(db_path, 0, None, move |addr| {
+        // Default policy: export masks the built-in secret patterns.
+        dashboard::serve(db_path, 0, None, policy::Policy::default(), move |addr| {
             let _ = tx.take().unwrap().send(addr);
         })
         .await
@@ -210,6 +211,8 @@ async fn full_api_surface() {
         .await
         .unwrap();
     assert!(health["version"].is_string());
+    // No replay backend was wired into these tests -> capabilities.replay is false.
+    assert_eq!(health["capabilities"]["replay"], serde_json::json!(false));
 
     // --- /api/sessions ---
     let sessions: serde_json::Value = client
@@ -828,4 +831,241 @@ async fn on_ready_reports_bound_and_connectable_address() {
     tokio::net::TcpStream::connect(addr)
         .await
         .expect("address from on_ready should be immediately connectable");
+}
+
+/// Spawn `dashboard::serve` on port 0 with a stub replay backend wired in, so the
+/// health endpoint reports `capabilities.replay = true`. The stub is never invoked
+/// here; only its presence matters.
+async fn spawn_server_with_replay(db_path: PathBuf) -> std::net::SocketAddr {
+    use dashboard::{ReplayError, ReplayFn, ReplayOutcome};
+    let replay: ReplayFn = std::sync::Arc::new(|_id: i64| {
+        Box::pin(async move {
+            Ok::<ReplayOutcome, ReplayError>(ReplayOutcome {
+                transport: "stub".to_owned(),
+                response_raw: None,
+                note: "stub".to_owned(),
+            })
+        })
+            as std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<ReplayOutcome, ReplayError>> + Send>,
+            >
+    });
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let mut tx = Some(tx);
+        dashboard::serve(db_path, 0, Some(replay), policy::Policy::default(), move |addr| {
+            let _ = tx.take().unwrap().send(addr);
+        })
+        .await
+    });
+    rx.await.expect("on_ready fired with the bound address")
+}
+
+/// `GET /api/health` reflects which optional backends are wired in: `replay` is false
+/// with no backend (the default spawn) and true once one is supplied.
+#[tokio::test]
+async fn health_reports_replay_capability_both_states() {
+    let client = reqwest::Client::new();
+
+    // Absent replay backend -> capabilities.replay == false.
+    let tmp = TempDir::new("health-noreplay");
+    let addr = spawn_server(tmp.db()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let health: serde_json::Value = client
+        .get(format!("{base}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["capabilities"]["replay"], serde_json::json!(false));
+
+    // Present replay backend -> capabilities.replay == true.
+    let tmp2 = TempDir::new("health-replay");
+    let addr2 = spawn_server_with_replay(tmp2.db()).await;
+    let base2 = format!("http://{addr2}");
+    wait_for_server(&base2).await;
+    let health2: serde_json::Value = client
+        .get(format!("{base2}/api/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health2["capabilities"]["replay"], serde_json::json!(true));
+}
+
+/// `GET /api/sessions/{id}/export`: returns the whole session as a secret-masked JSON
+/// bundle with a `Content-Disposition` attachment header; an unknown id answers 404.
+#[tokio::test]
+async fn export_session_masks_secrets_and_sets_download_header() {
+    let tmp = TempDir::new("export");
+    let db = tmp.db();
+    let sid = {
+        let store = Store::open(&db).unwrap();
+        let sid = store.begin_session("exp", "echo srv").unwrap();
+        // A frame whose body carries an AWS access key: the export must mask it.
+        store
+            .insert(
+                sid,
+                &rec(
+                    Direction::C2s,
+                    1,
+                    r#"{"id":1,"method":"tools/call","params":{"arguments":{"key":"AKIAIOSFODNN7EXAMPLE"}}}"#,
+                ),
+            )
+            .unwrap();
+        store.end_session(sid).unwrap();
+        sid
+    };
+
+    let addr = spawn_server(db.clone()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/sessions/{sid}/export"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let disposition = resp
+        .headers()
+        .get("content-disposition")
+        .expect("a Content-Disposition header")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        disposition.contains(&format!("mcpglass-session-{sid}.json")),
+        "expected an attachment filename, got: {disposition}"
+    );
+
+    let bundle: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(bundle["session"]["id"].as_i64().unwrap(), sid);
+    let raw = bundle["messages"][0]["raw"].as_str().unwrap();
+    assert!(!raw.contains("AKIAIOSFODNN7EXAMPLE"), "secret leaked in export: {raw}");
+    assert!(raw.contains('*'), "expected a masked secret span: {raw}");
+
+    // Unknown id -> 404.
+    let missing = client
+        .get(format!("{base}/api/sessions/999999/export"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+/// `POST /api/prune`: no condition is a 400; a dry run reports what it would remove
+/// without deleting; a real prune deletes sessions and keeps tool fingerprints.
+#[tokio::test]
+async fn prune_endpoint_validates_dry_runs_and_deletes_keeping_fingerprints() {
+    let tmp = TempDir::new("prune-endpoint");
+    let db = tmp.db();
+    {
+        let store = Store::open(&db).unwrap();
+        for label in ["old", "new"] {
+            let sid = store.begin_session(label, "echo srv").unwrap();
+            let pad = "x".repeat(200);
+            for i in 0..40 {
+                store
+                    .insert(
+                        sid,
+                        &rec(
+                            Direction::C2s,
+                            i,
+                            &format!(r#"{{"id":{i},"method":"ping","pad":"{pad}"}}"#),
+                        ),
+                    )
+                    .unwrap();
+            }
+            // A fingerprint baseline that must outlive the prune.
+            store
+                .record_fingerprint(sid, "srv", "srv", &format!("tool-{label}"), "v1", "v2", "v3", 1)
+                .unwrap();
+            store.end_session(sid).unwrap();
+        }
+    }
+
+    let addr = spawn_server(db.clone()).await;
+    let base = format!("http://{addr}");
+    wait_for_server(&base).await;
+    let client = reqwest::Client::new();
+
+    // No condition -> 400.
+    let bad = client
+        .post(format!("{base}/api/prune"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Dry run with a tiny target: reports sessions to remove but deletes nothing.
+    let dry: serde_json::Value = client
+        .post(format!("{base}/api/prune"))
+        .json(&serde_json::json!({"max_size_bytes": 1, "dry_run": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        dry["stats"]["sessions"].as_u64().unwrap() >= 1,
+        "dry run should plan to remove at least one session"
+    );
+    let after_dry: serde_json::Value = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_dry["sessions"].as_array().unwrap().len(),
+        2,
+        "a dry run must not delete anything"
+    );
+
+    // Real prune to a 1-byte target: removes every session (live data can't reach 1B),
+    // reports the counts and the on-disk size, and keeps the fingerprint baseline.
+    let real: serde_json::Value = client
+        .post(format!("{base}/api/prune"))
+        .json(&serde_json::json!({"max_size_bytes": 1}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(real["stats"]["sessions"].as_u64().unwrap(), 2);
+    assert!(real["db_size_before"].as_u64().unwrap() > 0);
+
+    let after_real: serde_json::Value = client
+        .get(format!("{base}/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after_real["sessions"].as_array().unwrap().len(),
+        0,
+        "the real prune must delete the sessions"
+    );
+
+    // Fingerprints survive (never pruned).
+    let fps: i64 = {
+        let conn = Connection::open(&db).unwrap();
+        conn.query_row("SELECT COUNT(*) FROM tool_fingerprints", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(fps, 2, "tool fingerprints must survive a prune");
 }

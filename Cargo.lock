@@ -414,6 +414,7 @@ dependencies = [
  "anyhow",
  "axum",
  "mime_guess",
+ "policy",
  "proxy-core",
  "reqwest",
  "rusqlite",

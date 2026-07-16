@@ -155,7 +155,8 @@ enum SubCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Serve the local HTTP dashboard: `mcpglass dashboard [--db P] [--port N] [--no-open]`.
+    /// Serve the local HTTP dashboard:
+    /// `mcpglass dashboard [--db P] [--port N] [--no-open] [--policy P]`.
     Dashboard {
         /// SQLite session file. Defaults to <data_local>/mcpglass/sessions.db.
         #[arg(long)]
@@ -166,6 +167,12 @@ enum SubCmd {
         /// Skip opening a browser tab automatically.
         #[arg(long)]
         no_open: bool,
+        /// Security policy file whose `custom_secret_patterns` are masked (in addition
+        /// to the built-in ones) by the `GET /api/sessions/{id}/export` endpoint. Same
+        /// resolution as `export --policy`; a file that fails to load aborts startup.
+        /// Without it, the export masks the built-in patterns only.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
     /// Run the reverse proxy for url-type (Streamable HTTP) MCP servers:
     /// `mcpglass gateway [--port N] [--db P] [--log P] [--policy P] [--enforce]
@@ -323,8 +330,13 @@ async fn main() {
         } => {
             std::process::exit(clients::run_detach(&target, project, dry_run));
         }
-        SubCmd::Dashboard { db, port, no_open } => {
-            let code = dash::run(db, port, no_open).await;
+        SubCmd::Dashboard {
+            db,
+            port,
+            no_open,
+            policy,
+        } => {
+            let code = dash::run(db, port, no_open, policy).await;
             std::process::exit(code);
         }
         SubCmd::Gateway {
