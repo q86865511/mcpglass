@@ -1,5 +1,4 @@
 import type { Direction } from "../api";
-import type { Theme } from "../hooks/useTheme";
 
 interface ToolbarProps {
   direction: Direction | "";
@@ -10,8 +9,6 @@ interface ToolbarProps {
   onQueryChange: (v: string) => void;
   autoRefresh: boolean;
   onAutoRefreshChange: (v: boolean) => void;
-  theme: Theme;
-  onToggleTheme: () => void;
 }
 
 export function Toolbar({
@@ -23,8 +20,6 @@ export function Toolbar({
   onQueryChange,
   autoRefresh,
   onAutoRefreshChange,
-  theme,
-  onToggleTheme,
 }: ToolbarProps) {
   return (
     <div className="toolbar">
@@ -58,15 +53,6 @@ export function Toolbar({
         />
         auto-refresh (2s)
       </label>
-      <button
-        type="button"
-        className="theme-toggle"
-        onClick={onToggleTheme}
-        title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
-        aria-label="Toggle colour theme"
-      >
-        {theme === "dark" ? "☀" : "☾"}
-      </button>
     </div>
   );
 }

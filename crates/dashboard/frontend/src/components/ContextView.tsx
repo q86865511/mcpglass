@@ -11,7 +11,7 @@ const TOP_N = 10;
 
 export function ContextView({ report }: ContextViewProps) {
   if (!report) {
-    return <div className="stats-bar dim">no context data yet</div>;
+    return <div className="empty-hint dim">no context data yet</div>;
   }
 
   if (report.tool_count === 0) {
@@ -32,8 +32,8 @@ export function ContextView({ report }: ContextViewProps) {
 
   return (
     <div className="security-view">
-      <div style={{ display: "flex", alignItems: "baseline", gap: 10, marginBottom: 8 }}>
-        <span className="mono" style={{ fontSize: 28, fontWeight: 600 }}>
+      <div className="context-total">
+        <span className="context-total-value">
           ~{report.est_total_tokens.toLocaleString()}
         </span>
         <span className="dim">
@@ -53,7 +53,7 @@ export function ContextView({ report }: ContextViewProps) {
         </span>
       </div>
 
-      <table className="security-table" style={{ marginTop: 12 }}>
+      <table className="security-table context-table">
         <thead>
           <tr>
             <th>tool</th>
@@ -69,23 +69,11 @@ export function ContextView({ report }: ContextViewProps) {
               <td className="mono">{t.est_tokens.toLocaleString()}</td>
               <td className="mono">{t.total_chars.toLocaleString()}</td>
               <td>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <div
-                    style={{
-                      width: 80,
-                      height: 6,
-                      background: "var(--bg-panel-alt)",
-                      borderRadius: 3,
-                      overflow: "hidden",
-                      flexShrink: 0,
-                    }}
-                  >
+                <div className="context-bar-cell">
+                  <div className="context-bar-track">
                     <div
-                      style={{
-                        width: `${Math.min(100, t.pct)}%`,
-                        height: "100%",
-                        background: "var(--accent)",
-                      }}
+                      className="context-bar-fill"
+                      style={{ width: `${Math.min(100, t.pct)}%` }}
                     />
                   </div>
                   <span className="mono dim">{t.pct.toFixed(1)}%</span>
@@ -97,7 +85,7 @@ export function ContextView({ report }: ContextViewProps) {
       </table>
 
       {report.fat_tools.length > 0 && (
-        <div style={{ marginTop: 16 }}>
+        <div className="context-trim">
           <div className="dim">
             Trim candidates — description alone estimates over the fat threshold:
           </div>

@@ -105,7 +105,7 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
         <dt>time</dt>
         <dd className="mono">{formatClock(detail.ts_ms)}</dd>
         <dt>direction</dt>
-        <dd className="mono">{detail.direction}</dd>
+        <dd className={"mono channel-" + detail.direction}>{detail.direction}</dd>
         <dt>method</dt>
         <dd className="mono">
           {detail.method ?? (detail.rpc_id != null ? "(response)" : "(notification)")}
@@ -145,7 +145,7 @@ export function DetailPanel({ messageId }: DetailPanelProps) {
       {canReplay && (
         <div className="detail-raw-header">
           <span>replay</span>
-          <button className="copy-btn" onClick={doReplay} disabled={replaying}>
+          <button className="copy-btn btn-primary" onClick={doReplay} disabled={replaying}>
             {replaying ? "Replaying…" : "Replay"}
           </button>
         </div>

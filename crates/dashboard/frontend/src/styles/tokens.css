@@ -1,92 +1,122 @@
-/* mcpglass dashboard — design tokens.
+/* mcpglass dashboard — design tokens (oscilloscope instrument theme).
  *
- * `:root` carries the dark values (the current, unchanged look). `[data-theme="light"]`
- * overrides only the palette; scales, radii, shadows and fonts are theme-agnostic.
+ * `:root` carries the dark values (the default look: CRT phosphor on near-black).
+ * `[data-theme="light"]` overrides only the palette (a cool grey paper face); the
+ * scales, radii and fonts are theme-agnostic.
  *
- * Legacy variable names (--bg-panel, --bg-panel-alt, --danger, …) are kept as aliases
- * so the existing styles.css needs no renaming. New code should prefer the semantic
- * names (--bg-raised, --bg-overlay, --text-muted, and the space / font-size / radius scales).
+ * Base colours are defined here as literal hex — this is the ONE file allowed to.
+ * Everywhere else, alpha variants must go through
+ * `color-mix(in srgb, var(--x) N%, transparent)`, never a fresh rgba()/hex.
+ *
+ * The signature language: c2s/s2c message directions map to an oscilloscope's two
+ * channels — CH1 (--ch1, phosphor green, doubles as --accent) and CH2 (--ch2, cyan).
+ *
+ * Legacy variable names (--bg-panel, --bg-panel-alt, --text-muted, --fs-*, --radius-*)
+ * are kept as aliases so nothing that still references them breaks.
  */
 
 :root {
   /* ---- Surfaces (dark) ---- */
-  --bg: #14161a; /* base canvas */
-  --bg-raised: #1a1d23; /* panels, sidebar */
-  --bg-overlay: #20242c; /* hover / raised-on-raised */
-  --border: #2c313a;
+  --bg: #0a0f0c; /* base canvas — near-black with a green undertone */
+  --bg-raised: #0f1511; /* panels, sidebar */
+  --bg-overlay: #141c16; /* hover / raised-on-raised / active row */
+  --bg-deep: #070b09; /* raw JSON wells */
+  --border: #1d2921; /* hairline */
+  --border-strong: #2a3a2f;
 
   /* ---- Text ---- */
-  --text: #d7dbe0;
-  --text-dim: #7d8590;
-  --text-muted: #5a616b; /* dimmest layer, placeholders */
+  --text: #c9d8cd;
+  --text-dim: #8fa396;
+  --text-faint: #5c6e63; /* dimmest layer, instrument micro-labels, idle LEDs */
 
-  /* ---- Accent ---- */
-  --accent: #4fa3ff;
-  --accent-dim: #2b5f96;
+  /* ---- Channels (the signature) ---- */
+  --ch1: #3fe077; /* CH1 = c2s = phosphor green */
+  --ch2: #53d3e0; /* CH2 = s2c = cyan */
+  --accent: var(--ch1);
+  --accent-dim: #2a3a2f;
 
   /* ---- Semantic colours ---- */
-  --green: #3fb950;
-  --red: #f85149;
-  --orange: #d29922;
-  --yellow: #e3b341;
-  --danger: #b4231f; /* destructive action surface (was undefined, only reached via fallback) */
+  --green: var(--ch1);
+  --amber: #ffb454; /* warning LED */
+  --orange: var(--amber);
+  --red: #ff5f56; /* alarm LED */
+  --danger: var(--red);
+  --yellow: #e8d44d;
 
-  /* ---- Legacy aliases (resolve through the semantic names above) ---- */
+  /* ---- Instrument glow ---- *
+   * Blur radius for the two things allowed to glow (LED dots, active trace lines).
+   * Set to 0 in the light theme so the glow silently switches off. */
+  --glow: 4px;
+
+  /* ---- Legacy surface aliases ---- */
   --bg-panel: var(--bg-raised);
   --bg-panel-alt: var(--bg-overlay);
+  --text-muted: var(--text-faint);
 
-  /* ---- Spacing scale ---- */
+  /* ---- Spacing scale (4px base) ---- */
   --space-1: 2px;
   --space-2: 4px;
   --space-3: 6px;
   --space-4: 8px;
-  --space-5: 10px;
-  --space-6: 12px;
-  --space-7: 16px;
-  --space-8: 24px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 24px;
+  --space-8: 32px;
 
   /* ---- Font-size scale ---- */
+  --fs-xs: 11px; /* instrument micro-labels */
+  --fs-sm: 12px;
+  --fs-base: 13px; /* body default */
+  --fs-lg: 15px; /* readout values */
+  --fs-xl: 18px;
+  /* legacy aliases */
   --fs-1: 10px;
-  --fs-2: 11px;
-  --fs-3: 12px;
-  --fs-4: 13px; /* body default */
-  --fs-5: 16px;
-  --fs-6: 20px;
+  --fs-2: var(--fs-xs);
+  --fs-3: var(--fs-sm);
+  --fs-4: var(--fs-base);
+  --fs-5: var(--fs-lg);
+  --fs-6: var(--fs-xl);
 
-  /* ---- Radii ---- */
-  --radius-1: 4px;
-  --radius-2: 6px;
-  --radius-pill: 10px;
+  /* ---- Radii (small = instrument feel) ---- */
+  --radius-sm: 3px;
+  --radius: 5px;
+  /* legacy aliases */
+  --radius-1: var(--radius-sm);
+  --radius-2: var(--radius);
+  --radius-pill: var(--radius);
 
-  /* ---- Shadows ---- */
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.4);
+  /* ---- Shadows (kept flat; only the drawer floats) ---- */
+  --shadow-drawer: 0 0 0 1px rgba(0, 0, 0, 0.4), 8px 0 24px rgba(0, 0, 0, 0.45);
+  --scrim: rgba(0, 0, 0, 0.45); /* off-canvas drawer backdrop */
 
   /* ---- Typography ---- */
   --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
-/* Light theme — a cool grey paper base. Provisional palette; the next phase refines it. */
+/* Light theme — a cool grey paper face. Deeper channel/semantic hues so text and
+ * chips stay readable on the light surfaces (contrast checked against --bg-raised). */
 [data-theme="light"] {
-  --bg: #eef0f3;
-  --bg-raised: #ffffff;
-  --bg-overlay: #e4e7ec;
-  --border: #d0d5dd;
+  --bg: #e8ece9;
+  --bg-raised: #f3f6f3;
+  --bg-overlay: #ffffff;
+  --bg-deep: #dde3de;
+  --border: #c9d2cb;
+  --border-strong: #a9b6ac;
 
-  --text: #1b2027;
-  --text-dim: #5a6470;
-  --text-muted: #8a929c;
+  --text: #17211b;
+  --text-dim: #51625a;
+  --text-faint: #7c8b81;
 
-  --accent: #2b6fd6;
-  --accent-dim: #a9c6ef;
+  --ch1: #0b7a43;
+  --ch2: #0e7490;
+  --accent-dim: #a9b6ac;
 
-  --green: #1f8f38;
-  --red: #d1332b;
-  --orange: #b7791f;
-  --yellow: #96731a;
-  --danger: #c62d28;
+  --amber: #a66300;
+  --red: #c4302b;
+  --yellow: #8a7b00;
 
-  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.08);
-  --shadow-2: 0 4px 12px rgba(16, 24, 40, 0.12);
+  --glow: 0; /* no phosphor glow on paper */
+
+  --shadow-drawer: 0 0 0 1px rgba(16, 24, 40, 0.12), 8px 0 24px rgba(16, 24, 40, 0.18);
 }

@@ -1,0 +1,417 @@
+/* mcpglass dashboard — view layer: stats readouts, detail panel, security /
+ * inject / context views, count badges, empty states. */
+
+/* ==========================================================================
+   Stats bar — measurement readout row
+   ========================================================================== */
+
+.stats-bar {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-4) var(--space-5);
+  /* Second (and last) graticule surface in the UI. */
+  background-color: var(--bg-raised);
+  background-image: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--ch1) 5%, transparent) 1px,
+      transparent 1px
+    ),
+    linear-gradient(to bottom, color-mix(in srgb, var(--ch1) 5%, transparent) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.stats-readouts {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-7);
+  flex-wrap: wrap;
+}
+
+.readout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.readout-label {
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.readout-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-lg);
+  color: var(--text);
+  line-height: 1.1;
+}
+
+.readout-value-error {
+  color: var(--red);
+}
+
+.stats-toggle {
+  margin-left: auto;
+  align-self: center;
+}
+
+.stats-table {
+  margin-top: var(--space-5);
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats-table th {
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+.stats-table td {
+  text-align: left;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+
+/* ==========================================================================
+   Detail panel
+   ========================================================================== */
+
+.detail-panel {
+  flex: 1;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  overflow-y: auto;
+  min-width: 260px;
+}
+
+.detail-panel-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.detail-header {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  margin-bottom: var(--space-5);
+  color: var(--text);
+}
+
+.detail-fields {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-2) var(--space-5);
+  font-size: var(--fs-sm);
+  margin: 0 0 var(--space-5) 0;
+}
+
+.detail-fields dt {
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  align-self: center;
+}
+
+.detail-fields dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+/* Direction value carries its channel colour. */
+.channel-c2s {
+  color: var(--ch1);
+}
+
+.channel-s2c {
+  color: var(--ch2);
+}
+
+.detail-raw-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-3);
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-4);
+}
+
+.detail-raw {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--border) 40%, transparent);
+  border-radius: var(--radius-sm);
+  padding: var(--space-5);
+  font-size: var(--fs-sm);
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
+
+/* ==========================================================================
+   Security / Inject / Context — shared card + table
+   ========================================================================== */
+
+.security-view,
+.inject-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  flex: 1;
+  min-height: 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  overflow-y: auto;
+}
+
+.security-badges,
+.inject-badges {
+  display: flex;
+  gap: var(--space-5);
+  flex-wrap: wrap;
+  font-size: var(--fs-sm);
+}
+
+.count-badge {
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-4);
+}
+
+.count-badge b {
+  color: var(--text);
+}
+
+.count-badge-policy_deny {
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+  color: var(--amber);
+}
+
+.count-badge-secret_leak,
+.count-badge-blocked,
+.count-badge-error {
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  color: var(--red);
+}
+
+.count-badge-fingerprint_change {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+
+.count-badge-delay {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+
+.count-badge-drop {
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+  color: var(--amber);
+}
+
+.count-badge-truncate {
+  border-color: color-mix(in srgb, var(--ch2) 55%, transparent);
+  color: var(--ch2);
+}
+
+/* Coloured count badges keep their number in the same hue. */
+.count-badge-policy_deny b,
+.count-badge-secret_leak b,
+.count-badge-blocked b,
+.count-badge-error b,
+.count-badge-fingerprint_change b,
+.count-badge-delay b,
+.count-badge-drop b,
+.count-badge-truncate b {
+  color: inherit;
+}
+
+.security-table,
+.inject-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.security-table th,
+.inject-table th {
+  text-align: left;
+  padding: var(--space-4) var(--space-5);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg-raised);
+}
+
+.security-row td,
+.inject-row td {
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  vertical-align: top;
+}
+
+.security-detail,
+.inject-detail {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  word-break: break-all;
+}
+
+/* Kind / action / fault badges — outlined chips in semantic hues. */
+.badge-kind-policy_deny {
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+  color: var(--amber);
+}
+
+.badge-kind-secret_leak {
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  color: var(--red);
+}
+
+.badge-kind-fingerprint_change {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+
+.badge-action-flagged {
+  border-color: var(--border-strong);
+  color: var(--text-dim);
+}
+
+.badge-action-blocked {
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  color: var(--red);
+}
+
+.badge-fault-delay {
+  border-color: color-mix(in srgb, var(--yellow) 55%, transparent);
+  color: var(--yellow);
+}
+
+.badge-fault-error {
+  border-color: color-mix(in srgb, var(--red) 55%, transparent);
+  color: var(--red);
+}
+
+.badge-fault-drop {
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+  color: var(--amber);
+}
+
+.badge-fault-truncate {
+  border-color: color-mix(in srgb, var(--ch2) 55%, transparent);
+  color: var(--ch2);
+}
+
+/* ==========================================================================
+   Context view — token-cost readout + trim bars
+   ========================================================================== */
+
+.context-total {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-5);
+  margin-bottom: var(--space-4);
+}
+
+.context-total-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.context-table {
+  margin-top: var(--space-5);
+}
+
+.context-bar-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.context-bar-track {
+  width: 80px;
+  height: 6px;
+  background: var(--bg-overlay);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.context-bar-fill {
+  height: 100%;
+  background: var(--ch1);
+}
+
+.context-trim {
+  margin-top: var(--space-6);
+}
+
+.context-trim ul {
+  margin: var(--space-3) 0 0 0;
+  padding-left: var(--space-6);
+}
+
+.context-trim li {
+  margin-bottom: var(--space-1);
+}
+
+/* ==========================================================================
+   Empty states
+   ========================================================================== */
+
+.empty-hint {
+  padding: var(--space-8);
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.empty-state {
+  margin: auto;
+  text-align: center;
+  color: var(--text-dim);
+  max-width: 480px;
+}
+
+.empty-state h2 {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.empty-state-cmd {
+  background: var(--bg-deep);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-5);
+  color: var(--ch1);
+  display: inline-block;
+  font-family: var(--font-mono);
+}

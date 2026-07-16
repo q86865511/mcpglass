@@ -6,12 +6,15 @@ interface SidebarProps {
   selectedId: number | null;
   onSelect: (id: number) => void;
   onDelete: (id: number) => void;
+  // Drawer state — applied as an open class at the <=900px off-canvas breakpoint;
+  // ignored (sidebar is always in-flow) on wider viewports.
+  open: boolean;
 }
 
-export function Sidebar({ sessions, selectedId, onSelect, onDelete }: SidebarProps) {
+export function Sidebar({ sessions, selectedId, onSelect, onDelete, open }: SidebarProps) {
   return (
-    <aside className="sidebar">
-      <div className="sidebar-header">Sessions</div>
+    <aside className={"sidebar" + (open ? " sidebar-open" : "")}>
+      <div className="sidebar-header tick-label">Sessions</div>
       <ul className="session-list">
         {sessions.map((s) => {
           const live = s.ended_at_ms === null;
@@ -24,7 +27,14 @@ export function Sidebar({ sessions, selectedId, onSelect, onDelete }: SidebarPro
                 onClick={() => onSelect(s.id)}
               >
                 <div className="session-item-top">
-                  {live && <span className="live-dot" title="in progress" />}
+                  {/* Status LED: green trace while live, otherwise a faint idle dot.
+                      (No red — a blocked-session signal would need a count the
+                      sessions list endpoint doesn't carry.) */}
+                  <span
+                    className={"status-led" + (live ? " status-led-live" : "")}
+                    title={live ? "in progress" : undefined}
+                    aria-hidden="true"
+                  />
                   <span className="session-label">{s.label}</span>
                 </div>
                 <div className="session-item-meta">

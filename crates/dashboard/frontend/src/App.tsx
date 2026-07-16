@@ -59,6 +59,9 @@ export function App() {
   const [injectOffset, setInjectOffset] = useState(0);
   const [autoRefresh, setAutoRefresh] = useState(false);
 
+  // Off-canvas sidebar drawer (only shown at the <=900px breakpoint).
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
   // Polling tick: advances every AUTO_REFRESH_MS while auto-refresh is on. Resources
@@ -176,7 +179,10 @@ export function App() {
   );
 
   const handleSelectSession = useCallback(
-    (id: number) => setRoute({ sessionId: String(id), messageId: null }),
+    (id: number) => {
+      setRoute({ sessionId: String(id), messageId: null });
+      setDrawerOpen(false); // close the drawer after a pick on small screens
+    },
     [setRoute],
   );
   const handleSelectMessage = useCallback(
@@ -219,13 +225,44 @@ export function App() {
 
   return (
     <div className="app">
-      <Sidebar
-        sessions={sessions}
-        selectedId={selectedSessionId}
-        onSelect={handleSelectSession}
-        onDelete={handleDeleteSession}
-      />
-      <main className="main">
+      <header className="app-header">
+        <button
+          type="button"
+          className="drawer-toggle"
+          onClick={() => setDrawerOpen((o) => !o)}
+          aria-label="Toggle sessions sidebar"
+          aria-expanded={drawerOpen}
+        >
+          ☰
+        </button>
+        <div className="wordmark">
+          <span className="wordmark-led" aria-hidden="true" />
+          MCPGLASS
+        </div>
+        <div className="header-right">
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={toggleTheme}
+            title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+            aria-label="Toggle colour theme"
+          >
+            {theme === "dark" ? "☀" : "☾"}
+          </button>
+        </div>
+      </header>
+      <div className="app-body">
+        <Sidebar
+          sessions={sessions}
+          selectedId={selectedSessionId}
+          onSelect={handleSelectSession}
+          onDelete={handleDeleteSession}
+          open={drawerOpen}
+        />
+        {drawerOpen && (
+          <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} aria-hidden="true" />
+        )}
+        <main className="main">
         {sessionsError && <div className="banner banner-error">Failed to load sessions: {sessionsError}</div>}
         {deleteError && <div className="banner banner-error">Failed to delete session: {deleteError}</div>}
         {hasNoSessions ? (
@@ -250,7 +287,9 @@ export function App() {
               >
                 Security
                 {securityCounts && securityCounts.blocked > 0 && (
-                  <span className="view-tab-alert" title="blocked events present" />
+                  <span className="tab-alert tab-alert-red" title="blocked events present">
+                    {securityCounts.blocked}
+                  </span>
                 )}
               </button>
               <button
@@ -266,7 +305,9 @@ export function App() {
                 Inject
                 {injectCounts &&
                   injectCounts.delay + injectCounts.error + injectCounts.drop + injectCounts.truncate > 0 && (
-                    <span className="view-tab-alert" title="fault-injection events present" />
+                    <span className="tab-alert" title="fault-injection events present">
+                      {injectCounts.delay + injectCounts.error + injectCounts.drop + injectCounts.truncate}
+                    </span>
                   )}
               </button>
             </div>
@@ -281,8 +322,6 @@ export function App() {
                   onQueryChange={handleQueryChange}
                   autoRefresh={autoRefresh}
                   onAutoRefreshChange={setAutoRefresh}
-                  theme={theme}
-                  onToggleTheme={toggleTheme}
                 />
                 {messagesApi.error && (
                   <div className="banner banner-error">Failed to load messages: {messagesApi.error}</div>
@@ -342,7 +381,8 @@ export function App() {
             )}
           </>
         )}
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
