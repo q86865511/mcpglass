@@ -150,10 +150,10 @@ Grab the archive for your platform from the [latest release](https://github.com/
 sha256sum -c SHA256SUMS --ignore-missing
 
 # Optional: verify the GitHub Actions build provenance attestation.
-gh attestation verify mcpglass-v0.1.1-x86_64-unknown-linux-gnu.tar.gz --owner q86865511
+gh attestation verify mcpglass-v0.2.0-x86_64-unknown-linux-gnu.tar.gz --owner q86865511
 
-tar -xzf mcpglass-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-cd mcpglass-v0.1.1-x86_64-unknown-linux-gnu
+tar -xzf mcpglass-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+cd mcpglass-v0.2.0-x86_64-unknown-linux-gnu
 ./mcpglass --help
 ```
 
@@ -268,7 +268,7 @@ cargo clippy --workspace -- -D warnings
 cd crates/dashboard/frontend && pnpm build    # tsc strict + vite, embedded via rust-embed
 ```
 
-CI runs all of the above on Ubuntu and Windows for every push and PR
+CI runs all of the above on Ubuntu, Windows, and macOS for every push and PR
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)). Frontend development against fixture data
 without a real proxy: `pnpm mock` + `pnpm dev`. Contribution conventions:
 [CONTRIBUTING.md](CONTRIBUTING.md) · vulnerability reports: [SECURITY.md](SECURITY.md).
