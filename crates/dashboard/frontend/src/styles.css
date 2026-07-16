@@ -1,21 +1,6 @@
-/* mcpglass dashboard — dark developer-tool theme. No CSS framework. */
-
-:root {
-  --bg: #14161a;
-  --bg-panel: #1a1d23;
-  --bg-panel-alt: #20242c;
-  --border: #2c313a;
-  --text: #d7dbe0;
-  --text-dim: #7d8590;
-  --accent: #4fa3ff;
-  --accent-dim: #2b5f96;
-  --green: #3fb950;
-  --red: #f85149;
-  --orange: #d29922;
-  --yellow: #e3b341;
-  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
+/* mcpglass dashboard — developer-tool theme. No CSS framework.
+ * Design tokens (colours, spacing, radii, fonts) live in styles/tokens.css, which
+ * main.tsx imports first; this file only consumes those variables. */
 
 * {
   box-sizing: border-box;
@@ -517,6 +502,25 @@ body {
   font-size: 12px;
   white-space: nowrap;
   cursor: pointer;
+}
+
+/* Provisional theme switch — restyled in the visual-refresh phase. */
+.theme-toggle {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: var(--radius-1);
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--accent-dim);
 }
 
 /* ---- Content split: table + detail ---- */

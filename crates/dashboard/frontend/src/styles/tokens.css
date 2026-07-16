@@ -1,0 +1,92 @@
+/* mcpglass dashboard — design tokens.
+ *
+ * `:root` carries the dark values (the current, unchanged look). `[data-theme="light"]`
+ * overrides only the palette; scales, radii, shadows and fonts are theme-agnostic.
+ *
+ * Legacy variable names (--bg-panel, --bg-panel-alt, --danger, …) are kept as aliases
+ * so the existing styles.css needs no renaming. New code should prefer the semantic
+ * names (--bg-raised, --bg-overlay, --text-muted, and the space / font-size / radius scales).
+ */
+
+:root {
+  /* ---- Surfaces (dark) ---- */
+  --bg: #14161a; /* base canvas */
+  --bg-raised: #1a1d23; /* panels, sidebar */
+  --bg-overlay: #20242c; /* hover / raised-on-raised */
+  --border: #2c313a;
+
+  /* ---- Text ---- */
+  --text: #d7dbe0;
+  --text-dim: #7d8590;
+  --text-muted: #5a616b; /* dimmest layer, placeholders */
+
+  /* ---- Accent ---- */
+  --accent: #4fa3ff;
+  --accent-dim: #2b5f96;
+
+  /* ---- Semantic colours ---- */
+  --green: #3fb950;
+  --red: #f85149;
+  --orange: #d29922;
+  --yellow: #e3b341;
+  --danger: #b4231f; /* destructive action surface (was undefined, only reached via fallback) */
+
+  /* ---- Legacy aliases (resolve through the semantic names above) ---- */
+  --bg-panel: var(--bg-raised);
+  --bg-panel-alt: var(--bg-overlay);
+
+  /* ---- Spacing scale ---- */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-7: 16px;
+  --space-8: 24px;
+
+  /* ---- Font-size scale ---- */
+  --fs-1: 10px;
+  --fs-2: 11px;
+  --fs-3: 12px;
+  --fs-4: 13px; /* body default */
+  --fs-5: 16px;
+  --fs-6: 20px;
+
+  /* ---- Radii ---- */
+  --radius-1: 4px;
+  --radius-2: 6px;
+  --radius-pill: 10px;
+
+  /* ---- Shadows ---- */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.4);
+
+  /* ---- Typography ---- */
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Light theme — a cool grey paper base. Provisional palette; the next phase refines it. */
+[data-theme="light"] {
+  --bg: #eef0f3;
+  --bg-raised: #ffffff;
+  --bg-overlay: #e4e7ec;
+  --border: #d0d5dd;
+
+  --text: #1b2027;
+  --text-dim: #5a6470;
+  --text-muted: #8a929c;
+
+  --accent: #2b6fd6;
+  --accent-dim: #a9c6ef;
+
+  --green: #1f8f38;
+  --red: #d1332b;
+  --orange: #b7791f;
+  --yellow: #96731a;
+  --danger: #c62d28;
+
+  --shadow-1: 0 1px 2px rgba(16, 24, 40, 0.08);
+  --shadow-2: 0 4px 12px rgba(16, 24, 40, 0.12);
+}

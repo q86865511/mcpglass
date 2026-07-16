@@ -129,16 +129,16 @@ export interface HealthResponse {
   version: string;
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(path, signal ? { signal } : undefined);
   if (!res.ok) {
     throw new Error(`${path} -> HTTP ${res.status}`);
   }
   return (await res.json()) as T;
 }
 
-export function fetchSessions(): Promise<SessionsResponse> {
-  return getJson<SessionsResponse>("/api/sessions");
+export function fetchSessions(signal?: AbortSignal): Promise<SessionsResponse> {
+  return getJson<SessionsResponse>("/api/sessions", signal);
 }
 
 // Delete a session and all its recorded messages / security / inject events (its
@@ -163,6 +163,7 @@ export interface MessageFilters {
 export function fetchMessages(
   sessionId: number,
   filters: MessageFilters,
+  signal?: AbortSignal,
 ): Promise<MessagesResponse> {
   const params = new URLSearchParams();
   params.set("limit", String(filters.limit));
@@ -172,11 +173,12 @@ export function fetchMessages(
   if (filters.q) params.set("q", filters.q);
   return getJson<MessagesResponse>(
     `/api/sessions/${sessionId}/messages?${params.toString()}`,
+    signal,
   );
 }
 
-export function fetchMessageDetail(id: number): Promise<MessageDetail> {
-  return getJson<MessageDetail>(`/api/messages/${id}`);
+export function fetchMessageDetail(id: number, signal?: AbortSignal): Promise<MessageDetail> {
+  return getJson<MessageDetail>(`/api/messages/${id}`, signal);
 }
 
 export interface ReplayResult {
@@ -199,8 +201,11 @@ export async function postReplay(id: number): Promise<ReplayResult> {
   return (await res.json()) as ReplayResult;
 }
 
-export function fetchSessionStats(sessionId: number): Promise<SessionStats> {
-  return getJson<SessionStats>(`/api/sessions/${sessionId}/stats`);
+export function fetchSessionStats(
+  sessionId: number,
+  signal?: AbortSignal,
+): Promise<SessionStats> {
+  return getJson<SessionStats>(`/api/sessions/${sessionId}/stats`, signal);
 }
 
 export function fetchHealth(): Promise<HealthResponse> {
@@ -215,17 +220,22 @@ export interface SecurityEventsFilters {
 export function fetchSecurityEvents(
   sessionId: number,
   filters: SecurityEventsFilters,
+  signal?: AbortSignal,
 ): Promise<SecurityEventsResponse> {
   const params = new URLSearchParams();
   params.set("limit", String(filters.limit));
   params.set("offset", String(filters.offset));
   return getJson<SecurityEventsResponse>(
     `/api/sessions/${sessionId}/security?${params.toString()}`,
+    signal,
   );
 }
 
-export function fetchSecurityCounts(sessionId: number): Promise<SecurityCounts> {
-  return getJson<SecurityCounts>(`/api/sessions/${sessionId}/security/counts`);
+export function fetchSecurityCounts(
+  sessionId: number,
+  signal?: AbortSignal,
+): Promise<SecurityCounts> {
+  return getJson<SecurityCounts>(`/api/sessions/${sessionId}/security/counts`, signal);
 }
 
 // Context-bloat analysis: how many context tokens a session's advertised
@@ -251,8 +261,11 @@ export interface ContextReport {
   fat_tools: string[];
 }
 
-export function fetchContext(sessionId: number): Promise<ContextReport> {
-  return getJson<ContextReport>(`/api/sessions/${sessionId}/context`);
+export function fetchContext(
+  sessionId: number,
+  signal?: AbortSignal,
+): Promise<ContextReport> {
+  return getJson<ContextReport>(`/api/sessions/${sessionId}/context`, signal);
 }
 
 export interface InjectEventsFilters {
@@ -263,15 +276,20 @@ export interface InjectEventsFilters {
 export function fetchInjectEvents(
   sessionId: number,
   filters: InjectEventsFilters,
+  signal?: AbortSignal,
 ): Promise<InjectEventsResponse> {
   const params = new URLSearchParams();
   params.set("limit", String(filters.limit));
   params.set("offset", String(filters.offset));
   return getJson<InjectEventsResponse>(
     `/api/sessions/${sessionId}/inject?${params.toString()}`,
+    signal,
   );
 }
 
-export function fetchInjectCounts(sessionId: number): Promise<InjectCounts> {
-  return getJson<InjectCounts>(`/api/sessions/${sessionId}/inject/counts`);
+export function fetchInjectCounts(
+  sessionId: number,
+  signal?: AbortSignal,
+): Promise<InjectCounts> {
+  return getJson<InjectCounts>(`/api/sessions/${sessionId}/inject/counts`, signal);
 }
